@@ -41,6 +41,14 @@ app.get('/', (req, res) => res.json({
 
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
+app.get('/debug', (req, res) => res.json({
+  supabase_url: process.env.SUPABASE_URL ? '✅ set' : '❌ missing',
+  supabase_key: process.env.SUPABASE_SERVICE_KEY ? '✅ set' : '❌ missing',
+  jwt_secret: process.env.JWT_SECRET ? '✅ set' : '❌ missing',
+  node_env: process.env.NODE_ENV || 'not set',
+  port: PORT
+}));
+
 // ══════════════════════════════════════════════════════════════════
 // AUTH
 // ══════════════════════════════════════════════════════════════════
