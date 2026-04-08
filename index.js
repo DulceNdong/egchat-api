@@ -118,45 +118,64 @@ app.get('/api/auth/me', auth, async (req, res) => {
 app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'Sesión cerrada' }));
 
 // ========================================================================
-// CHAT / MENSJERÍA COMPLETA
+// CHAT / MENSAJERÍA COMPLETA
 // ========================================================================
 
 // Obtener todos los chats del usuario
 app.get('/api/chats', auth, async (req, res) => {
   try {
-    const { data: chats, error } = await supabase
+    // Buscar chats donde el usuario es participante
+    const { data: participations, error: pErr } = await supabase
+      .from('chat_participants')
+      .select('chat_id')
+      .eq('user_id', req.user.id);
+
+    if (pErr) {
+      // Si la tabla no existe, devolver array vacío
+      return res.json([]);
+    }
+
+    if (!participations || participations.length === 0) return res.json([]);
+
+    const chatIds = participations.map(p => p.chat_id);
+
+    const { data: chats } = await supabase
       .from('chats')
-      .select(`
-        *,
-        participants!inner(
-          user_id,
-          users(id, phone, full_name, avatar_url)
-        ),
-        last_message:messages(id, text, type, created_at, sender_id)
-      `)
-      .contains('participants', JSON.stringify([{ user_id: req.user.id }]));
+      .select('*')
+      .in('id', chatIds)
+      .order('updated_at', { ascending: false });
 
-    if (error) throw error;
+    if (!chats) return res.json([]);
 
-    // Formatear los datos
-    const formattedChats = chats.map(chat => ({
-      id: chat.id,
-      type: chat.type, // 'private', 'group'
-      name: chat.name,
-      avatar_url: chat.avatar_url,
-      participants: chat.participants.map(p => ({
-        user_id: p.user_id,
-        ...p.users
-      })),
-      last_message: chat.last_message?.[0] || null,
-      updated_at: chat.updated_at,
-      unread_count: chat.unread_count || 0
+    // Para cada chat, obtener participantes y último mensaje
+    const result = await Promise.all(chats.map(async (chat) => {
+      const { data: parts } = await supabase
+        .from('chat_participants')
+        .select('user_id, users(id, phone, full_name)')
+        .eq('chat_id', chat.id);
+
+      const { data: lastMsgs } = await supabase
+        .from('messages')
+        .select('id, text, type, created_at, sender_id')
+        .eq('chat_id', chat.id)
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      return {
+        id: chat.id,
+        type: chat.type || 'private',
+        name: chat.name,
+        participants: parts || [],
+        last_message: lastMsgs?.[0] || null,
+        updated_at: chat.updated_at,
+        unread_count: 0
+      };
     }));
 
-    res.json(formattedChats);
+    res.json(result);
   } catch (e) {
-    console.error('Get chats error:', e);
-    res.status(500).json({ message: e.message });
+    console.error('Get chats error:', e.message);
+    res.json([]); // Devolver vacío en vez de 500
   }
 });
 
@@ -169,128 +188,52 @@ app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
     const from = (page - 1) * limit;
 
     // Verificar que el usuario pertenece al chat
-    const { data: chat, error: chatError } = await supabase
-      .from('chats')
-      .select('id')
-      .eq('id', chatId)
-      .contains('participants', JSON.stringify([{ user_id: req.user.id }]))
+    const { data: part } = await supabase
+      .from('chat_participants')
+      .select('chat_id')
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
       .single();
 
-    if (chatError || !chat) {
-      return res.status(403).json({ message: 'No tienes acceso a este chat' });
-    }
+    if (!part) return res.status(403).json({ message: 'No tienes acceso a este chat' });
 
-    // Obtener mensajes
-    const { data: messages, error: msgError } = await supabase
+    const { data: messages } = await supabase
       .from('messages')
-      .select(`
-        id,
-        text,
-        type,
-        created_at,
-        updated_at,
-        sender_id,
-        status,
-        reply_to,
-        file_url,
-        file_type,
-        file_size,
-        thumbnail_url,
-        sender:users(id, phone, full_name, avatar_url)
-      `)
+      .select('id, text, type, created_at, sender_id, status, reply_to, file_url')
       .eq('chat_id', chatId)
       .order('created_at', { ascending: false })
       .range(from, from + limit - 1);
 
-    if (msgError) throw msgError;
-
-    res.json(messages.reverse()); // Mensajes más antiguos primero
+    res.json((messages || []).reverse());
   } catch (e) {
-    console.error('Get messages error:', e);
-    res.status(500).json({ message: e.message });
+    console.error('Get messages error:', e.message);
+    res.json([]);
   }
 });
-
 // Enviar mensaje
 app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
-    const { text, type = 'text', reply_to, file_url, file_type, file_size, thumbnail_url } = req.body;
+    const { text, type = 'text', reply_to, file_url } = req.body;
+    if (!text && !file_url) return res.status(400).json({ message: 'Texto o archivo requerido' });
 
-    if (!text && !file_url) {
-      return res.status(400).json({ message: 'El texto o archivo es requerido' });
-    }
+    // Verificar acceso
+    const { data: part } = await supabase
+      .from('chat_participants').select('chat_id').eq('chat_id', chatId).eq('user_id', req.user.id).single();
+    if (!part) return res.status(403).json({ message: 'Sin acceso' });
 
-    // Verificar acceso al chat
-    const { data: chat, error: chatError } = await supabase
-      .from('chats')
-      .select('id, participants')
-      .eq('id', chatId)
-      .contains('participants', JSON.stringify([{ user_id: req.user.id }]))
-      .single();
-
-    if (chatError || !chat) {
-      return res.status(403).json({ message: 'No tienes acceso a este chat' });
-    }
-
-    // Crear mensaje
-    const { data: message, error: msgError } = await supabase
+    const { data: message, error } = await supabase
       .from('messages')
-      .insert({
-        chat_id: chatId,
-        sender_id: req.user.id,
-        text: text || null,
-        type,
-        reply_to: reply_to || null,
-        file_url: file_url || null,
-        file_type: file_type || null,
-        file_size: file_size || null,
-        thumbnail_url: thumbnail_url || null,
-        status: 'sent',
-        created_at: new Date().toISOString()
-      })
-      .select(`
-        id,
-        text,
-        type,
-        created_at,
-        sender_id,
-        status,
-        reply_to,
-        file_url,
-        file_type,
-        file_size,
-        thumbnail_url,
-        sender:users(id, phone, full_name, avatar_url)
-      `)
+      .insert({ chat_id: chatId, sender_id: req.user.id, text: text || null, type, reply_to: reply_to || null, file_url: file_url || null, status: 'sent' })
+      .select('id, text, type, created_at, sender_id, status')
       .single();
 
-    if (msgError) throw msgError;
+    if (error) throw error;
 
-    // Actualizar último mensaje del chat
-    await supabase
-      .from('chats')
-      .update({ 
-        updated_at: new Date().toISOString(),
-        last_message_id: message.id
-      })
-      .eq('id', chatId);
-
-    // Incrementar contador de no leídos para otros participantes
-    const otherParticipants = chat.participants
-      .filter(p => p.user_id !== req.user.id)
-      .map(p => p.user_id);
-
-    if (otherParticipants.length > 0) {
-      await supabase.rpc('increment_unread_count', {
-        chat_id_param: chatId,
-        user_ids: otherParticipants
-      });
-    }
-
+    await supabase.from('chats').update({ updated_at: new Date().toISOString() }).eq('id', chatId);
     res.status(201).json(message);
   } catch (e) {
-    console.error('Send message error:', e);
+    console.error('Send message error:', e.message);
     res.status(500).json({ message: e.message });
   }
 });
@@ -539,6 +482,204 @@ app.delete('/api/messages/:messageId', auth, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════
+// CONTACTOS - GESTIÓN COMPLETA
+// ══════════════════════════════════════════════════════════
+
+// Obtener todos los contactos del usuario
+app.get('/api/contacts', auth, async (req, res) => {
+  try {
+    const { data: contacts, error } = await supabase
+      .from('contacts')
+      .select(`
+        *,
+        contact_user:users!contact_user_id_fkey(
+          id, phone, full_name, avatar_url, last_seen, status
+        )
+      `)
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    // Formatear contactos
+    const formattedContacts = contacts.map(contact => ({
+      id: contact.id,
+      contact_user_id: contact.contact_user_id,
+      nickname: contact.nickname,
+      is_blocked: contact.is_blocked,
+      is_favorite: contact.is_favorite,
+      created_at: contact.created_at,
+      user: contact.contact_user
+    }));
+
+    res.json(formattedContacts);
+  } catch (e) {
+    console.error('Get contacts error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Agregar contacto
+app.post('/api/contacts', auth, async (req, res) => {
+  try {
+    const { contact_user_id, nickname } = req.body;
+
+    if (!contact_user_id) {
+      return res.status(400).json({ message: 'ID de contacto requerido' });
+    }
+
+    // Verificar que el usuario a agregar existe
+    const { data: targetUser, error: userError } = await supabase
+      .from('users')
+      .select('id, phone, full_name')
+      .eq('id', contact_user_id)
+      .single();
+
+    if (userError || !targetUser) {
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+
+    // Verificar que ya no sea contacto
+    const { data: existingContact } = await supabase
+      .from('contacts')
+      .select('id')
+      .eq('user_id', req.user.id)
+      .eq('contact_user_id', contact_user_id)
+      .single();
+
+    if (existingContact) {
+      return res.status(409).json({ message: 'El usuario ya es tu contacto' });
+    }
+
+    // Agregar contacto
+    const { data: contact, error } = await supabase
+      .from('contacts')
+      .insert({
+        user_id: req.user.id,
+        contact_user_id,
+        nickname: nickname || targetUser.full_name
+      })
+      .select(`
+        *,
+        contact_user:users!contact_user_id_fkey(
+          id, phone, full_name, avatar_url, last_seen, status
+        )
+      `)
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      id: contact.id,
+      contact_user_id: contact.contact_user_id,
+      nickname: contact.nickname,
+      is_blocked: contact.is_blocked,
+      is_favorite: contact.is_favorite,
+      created_at: contact.created_at,
+      user: contact.contact_user
+    });
+  } catch (e) {
+    console.error('Add contact error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Bloquear contacto
+app.post('/api/contacts/:contactId/block', auth, async (req, res) => {
+  try {
+    const { contactId } = req.params;
+
+    const { data: contact, error } = await supabase
+      .from('contacts')
+      .update({ is_blocked: true })
+      .eq('id', contactId)
+      .eq('user_id', req.user.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!contact) {
+      return res.status(404).json({ message: 'Contacto no encontrado' });
+    }
+
+    res.json({ message: 'Contacto bloqueado exitosamente', contact });
+  } catch (e) {
+    console.error('Block contact error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Desbloquear contacto
+app.post('/api/contacts/:contactId/unblock', auth, async (req, res) => {
+  try {
+    const { contactId } = req.params;
+
+    const { data: contact, error } = await supabase
+      .from('contacts')
+      .update({ is_blocked: false })
+      .eq('id', contactId)
+      .eq('user_id', req.user.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!contact) {
+      return res.status(404).json({ message: 'Contacto no encontrado' });
+    }
+
+    res.json({ message: 'Contacto desbloqueado exitosamente', contact });
+  } catch (e) {
+    console.error('Unblock contact error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Eliminar contacto
+app.delete('/api/contacts/:contactId', auth, async (req, res) => {
+  try {
+    const { contactId } = req.params;
+
+    const { error } = await supabase
+      .from('contacts')
+      .delete()
+      .eq('id', contactId)
+      .eq('user_id', req.user.id);
+
+    if (error) throw error;
+
+    res.json({ message: 'Contacto eliminado exitosamente' });
+  } catch (e) {
+    console.error('Delete contact error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Marcar contacto como favorito
+app.post('/api/contacts/:contactId/favorite', auth, async (req, res) => {
+  try {
+    const { contactId } = req.params;
+
+    const { data: contact, error } = await supabase
+      .from('contacts')
+      .update({ is_favorite: true })
+      .eq('id', contactId)
+      .eq('user_id', req.user.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!contact) {
+      return res.status(404).json({ message: 'Contacto no encontrado' });
+    }
+
+    res.json({ message: 'Contacto marcado como favorito', contact });
+  } catch (e) {
+    console.error('Favorite contact error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // Obtener contactos para chat
 app.get('/api/contacts/search', auth, async (req, res) => {
   try {
@@ -677,20 +818,8 @@ app.post('/api/wallet/recharge-code', auth, async (req, res) => {
   await supabase.from('transactions').insert({
     user_id: req.user.id, type: 'deposit', amount, method: 'Código de recarga',
     reference: code, status: 'completed'
-  });
 
-  res.json({ balance: newBalance, amount, message: `${amount.toLocaleString()} XAF añadidos` });
-});
-
-// ══════════════════════════════════════════════════════════════════
-// LIA-25
-// ══════════════════════════════════════════════════════════════════
-app.post('/api/lia/chat', auth, async (req, res) => {
-  const { message } = req.body;
-  const lower = message.toLowerCase();
-
-  const { data: wallet } = await supabase
-    .from('wallets').select('balance').eq('user_id', req.user.id).single();
+  const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', req.user.id).single();
   const balance = wallet?.balance || 0;
 
   let reply = '';
@@ -706,10 +835,14 @@ app.post('/api/lia/chat', auth, async (req, res) => {
     reply = 'Puedes hacer compras en línea desde la sección Supermercados. Tenemos tiendas en Malabo y Bata.';
   else if (lower.includes('transferir') || lower.includes('enviar dinero'))
     reply = 'Para enviar dinero, ve a Mi Monedero → Enviar, o dime el número y el importe.';
+  else if (lower.includes('seguro'))
+    reply = 'Puedes contratar seguros de salud, vehículo, vida y hogar en la sección Seguros.';
+  else if (lower.includes('noticias'))
+    reply = 'Las últimas noticias de Guinea Ecuatorial y del mundo están en la sección Noticias.';
   else if (lower.includes('gracias'))
     reply = '¡De nada! Estoy aquí para ayudarte. ¿Hay algo más?';
   else
-    reply = `Entendido: "${message}". Puedo ayudarte con saldo, transferencias, taxi, salud, supermercados y más.`;
+    reply = `Entendido: "${message}". Puedo ayudarte con saldo, transferencias, taxi, salud, supermercados, seguros y noticias.`;
 
   // Guardar conversación en Supabase
   await supabase.from('lia_conversations').insert({
@@ -957,6 +1090,456 @@ app.post('/api/taxi/:rideId/rate', auth, async (req, res) => {
   const { rating, comment } = req.body;
   res.json({ message: 'Valoración enviada', rating, rideId: req.params.rideId });
 });
+
+// ════════════════════════════════════════════════════════════
+// SEGUROS - COTIZACIONES, PÓLIZAS, RECLAMACIONES
+// ══════════════════════════════════════════════════════════════
+
+// Obtener tipos de seguros disponibles
+app.get('/api/insurance/types', auth, async (req, res) => {
+  try {
+    const insuranceTypes = [
+      {
+        id: 'salud',
+        name: 'Seguro de Salud',
+        icon: '🏥',
+        description: 'Cobertura médica completa',
+        coverage: ['consultas', 'urgencias', 'hospitalización', 'medicamentos'],
+        starting_price: 5000
+      },
+      {
+        id: 'vehiculo',
+        name: 'Seguro de Vehículo',
+        icon: '🚗',
+        description: 'Protección para tu vehículo',
+        coverage: ['colisión', 'robo', 'daños', 'responsabilidad civil'],
+        starting_price: 8000
+      },
+      {
+        id: 'vida',
+        name: 'Seguro de Vida',
+        icon: '🛡️',
+        description: 'Seguridad para tu familia',
+        coverage: ['fallecimiento', 'invalidez', 'enfermedades graves'],
+        starting_price: 3000
+      },
+      {
+        id: 'hogar',
+        name: 'Seguro de Hogar',
+        icon: '🏠',
+        description: 'Protección para tu vivienda',
+        coverage: ['incendio', 'robo', 'daños estructurales', 'responsabilidad civil'],
+        starting_price: 4000
+      }
+    ];
+
+    res.json(insuranceTypes);
+  } catch (e) {
+    console.error('Get insurance types error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Obtener cotización de seguro
+app.post('/api/insurance/quote', auth, async (req, res) => {
+  try {
+    const { insurance_type, coverage_amount, duration_months } = req.body;
+
+    if (!insurance_type || !coverage_amount || !duration_months) {
+      return res.status(400).json({ message: 'Datos incompletos para cotización' });
+    }
+
+    // Calcular prima mensual (ejemplo simple)
+    const baseRates = {
+      salud: 0.02,
+      vehiculo: 0.035,
+      vida: 0.015,
+      hogar: 0.025
+    };
+
+    const monthly_premium = Math.round(coverage_amount * baseRates[insurance_type] || 0.02);
+    const total_premium = monthly_premium * duration_months;
+
+    res.json({
+      insurance_type,
+      coverage_amount,
+      duration_months,
+      monthly_premium,
+      total_premium,
+      currency: 'XAF',
+      valid_until: new Date(Date.now() + (30 * 24 * 60 * 60 * 1000)).toISOString()
+    });
+  } catch (e) {
+    console.error('Get insurance quote error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Contratar seguro
+app.post('/api/insurance/contract', auth, async (req, res) => {
+  try {
+    const { insurance_type, coverage_amount, duration_months, payment_method } = req.body;
+
+    if (!insurance_type || !coverage_amount || !duration_months) {
+      return res.status(400).json({ message: 'Datos incompletos para contratar' });
+    }
+
+    // Verificar saldo
+    const { data: wallet } = await supabase
+      .from('wallets')
+      .select('balance')
+      .eq('user_id', req.user.id)
+      .single();
+
+    // Calcular prima
+    const baseRates = {
+      salud: 0.02,
+      vehiculo: 0.035,
+      vida: 0.015,
+      hogar: 0.025
+    };
+
+    const monthly_premium = Math.round(coverage_amount * baseRates[insurance_type] || 0.02);
+    const total_premium = monthly_premium * duration_months;
+
+    if (!wallet || total_premium > wallet.balance) {
+      return res.status(400).json({ message: 'Saldo insuficiente para contratar seguro' });
+    }
+
+    // Crear póliza
+    const { data: policy } = await supabase
+      .from('insurance_policies')
+      .insert({
+        user_id: req.user.id,
+        insurance_type,
+        coverage_amount,
+        duration_months,
+        monthly_premium,
+        total_premium,
+        status: 'active',
+        start_date: new Date().toISOString(),
+        end_date: new Date(Date.now() + (duration_months * 30 * 24 * 60 * 60 * 1000)).toISOString()
+      })
+      .select()
+      .single();
+
+    // Procesar pago
+    const newBalance = wallet.balance - total_premium;
+    await supabase
+      .from('wallets')
+      .update({ balance: newBalance })
+      .eq('user_id', req.user.id);
+
+    // Registrar transacción
+    await supabase
+      .from('transactions')
+      .insert({
+        user_id: req.user.id,
+        type: 'insurance_payment',
+        amount: total_premium,
+        method: payment_method,
+        reference: `INSURANCE-${policy.id}`,
+        status: 'completed',
+        metadata: {
+          policy_id: policy.id,
+          insurance_type,
+          duration_months
+        }
+      });
+
+    res.json({
+      message: 'Seguro contratado exitosamente',
+      policy,
+      balance: newBalance
+    });
+  } catch (e) {
+    console.error('Contract insurance error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Obtener pólizas del usuario
+app.get('/api/insurance/policies', auth, async (req, res) => {
+  try {
+    const { data: policies } = await supabase
+      .from('insurance_policies')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false });
+
+    res.json(policies || []);
+  } catch (e) {
+    console.error('Get insurance policies error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Presentar reclamación
+app.post('/api/insurance/claim', auth, async (req, res) => {
+  try {
+    const { policy_id, claim_type, description, amount } = req.body;
+
+    if (!policy_id || !claim_type || !description) {
+      return res.status(400).json({ message: 'Datos incompletos para reclamación' });
+    }
+
+    // Verificar que la póliza pertenece al usuario
+    const { data: policy } = await supabase
+      .from('insurance_policies')
+      .select('id, user_id, status')
+      .eq('id', policy_id)
+      .single();
+
+    if (!policy || policy.user_id !== req.user.id) {
+      return res.status(404).json({ message: 'Póliza no encontrada' });
+    }
+
+    if (policy.status !== 'active') {
+      return res.status(400).json({ message: 'La póliza no está activa' });
+    }
+
+    // Crear reclamación
+    const { data: claim } = await supabase
+      .from('insurance_claims')
+      .insert({
+        policy_id,
+        user_id: req.user.id,
+        claim_type,
+        description,
+        amount,
+        status: 'pending',
+        submitted_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    res.json({
+      message: 'Reclamación presentada exitosamente',
+      claim
+    });
+  } catch (e) {
+    console.error('Submit insurance claim error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Obtener reclamaciones del usuario
+app.get('/api/insurance/claims', auth, async (req, res) => {
+  try {
+    const { data: claims } = await supabase
+      .from('insurance_claims')
+      .select(`
+        *,
+        policy:insurance_policies(id, insurance_type, status)
+      `)
+      .eq('user_id', req.user.id)
+      .order('submitted_at', { ascending: false });
+
+    res.json(claims || []);
+  } catch (e) {
+    console.error('Get insurance claims error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════
+// NOTICIAS - CATEGORÍAS, FEEDS, BÚSQUEDA, PERSONALIZACIÓN
+// ════════════════════════════════════════════════════════════
+
+// Obtener categorías de noticias
+app.get('/api/news/categories', auth, async (req, res) => {
+  try {
+    const categories = [
+      {
+        id: 'nacional',
+        name: 'Nacional',
+        icon: '🇬🇶',
+        description: 'Noticias de Guinea Ecuatorial'
+      },
+      {
+        id: 'internacional',
+        name: 'Internacional',
+        icon: '🌍',
+        description: 'Noticias del mundo'
+      },
+      {
+        id: 'deportes',
+        name: 'Deportes',
+        icon: '⚽',
+        description: 'Fútbol y otros deportes'
+      },
+      {
+        id: 'economia',
+        name: 'Economía',
+        icon: '💰',
+        description: 'Finanzas y negocios'
+      },
+      {
+        id: 'tecnologia',
+        name: 'Tecnología',
+        icon: '💻',
+        description: 'Tecnología y ciencia'
+      },
+      {
+        id: 'cultura',
+        name: 'Cultura',
+        icon: '🎭',
+        description: 'Arte y entretenimiento'
+      }
+    ];
+
+    res.json(categories);
+  } catch (e) {
+    console.error('Get news categories error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Obtener noticias por categoría
+app.get('/api/news', auth, async (req, res) => {
+  try {
+    const { category, page = 1, limit = 20 } = req.query;
+
+    // Noticias simuladas (en producción vendrían de una API real)
+    const allNews = [
+      {
+        id: '1',
+        title: 'EGCHAT lanza nueva funcionalidad de mensajería instantánea',
+        category: 'tecnologia',
+        summary: 'La aplicación EGCHAT anuncia importantes mejoras...',
+        content: '...',
+        image_url: 'https://example.com/egchat-news.jpg',
+        published_at: new Date().toISOString(),
+        source: 'TechGE'
+      },
+      {
+        id: '2',
+        title: 'Economía de Guinea Ecuatorial muestra crecimiento',
+        category: 'economia',
+        summary: 'El Banco Central de Guinea Ecuatorial reporta...',
+        content: '...',
+        image_url: 'https://example.com/economy-news.jpg',
+        published_at: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+        source: 'EcoDiario'
+      }
+    ];
+
+    const filteredNews = category 
+      ? allNews.filter(news => news.category === category)
+      : allNews;
+
+    const startIndex = (page - 1) * limit;
+    const endIndex = startIndex + parseInt(limit);
+    const paginatedNews = filteredNews.slice(startIndex, endIndex);
+
+    res.json({
+      news: paginatedNews,
+      total: filteredNews.length,
+      page: parseInt(page),
+      totalPages: Math.ceil(filteredNews.length / limit)
+    });
+  } catch (e) {
+    console.error('Get news error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Buscar noticias
+app.get('/api/news/search', auth, async (req, res) => {
+  try {
+    const { q, category } = req.query;
+
+    if (!q || q.length < 2) {
+      return res.status(400).json({ message: 'La búsqueda debe tener al menos 2 caracteres' });
+    }
+
+    // Noticias simuladas para búsqueda
+    const searchResults = [
+      {
+        id: 'search1',
+        title: `Resultados para "${q}" en EGCHAT`,
+        category: category || 'todos',
+        summary: `Se encontraron artículos relacionados con ${q}...`,
+        published_at: new Date().toISOString(),
+        source: 'SearchEG'
+      }
+    ];
+
+    res.json({
+      query: q,
+      results: searchResults,
+      total: searchResults.length
+    });
+  } catch (e) {
+    console.error('Search news error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Marcar noticia como favorita
+app.post('/api/news/:newsId/favorite', auth, async (req, res) => {
+  try {
+    const { newsId } = req.params;
+
+    const { data: favorite } = await supabase
+      .from('user_news_favorites')
+      .upsert({
+        user_id: req.user.id,
+        news_id: newsId
+      })
+      .select()
+      .single();
+
+    res.json({
+      message: 'Noticia marcada como favorita',
+      favorite
+    });
+  } catch (e) {
+    console.error('Favorite news error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Obtener noticias favoritas del usuario
+app.get('/api/news/favorites', auth, async (req, res) => {
+  try {
+    const { data: favorites } = await supabase
+      .from('user_news_favorites')
+      .select(`
+        *,
+        news:news_items(id, title, summary, published_at, image_url)
+      `)
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false });
+
+    res.json(favorites || []);
+  } catch (e) {
+    console.error('Get favorite news error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════
+// AI ASSISTANT LIA-25 - CHAT INTELIGENTE INTEGRADO
+// ══════════════════════════════════════════════════════════
+
+app.post('/api/lia/chat', auth, async (req, res) => {
+  const { message } = req.body;
+  const lower = message.toLowerCase();
+
+  const { data: wallet } = await supabase
+    .from('wallets')
+    .select('balance')
+    .eq('user_id', req.user.id)
+    .single();
+  const balance = wallet?.balance || 0;
+
+  let reply = '';
+  if (lower.includes('saldo') || lower.includes('balance'))
+    reply = `Tu saldo actual es **${balance.toLocaleString()} XAF**. ¿Deseas recargar o retirar?`;
+  else if (lower.includes('hola') || lower.includes('buenos'))
+    reply = '¡Hola! Soy Lia-25, tu asistente inteligente de EGCHAT. ¿En qué puedo ayudarte hoy?';
+  else if (lower.includes('taxi'))
 
 // ══════════════════════════════════════════════════════════════════
 // SEGUROS
