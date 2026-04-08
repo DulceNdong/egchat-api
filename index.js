@@ -818,6 +818,17 @@ app.post('/api/wallet/recharge-code', auth, async (req, res) => {
   await supabase.from('transactions').insert({
     user_id: req.user.id, type: 'deposit', amount, method: 'Código de recarga',
     reference: code, status: 'completed'
+  });
+
+  res.json({ balance: newBalance, amount, message: `${amount.toLocaleString()} XAF añadidos` });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// LIA-25
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/lia/chat', auth, async (req, res) => {
+  const { message } = req.body;
+  const lower = message.toLowerCase();
 
   const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', req.user.id).single();
   const balance = wallet?.balance || 0;
@@ -1520,30 +1531,9 @@ app.get('/api/news/favorites', auth, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
-// AI ASSISTANT LIA-25 - CHAT INTELIGENTE INTEGRADO
+// SEGUROS
 // ══════════════════════════════════════════════════════════
 
-app.post('/api/lia/chat', auth, async (req, res) => {
-  const { message } = req.body;
-  const lower = message.toLowerCase();
-
-  const { data: wallet } = await supabase
-    .from('wallets')
-    .select('balance')
-    .eq('user_id', req.user.id)
-    .single();
-  const balance = wallet?.balance || 0;
-
-  let reply = '';
-  if (lower.includes('saldo') || lower.includes('balance'))
-    reply = `Tu saldo actual es **${balance.toLocaleString()} XAF**. ¿Deseas recargar o retirar?`;
-  else if (lower.includes('hola') || lower.includes('buenos'))
-    reply = '¡Hola! Soy Lia-25, tu asistente inteligente de EGCHAT. ¿En qué puedo ayudarte hoy?';
-  else if (lower.includes('taxi'))
-
-// ══════════════════════════════════════════════════════════════════
-// SEGUROS
-// ══════════════════════════════════════════════════════════════════
 const ASEGURADORAS = [
   { id: '1', name: 'COGE Seguros', products: ['Vida', 'Salud', 'Auto', 'Hogar'] },
   { id: '2', name: 'SIAT Guinea', products: ['Auto', 'Empresarial', 'Transporte'] },
