@@ -34,7 +34,7 @@ const auth = (req, res, next) => {
 // ── ROOT ──────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   message: 'EGCHAT API funcionando!',
-  version: '2.0.0',
+  version: '2.5.0',
   database: 'Supabase',
   status: 'active'
 }));
@@ -60,7 +60,7 @@ app.post('/api/auth/register', async (req, res) => {
 
     // Verificar si ya existe
     const { data: existing } = await supabase
-      .from('users').select('id').eq('phone', phone).single();
+      .from('users').select('id').eq('phone', phone).maybeSingle();
     if (existing) return res.status(409).json({ message: 'El teléfono ya está registrado' });
 
     const hashed = await bcrypt.hash(password, 10);
@@ -90,7 +90,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ message: 'phone y password son requeridos' });
 
     const { data: user, error } = await supabase
-      .from('users').select('*').eq('phone', phone).single();
+      .from('users').select('*').eq('phone', phone).maybeSingle();
 
     if (error || !user) return res.status(401).json({ message: 'Credenciales incorrectas' });
 
@@ -338,9 +338,9 @@ app.post('/api/chats/private', auth, async (req, res) => {
     // Buscar chat existente entre los dos
     const { data: myChats } = await supabase.from('chat_participants').select('chat_id').eq('user_id', req.user.id);
     const { data: theirChats } = await supabase.from('chat_participants').select('chat_id').eq('user_id', targetId);
-    const myIds = (myChats||[]).map((c:any)=>c.chat_id);
-    const theirIds = (theirChats||[]).map((c:any)=>c.chat_id);
-    const common = myIds.filter((id:string)=>theirIds.includes(id));
+    const myIds = (myChats||[]).map(c => c.chat_id);
+    const theirIds = (theirChats||[]).map(c => c.chat_id);
+    const common = myIds.filter(id => theirIds.includes(id));
 
     if (common.length > 0) {
       const { data: existing } = await supabase.from('chats').select('*').eq('id', common[0]).single();
@@ -1645,6 +1645,105 @@ app.get('/api/noticias/:id', auth, async (req, res) => {
   const noticia = NOTICIAS.find(n => n.id === req.params.id);
   if (!noticia) return res.status(404).json({ message: 'Noticia no encontrada' });
   res.json({ ...noticia, content: `Contenido completo de: ${noticia.title}. Esta noticia fue publicada por ${noticia.source}.` });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// GRUPOS DE CHAT
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/chats/group', auth, async (req, res) => {
+  try {
+    const { name, participant_ids, avatar_url } = req.body;
+    if (!name || !participant_ids?.length) return res.status(400).json({ message: 'Nombre y participantes requeridos' });
+
+    const { data: chat, error } = await supabase.from('chats')
+      .insert({ type: 'group', name, avatar_url: avatar_url || null, created_by: req.user.id })
+      .select().single();
+    if (error) throw error;
+
+    const allIds = [...new Set([req.user.id, ...participant_ids])];
+    await supabase.from('chat_participants').insert(allIds.map(uid => ({ chat_id: chat.id, user_id: uid })));
+
+    res.json({ ...chat, participants: allIds });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// Añadir participante a grupo
+app.post('/api/chats/:chatId/participants', auth, async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    await supabase.from('chat_participants').upsert({ chat_id: req.params.chatId, user_id });
+    res.json({ message: 'Participante añadido' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// NOTIFICACIONES
+// ══════════════════════════════════════════════════════════════════
+app.get('/api/notifications', auth, async (req, res) => {
+  try {
+    // Mensajes no leídos como notificaciones
+    const { data: parts } = await supabase.from('chat_participants').select('chat_id').eq('user_id', req.user.id);
+    const chatIds = (parts || []).map(p => p.chat_id);
+    if (!chatIds.length) return res.json([]);
+
+    const { data: msgs } = await supabase.from('messages')
+      .select('id, text, chat_id, sender_id, created_at, users!sender_id(full_name, avatar_url)')
+      .in('chat_id', chatIds)
+      .neq('sender_id', req.user.id)
+      .eq('status', 'sent')
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    res.json(msgs || []);
+  } catch (e) { res.json([]); }
+});
+
+// Marcar mensajes como leídos
+app.post('/api/chats/:chatId/read', auth, async (req, res) => {
+  try {
+    await supabase.from('messages')
+      .update({ status: 'read' })
+      .eq('chat_id', req.params.chatId)
+      .neq('sender_id', req.user.id);
+    res.json({ message: 'Mensajes marcados como leídos' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// CONTACTOS CON FOTO Y PERFIL
+// ══════════════════════════════════════════════════════════════════
+app.get('/api/contacts', auth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('contacts')
+      .select('*, users!contact_id(id, phone, full_name, avatar_url)')
+      .eq('user_id', req.user.id);
+    res.json((data || []).map(c => ({
+      id: c.contact_id,
+      name: c.nickname || c.users?.full_name || 'Contacto',
+      phone: c.users?.phone || '',
+      avatar_url: c.users?.avatar_url || '',
+      addedDate: c.created_at,
+    })));
+  } catch (e) { res.json([]); }
+});
+
+app.post('/api/contacts', auth, async (req, res) => {
+  try {
+    const { phone, name } = req.body;
+    const { data: found } = await supabase.from('users').select('id, phone, full_name, avatar_url').eq('phone', phone).single();
+    if (!found) return res.status(404).json({ message: 'Usuario no encontrado' });
+    await supabase.from('contacts').upsert({ user_id: req.user.id, contact_id: found.id, nickname: name || found.full_name });
+    res.json({ id: found.id, name: found.full_name, phone: found.phone, avatar_url: found.avatar_url });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// Perfil público de un usuario
+app.get('/api/users/:userId', auth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('users').select('id, phone, full_name, avatar_url, created_at').eq('id', req.params.userId).single();
+    if (!data) return res.status(404).json({ message: 'Usuario no encontrado' });
+    res.json(data);
+  } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 // ══════════════════════════════════════════════════════════════════
