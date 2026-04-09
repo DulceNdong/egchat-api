@@ -1,4 +1,4 @@
-// dotenv solo en local (en Render las vars vienen del dashboard)
+﻿// dotenv solo en local (en Render las vars vienen del dashboard)
 try { require('dotenv').config(); } catch(e) {}
 const express = require('express');
 const cors = require('cors');
@@ -10,7 +10,7 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'egchat_secret_2026';
 
-// ── Supabase ──────────────────────────────────────────────────────
+// â”€â”€ Supabase â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const supabase = createClient(
   process.env.SUPABASE_URL || '',
   process.env.SUPABASE_SERVICE_KEY || ''
@@ -19,7 +19,7 @@ const supabase = createClient(
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ── Middleware auth ───────────────────────────────────────────────
+// â”€â”€ Middleware auth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const auth = (req, res, next) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ message: 'Token requerido' });
@@ -27,11 +27,11 @@ const auth = (req, res, next) => {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch {
-    res.status(401).json({ message: 'Token inválido o expirado' });
+    res.status(401).json({ message: 'Token invÃ¡lido o expirado' });
   }
 };
 
-// ── ROOT ──────────────────────────────────────────────────────────
+// â”€â”€ ROOT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app.get('/', (req, res) => res.json({
   message: 'EGCHAT API funcionando!',
   version: '2.5.0',
@@ -42,16 +42,16 @@ app.get('/', (req, res) => res.json({
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
 app.get('/debug', (req, res) => res.json({
-  supabase_url: process.env.SUPABASE_URL ? '✅ set' : '❌ missing',
-  supabase_key: process.env.SUPABASE_SERVICE_KEY ? '✅ set' : '❌ missing',
-  jwt_secret: process.env.JWT_SECRET ? '✅ set' : '❌ missing',
+  supabase_url: process.env.SUPABASE_URL ? 'âœ… set' : 'âŒ missing',
+  supabase_key: process.env.SUPABASE_SERVICE_KEY ? 'âœ… set' : 'âŒ missing',
+  jwt_secret: process.env.JWT_SECRET ? 'âœ… set' : 'âŒ missing',
   node_env: process.env.NODE_ENV || 'not set',
   port: PORT
 }));
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // AUTH
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { phone, password, full_name, avatar_url } = req.body;
@@ -61,7 +61,7 @@ app.post('/api/auth/register', async (req, res) => {
     // Verificar si ya existe
     const { data: existing } = await supabase
       .from('users').select('id').eq('phone', phone).maybeSingle();
-    if (existing) return res.status(409).json({ message: 'El teléfono ya está registrado' });
+    if (existing) return res.status(409).json({ message: 'El telÃ©fono ya estÃ¡ registrado' });
 
     const hashed = await bcrypt.hash(password, 10);
     const { data: user, error } = await supabase
@@ -97,7 +97,7 @@ app.post('/api/auth/login', async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ message: 'Credenciales incorrectas' });
 
-    // Actualizar último acceso
+    // Actualizar Ãºltimo acceso
     await supabase.from('users').update({ last_login: new Date().toISOString() }).eq('id', user.id);
 
     const token = jwt.sign({ id: user.id, phone }, JWT_SECRET, { expiresIn: '30d' });
@@ -131,11 +131,11 @@ app.put('/api/auth/profile', auth, async (req, res) => {
   }
 });
 
-app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'Sesión cerrada' }));
+app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'SesiÃ³n cerrada' }));
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // CONTACTOS
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.get('/api/contacts', auth, async (req, res) => {
   try {
     const { data: contacts } = await supabase
@@ -198,7 +198,7 @@ app.post('/api/contacts/:contactId/block', auth, async (req, res) => {
 });
 
 // ========================================================================
-// CHAT / MENSAJERÍA COMPLETA
+// CHAT / MENSAJERÃA COMPLETA
 // ========================================================================
 
 // Obtener todos los chats del usuario
@@ -211,7 +211,7 @@ app.get('/api/chats', auth, async (req, res) => {
       .eq('user_id', req.user.id);
 
     if (pErr) {
-      // Si la tabla no existe, devolver array vacío
+      // Si la tabla no existe, devolver array vacÃ­o
       return res.json([]);
     }
 
@@ -227,7 +227,7 @@ app.get('/api/chats', auth, async (req, res) => {
 
     if (!chats) return res.json([]);
 
-    // Para cada chat, obtener participantes y último mensaje
+    // Para cada chat, obtener participantes y Ãºltimo mensaje
     const result = await Promise.all(chats.map(async (chat) => {
       const { data: parts } = await supabase
         .from('chat_participants')
@@ -255,11 +255,11 @@ app.get('/api/chats', auth, async (req, res) => {
     res.json(result);
   } catch (e) {
     console.error('Get chats error:', e.message);
-    res.json([]); // Devolver vacío en vez de 500
+    res.json([]); // Devolver vacÃ­o en vez de 500
   }
 });
 
-// Obtener mensajes de un chat específico
+// Obtener mensajes de un chat especÃ­fico
 app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
@@ -319,7 +319,7 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
 });
 
 // Crear chat privado
-// Crear chat privado — usa chat_participants
+// Crear chat privado â€” usa chat_participants
 app.post('/api/chats/private', auth, async (req, res) => {
   try {
     const { participant_id, phone } = req.body;
@@ -351,7 +351,7 @@ app.post('/api/chats/private', auth, async (req, res) => {
     const { data: chat, error } = await supabase.from('chats').insert({ type:'private', created_by: req.user.id }).select().single();
     if (error) throw error;
 
-    // Añadir participantes
+    // AÃ±adir participantes
     await supabase.from('chat_participants').insert([
       { chat_id: chat.id, user_id: req.user.id },
       { chat_id: chat.id, user_id: targetId }
@@ -361,22 +361,8 @@ app.post('/api/chats/private', auth, async (req, res) => {
     const { data: other } = await supabase.from('users').select('id,full_name,phone,avatar_url').eq('id', targetId).single();
 
     res.json({ ...chat, other_user: other });
-  } catch (e: any) {
-    console.error('Create private chat error:', e.message);
-    res.status(500).json({ message: e.message });
-  }
-});
-      participants: [
-        { user_id: req.user.id },
-        { user_id: participant_id, ...otherUser }
-      ],
-      last_message: null,
-      unread_count: 0
-    };
-
-    res.status(201).json(formattedChat);
   } catch (e) {
-    console.error('Create private chat error:', e);
+    console.error('Create private chat error:', e.message);
     res.status(500).json({ message: e.message });
   }
 });
@@ -394,7 +380,7 @@ app.post('/api/chats/group', auth, async (req, res) => {
       participant_ids.push(req.user.id);
     }
 
-    // Obtener información de los participantes
+    // Obtener informaciÃ³n de los participantes
     const { data: participants, error: userError } = await supabase
       .from('users')
       .select('id, phone, full_name, avatar_url')
@@ -436,7 +422,7 @@ app.post('/api/chats/group', auth, async (req, res) => {
   }
 });
 
-// Marcar mensajes como leídos
+// Marcar mensajes como leÃ­dos
 app.post('/api/chats/:chatId/read', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
@@ -454,7 +440,7 @@ app.post('/api/chats/:chatId/read', auth, async (req, res) => {
       return res.status(403).json({ message: 'No tienes acceso a este chat' });
     }
 
-    // Marcar mensajes como leídos hasta el mensaje especificado
+    // Marcar mensajes como leÃ­dos hasta el mensaje especificado
     const { error: updateError } = await supabase
       .from('message_reads')
       .upsert({
@@ -468,14 +454,14 @@ app.post('/api/chats/:chatId/read', auth, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Resetear contador de no leídos
+    // Resetear contador de no leÃ­dos
     await supabase
       .from('chat_participants')
       .update({ unread_count: 0 })
       .eq('chat_id', chatId)
       .eq('user_id', req.user.id);
 
-    res.json({ message: 'Mensajes marcados como leídos' });
+    res.json({ message: 'Mensajes marcados como leÃ­dos' });
   } catch (e) {
     console.error('Mark as read error:', e);
     res.status(500).json({ message: e.message });
@@ -499,7 +485,7 @@ app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
       return res.status(403).json({ message: 'No tienes acceso a este chat' });
     }
 
-    // Aquí iría la lógica de subida de archivos a un servicio como AWS S3
+    // AquÃ­ irÃ­a la lÃ³gica de subida de archivos a un servicio como AWS S3
     // Por ahora, simulamos la subida
     const fileUrl = `https://storage.egchat-gq.com/chats/${chatId}/${Date.now()}.jpg`;
     
@@ -550,9 +536,9 @@ app.delete('/api/messages/:messageId', auth, async (req, res) => {
   }
 });
 
-// ══════════════════════════════════════════════════════════
-// CONTACTOS - GESTIÓN COMPLETA
-// ══════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// CONTACTOS - GESTIÃ“N COMPLETA
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 // Obtener todos los contactos del usuario
 app.get('/api/contacts', auth, async (req, res) => {
@@ -754,10 +740,10 @@ app.get('/api/contacts/search', auth, async (req, res) => {
     const { q } = req.query;
     
     if (!q || q.length < 2) {
-      return res.status(400).json({ message: 'La búsqueda debe tener al menos 2 caracteres' });
+      return res.status(400).json({ message: 'La bÃºsqueda debe tener al menos 2 caracteres' });
     }
 
-    // Buscar usuarios por teléfono o nombre
+    // Buscar usuarios por telÃ©fono o nombre
     const { data: users, error } = await supabase
       .from('users')
       .select('id, phone, full_name, avatar_url, last_seen')
@@ -774,9 +760,9 @@ app.get('/api/contacts/search', auth, async (req, res) => {
   }
 });
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // WALLET
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.get('/api/wallet/balance', auth, async (req, res) => {
   let { data: wallet } = await supabase
     .from('wallets').select('balance, currency').eq('user_id', req.user.id).single();
@@ -805,7 +791,7 @@ app.get('/api/wallet/transactions', auth, async (req, res) => {
 
 app.post('/api/wallet/deposit', auth, async (req, res) => {
   const { amount, method, reference } = req.body;
-  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe inválido' });
+  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe invÃ¡lido' });
 
   const { data: wallet } = await supabase
     .from('wallets').select('balance').eq('user_id', req.user.id).single();
@@ -826,7 +812,7 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
   const { data: wallet } = await supabase
     .from('wallets').select('balance').eq('user_id', req.user.id).single();
 
-  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe inválido' });
+  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe invÃ¡lido' });
   if (!wallet || amount > wallet.balance) return res.status(400).json({ message: 'Saldo insuficiente' });
 
   const newBalance = wallet.balance - amount;
@@ -852,7 +838,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
 
   const { data: tx } = await supabase.from('transactions').insert({
     user_id: req.user.id, type: 'transfer_sent', amount, method: 'EGCHAT',
-    reference: `A: ${to} · ${concept || ''}`, status: 'completed'
+    reference: `A: ${to} Â· ${concept || ''}`, status: 'completed'
   }).select().single();
 
   res.json({ balance: newBalance, transaction: tx });
@@ -861,16 +847,16 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
 app.post('/api/wallet/recharge-code', auth, async (req, res) => {
   const { code } = req.body;
   if (!code || code.replace(/-/g, '').length !== 16)
-    return res.status(400).json({ message: 'Código inválido' });
+    return res.status(400).json({ message: 'CÃ³digo invÃ¡lido' });
 
-  // Verificar si el código ya fue usado
+  // Verificar si el cÃ³digo ya fue usado
   const { data: usedCode } = await supabase
     .from('recharge_codes').select('*').eq('code', code).single();
 
-  if (!usedCode) return res.status(400).json({ message: 'Código no válido' });
-  if (usedCode.used || usedCode.is_used) return res.status(400).json({ message: 'Código ya utilizado' });
+  if (!usedCode) return res.status(400).json({ message: 'CÃ³digo no vÃ¡lido' });
+  if (usedCode.used || usedCode.is_used) return res.status(400).json({ message: 'CÃ³digo ya utilizado' });
   if (usedCode.expires_at && new Date(usedCode.expires_at) < new Date())
-    return res.status(400).json({ message: 'Código expirado' });
+    return res.status(400).json({ message: 'CÃ³digo expirado' });
 
   const amount = usedCode?.amount || 5000;
 
@@ -884,16 +870,16 @@ app.post('/api/wallet/recharge-code', auth, async (req, res) => {
   await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
 
   await supabase.from('transactions').insert({
-    user_id: req.user.id, type: 'deposit', amount, method: 'Código de recarga',
+    user_id: req.user.id, type: 'deposit', amount, method: 'CÃ³digo de recarga',
     reference: code, status: 'completed'
   });
 
-  res.json({ balance: newBalance, amount, message: `${amount.toLocaleString()} XAF añadidos` });
+  res.json({ balance: newBalance, amount, message: `${amount.toLocaleString()} XAF aÃ±adidos` });
 });
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // LIA-25
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.post('/api/lia/chat', auth, async (req, res) => {
   const { message } = req.body;
   const lower = message.toLowerCase();
@@ -903,27 +889,27 @@ app.post('/api/lia/chat', auth, async (req, res) => {
 
   let reply = '';
   if (lower.includes('saldo') || lower.includes('balance'))
-    reply = `Tu saldo actual es **${balance.toLocaleString()} XAF**. ¿Deseas recargar o retirar?`;
+    reply = `Tu saldo actual es **${balance.toLocaleString()} XAF**. Â¿Deseas recargar o retirar?`;
   else if (lower.includes('hola') || lower.includes('buenos'))
-    reply = '¡Hola! Soy Lia-25, tu asistente inteligente de EGCHAT. ¿En qué puedo ayudarte hoy?';
+    reply = 'Â¡Hola! Soy Lia-25, tu asistente inteligente de EGCHAT. Â¿En quÃ© puedo ayudarte hoy?';
   else if (lower.includes('taxi'))
-    reply = 'Puedo ayudarte a pedir un taxi. Ve a la sección MiTaxi desde el menú principal.';
+    reply = 'Puedo ayudarte a pedir un taxi. Ve a la secciÃ³n MiTaxi desde el menÃº principal.';
   else if (lower.includes('salud') || lower.includes('hospital'))
-    reply = 'En la sección Salud encontrarás hospitales, farmacias y puedes pedir citas médicas.';
+    reply = 'En la secciÃ³n Salud encontrarÃ¡s hospitales, farmacias y puedes pedir citas mÃ©dicas.';
   else if (lower.includes('supermercado') || lower.includes('compra'))
-    reply = 'Puedes hacer compras en línea desde la sección Supermercados. Tenemos tiendas en Malabo y Bata.';
+    reply = 'Puedes hacer compras en lÃ­nea desde la secciÃ³n Supermercados. Tenemos tiendas en Malabo y Bata.';
   else if (lower.includes('transferir') || lower.includes('enviar dinero'))
-    reply = 'Para enviar dinero, ve a Mi Monedero → Enviar, o dime el número y el importe.';
+    reply = 'Para enviar dinero, ve a Mi Monedero â†’ Enviar, o dime el nÃºmero y el importe.';
   else if (lower.includes('seguro'))
-    reply = 'Puedes contratar seguros de salud, vehículo, vida y hogar en la sección Seguros.';
+    reply = 'Puedes contratar seguros de salud, vehÃ­culo, vida y hogar en la secciÃ³n Seguros.';
   else if (lower.includes('noticias'))
-    reply = 'Las últimas noticias de Guinea Ecuatorial y del mundo están en la sección Noticias.';
+    reply = 'Las Ãºltimas noticias de Guinea Ecuatorial y del mundo estÃ¡n en la secciÃ³n Noticias.';
   else if (lower.includes('gracias'))
-    reply = '¡De nada! Estoy aquí para ayudarte. ¿Hay algo más?';
+    reply = 'Â¡De nada! Estoy aquÃ­ para ayudarte. Â¿Hay algo mÃ¡s?';
   else
     reply = `Entendido: "${message}". Puedo ayudarte con saldo, transferencias, taxi, salud, supermercados, seguros y noticias.`;
 
-  // Guardar conversación en Supabase
+  // Guardar conversaciÃ³n en Supabase
   await supabase.from('lia_conversations').insert({
     user_id: req.user.id, message, reply
   }).catch(() => {});
@@ -931,9 +917,9 @@ app.post('/api/lia/chat', auth, async (req, res) => {
   res.json({ reply, timestamp: new Date().toISOString() });
 });
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // USER
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.get('/api/user/profile', auth, async (req, res) => {
   const { data: user } = await supabase
     .from('users').select('id, phone, full_name, created_at, last_login').eq('id', req.user.id).single();
@@ -956,15 +942,15 @@ app.post('/api/user/change-password', auth, async (req, res) => {
   const { oldPassword, newPassword } = req.body;
   const { data: user } = await supabase.from('users').select('password_hash').eq('id', req.user.id).single();
   const ok = await bcrypt.compare(oldPassword, user.password_hash);
-  if (!ok) return res.status(401).json({ message: 'Contraseña actual incorrecta' });
+  if (!ok) return res.status(401).json({ message: 'ContraseÃ±a actual incorrecta' });
   const hashed = await bcrypt.hash(newPassword, 10);
   await supabase.from('users').update({ password_hash: hashed }).eq('id', req.user.id);
-  res.json({ message: 'Contraseña actualizada' });
+  res.json({ message: 'ContraseÃ±a actualizada' });
 });
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // CONTACTOS
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.get('/api/contacts', auth, async (req, res) => {
   const { data } = await supabase.from('contacts')
     .select('*, contact:contact_id(id, phone, full_name, avatar_url)')
@@ -997,12 +983,12 @@ app.put('/api/contacts/:id/unblock', auth, async (req, res) => {
   res.json({ message: 'Contacto desbloqueado' });
 });
 
-// ══════════════════════════════════════════════════════════════════
-// SERVICIOS PÚBLICOS (simulados con datos reales de GE)
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// SERVICIOS PÃšBLICOS (simulados con datos reales de GE)
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.post('/api/servicios/segesa/consultar', auth, async (req, res) => {
   const { contrato } = req.body;
-  if (!contrato) return res.status(400).json({ message: 'Número de contrato requerido' });
+  if (!contrato) return res.status(400).json({ message: 'NÃºmero de contrato requerido' });
   res.json({ contrato, titular: 'Cliente SEGESA', importe: Math.floor(Math.random()*15000)+5000, vencimiento: '2026-04-30', estado: 'pendiente', direccion: 'Malabo, Guinea Ecuatorial' });
 });
 
@@ -1018,7 +1004,7 @@ app.post('/api/servicios/segesa/pagar', auth, async (req, res) => {
 
 app.post('/api/servicios/snge/consultar', auth, async (req, res) => {
   const { contrato } = req.body;
-  if (!contrato) return res.status(400).json({ message: 'Número de contrato requerido' });
+  if (!contrato) return res.status(400).json({ message: 'NÃºmero de contrato requerido' });
   res.json({ contrato, titular: 'Cliente SNGE', importe: Math.floor(Math.random()*8000)+2000, vencimiento: '2026-04-30', estado: 'pendiente', direccion: 'Malabo, Guinea Ecuatorial' });
 });
 
@@ -1050,23 +1036,23 @@ app.post('/api/servicios/dgi/pagar', auth, async (req, res) => {
 app.post('/api/servicios/correos/enviar', auth, async (req, res) => {
   const { destinatario, peso, tipo } = req.body;
   const tarifa = tipo === 'express' ? 5000 : 2500;
-  res.json({ tracking: `EG${Date.now()}`, tarifa, estimado: tipo === 'express' ? '1-2 días' : '3-5 días', destinatario, message: 'Paquete registrado correctamente' });
+  res.json({ tracking: `EG${Date.now()}`, tarifa, estimado: tipo === 'express' ? '1-2 dÃ­as' : '3-5 dÃ­as', destinatario, message: 'Paquete registrado correctamente' });
 });
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // SUPERMERCADOS
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 const SUPERMERCADOS = [
   { id: '1', name: 'Supermarket Malabo', city: 'Malabo', address: 'Calle de la Independencia', phone: '+240 222 001', open: true },
   { id: '2', name: 'Tienda Bata Centro', city: 'Bata', address: 'Av. Hassan II', phone: '+240 333 001', open: true },
   { id: '3', name: 'Mercado Mongomo', city: 'Mongomo', address: 'Plaza Central', phone: '+240 444 001', open: false },
 ];
 const PRODUCTOS = [
-  { id: '1', name: 'Arroz 5kg', price: 3500, category: 'Alimentación', stock: 50 },
-  { id: '2', name: 'Aceite 1L', price: 1200, category: 'Alimentación', stock: 30 },
+  { id: '1', name: 'Arroz 5kg', price: 3500, category: 'AlimentaciÃ³n', stock: 50 },
+  { id: '2', name: 'Aceite 1L', price: 1200, category: 'AlimentaciÃ³n', stock: 30 },
   { id: '3', name: 'Agua 6x1.5L', price: 2000, category: 'Bebidas', stock: 100 },
-  { id: '4', name: 'Leche 1L', price: 800, category: 'Lácteos', stock: 20 },
-  { id: '5', name: 'Pan de molde', price: 600, category: 'Panadería', stock: 15 },
+  { id: '4', name: 'Leche 1L', price: 800, category: 'LÃ¡cteos', stock: 20 },
+  { id: '5', name: 'Pan de molde', price: 600, category: 'PanaderÃ­a', stock: 15 },
 ];
 
 app.get('/api/supermarkets', auth, async (req, res) => {
@@ -1097,13 +1083,13 @@ app.get('/api/supermarkets/orders', auth, async (req, res) => {
   res.json(data || []);
 });
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // SALUD
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 const HOSPITALES = [
-  { id: '1', name: 'Hospital General de Malabo', city: 'Malabo', phone: '+240 222 100', emergency: true, specialties: ['Urgencias', 'Cirugía', 'Pediatría'] },
-  { id: '2', name: 'Clínica Santa Isabel', city: 'Malabo', phone: '+240 222 200', emergency: false, specialties: ['Medicina General', 'Ginecología'] },
-  { id: '3', name: 'Hospital Regional de Bata', city: 'Bata', phone: '+240 333 100', emergency: true, specialties: ['Urgencias', 'Traumatología'] },
+  { id: '1', name: 'Hospital General de Malabo', city: 'Malabo', phone: '+240 222 100', emergency: true, specialties: ['Urgencias', 'CirugÃ­a', 'PediatrÃ­a'] },
+  { id: '2', name: 'ClÃ­nica Santa Isabel', city: 'Malabo', phone: '+240 222 200', emergency: false, specialties: ['Medicina General', 'GinecologÃ­a'] },
+  { id: '3', name: 'Hospital Regional de Bata', city: 'Bata', phone: '+240 333 100', emergency: true, specialties: ['Urgencias', 'TraumatologÃ­a'] },
 ];
 const FARMACIAS = [
   { id: '1', name: 'Farmacia Central Malabo', city: 'Malabo', phone: '+240 222 300', open24h: true },
@@ -1123,7 +1109,7 @@ app.get('/api/salud/farmacias', auth, async (req, res) => {
 app.post('/api/salud/citas', auth, async (req, res) => {
   const { hospitalId, especialidad, fecha, motivo } = req.body;
   const hospital = HOSPITALES.find(h => h.id === hospitalId) || HOSPITALES[0];
-  res.json({ citaId: `CITA-${Date.now()}`, hospital: hospital.name, especialidad, fecha, motivo, confirmado: true, message: 'Cita médica confirmada' });
+  res.json({ citaId: `CITA-${Date.now()}`, hospital: hospital.name, especialidad, fecha, motivo, confirmado: true, message: 'Cita mÃ©dica confirmada' });
 });
 
 app.get('/api/salud/medicamentos', auth, async (req, res) => {
@@ -1144,9 +1130,9 @@ app.post('/api/salud/medicamentos/pedido', auth, async (req, res) => {
   res.json({ orderId: `MED-${Date.now()}`, status: 'confirmed', total, eta: '20-30 min', message: 'Pedido de medicamentos confirmado' });
 });
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // TAXI
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.post('/api/taxi/request', auth, async (req, res) => {
   const { origin, dest, type } = req.body;
   const tarifa = type === 'premium' ? 3500 : type === 'moto' ? 800 : 1500;
@@ -1171,12 +1157,12 @@ app.post('/api/taxi/:rideId/cancel', auth, async (req, res) => {
 
 app.post('/api/taxi/:rideId/rate', auth, async (req, res) => {
   const { rating, comment } = req.body;
-  res.json({ message: 'Valoración enviada', rating, rideId: req.params.rideId });
+  res.json({ message: 'ValoraciÃ³n enviada', rating, rideId: req.params.rideId });
 });
 
-// ════════════════════════════════════════════════════════════
-// SEGUROS - COTIZACIONES, PÓLIZAS, RECLAMACIONES
-// ══════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// SEGUROS - COTIZACIONES, PÃ“LIZAS, RECLAMACIONES
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 // Obtener tipos de seguros disponibles
 app.get('/api/insurance/types', auth, async (req, res) => {
@@ -1185,23 +1171,23 @@ app.get('/api/insurance/types', auth, async (req, res) => {
       {
         id: 'salud',
         name: 'Seguro de Salud',
-        icon: '🏥',
-        description: 'Cobertura médica completa',
-        coverage: ['consultas', 'urgencias', 'hospitalización', 'medicamentos'],
+        icon: 'ðŸ¥',
+        description: 'Cobertura mÃ©dica completa',
+        coverage: ['consultas', 'urgencias', 'hospitalizaciÃ³n', 'medicamentos'],
         starting_price: 5000
       },
       {
         id: 'vehiculo',
-        name: 'Seguro de Vehículo',
-        icon: '🚗',
-        description: 'Protección para tu vehículo',
-        coverage: ['colisión', 'robo', 'daños', 'responsabilidad civil'],
+        name: 'Seguro de VehÃ­culo',
+        icon: 'ðŸš—',
+        description: 'ProtecciÃ³n para tu vehÃ­culo',
+        coverage: ['colisiÃ³n', 'robo', 'daÃ±os', 'responsabilidad civil'],
         starting_price: 8000
       },
       {
         id: 'vida',
         name: 'Seguro de Vida',
-        icon: '🛡️',
+        icon: 'ðŸ›¡ï¸',
         description: 'Seguridad para tu familia',
         coverage: ['fallecimiento', 'invalidez', 'enfermedades graves'],
         starting_price: 3000
@@ -1209,9 +1195,9 @@ app.get('/api/insurance/types', auth, async (req, res) => {
       {
         id: 'hogar',
         name: 'Seguro de Hogar',
-        icon: '🏠',
-        description: 'Protección para tu vivienda',
-        coverage: ['incendio', 'robo', 'daños estructurales', 'responsabilidad civil'],
+        icon: 'ðŸ ',
+        description: 'ProtecciÃ³n para tu vivienda',
+        coverage: ['incendio', 'robo', 'daÃ±os estructurales', 'responsabilidad civil'],
         starting_price: 4000
       }
     ];
@@ -1223,13 +1209,13 @@ app.get('/api/insurance/types', auth, async (req, res) => {
   }
 });
 
-// Obtener cotización de seguro
+// Obtener cotizaciÃ³n de seguro
 app.post('/api/insurance/quote', auth, async (req, res) => {
   try {
     const { insurance_type, coverage_amount, duration_months } = req.body;
 
     if (!insurance_type || !coverage_amount || !duration_months) {
-      return res.status(400).json({ message: 'Datos incompletos para cotización' });
+      return res.status(400).json({ message: 'Datos incompletos para cotizaciÃ³n' });
     }
 
     // Calcular prima mensual (ejemplo simple)
@@ -1289,7 +1275,7 @@ app.post('/api/insurance/contract', auth, async (req, res) => {
       return res.status(400).json({ message: 'Saldo insuficiente para contratar seguro' });
     }
 
-    // Crear póliza
+    // Crear pÃ³liza
     const { data: policy } = await supabase
       .from('insurance_policies')
       .insert({
@@ -1313,7 +1299,7 @@ app.post('/api/insurance/contract', auth, async (req, res) => {
       .update({ balance: newBalance })
       .eq('user_id', req.user.id);
 
-    // Registrar transacción
+    // Registrar transacciÃ³n
     await supabase
       .from('transactions')
       .insert({
@@ -1341,7 +1327,7 @@ app.post('/api/insurance/contract', auth, async (req, res) => {
   }
 });
 
-// Obtener pólizas del usuario
+// Obtener pÃ³lizas del usuario
 app.get('/api/insurance/policies', auth, async (req, res) => {
   try {
     const { data: policies } = await supabase
@@ -1357,16 +1343,16 @@ app.get('/api/insurance/policies', auth, async (req, res) => {
   }
 });
 
-// Presentar reclamación
+// Presentar reclamaciÃ³n
 app.post('/api/insurance/claim', auth, async (req, res) => {
   try {
     const { policy_id, claim_type, description, amount } = req.body;
 
     if (!policy_id || !claim_type || !description) {
-      return res.status(400).json({ message: 'Datos incompletos para reclamación' });
+      return res.status(400).json({ message: 'Datos incompletos para reclamaciÃ³n' });
     }
 
-    // Verificar que la póliza pertenece al usuario
+    // Verificar que la pÃ³liza pertenece al usuario
     const { data: policy } = await supabase
       .from('insurance_policies')
       .select('id, user_id, status')
@@ -1374,14 +1360,14 @@ app.post('/api/insurance/claim', auth, async (req, res) => {
       .single();
 
     if (!policy || policy.user_id !== req.user.id) {
-      return res.status(404).json({ message: 'Póliza no encontrada' });
+      return res.status(404).json({ message: 'PÃ³liza no encontrada' });
     }
 
     if (policy.status !== 'active') {
-      return res.status(400).json({ message: 'La póliza no está activa' });
+      return res.status(400).json({ message: 'La pÃ³liza no estÃ¡ activa' });
     }
 
-    // Crear reclamación
+    // Crear reclamaciÃ³n
     const { data: claim } = await supabase
       .from('insurance_claims')
       .insert({
@@ -1397,7 +1383,7 @@ app.post('/api/insurance/claim', auth, async (req, res) => {
       .single();
 
     res.json({
-      message: 'Reclamación presentada exitosamente',
+      message: 'ReclamaciÃ³n presentada exitosamente',
       claim
     });
   } catch (e) {
@@ -1425,48 +1411,48 @@ app.get('/api/insurance/claims', auth, async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════
-// NOTICIAS - CATEGORÍAS, FEEDS, BÚSQUEDA, PERSONALIZACIÓN
-// ════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// NOTICIAS - CATEGORÃAS, FEEDS, BÃšSQUEDA, PERSONALIZACIÃ“N
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-// Obtener categorías de noticias
+// Obtener categorÃ­as de noticias
 app.get('/api/news/categories', auth, async (req, res) => {
   try {
     const categories = [
       {
         id: 'nacional',
         name: 'Nacional',
-        icon: '🇬🇶',
+        icon: 'ðŸ‡¬ðŸ‡¶',
         description: 'Noticias de Guinea Ecuatorial'
       },
       {
         id: 'internacional',
         name: 'Internacional',
-        icon: '🌍',
+        icon: 'ðŸŒ',
         description: 'Noticias del mundo'
       },
       {
         id: 'deportes',
         name: 'Deportes',
-        icon: '⚽',
-        description: 'Fútbol y otros deportes'
+        icon: 'âš½',
+        description: 'FÃºtbol y otros deportes'
       },
       {
         id: 'economia',
-        name: 'Economía',
-        icon: '💰',
+        name: 'EconomÃ­a',
+        icon: 'ðŸ’°',
         description: 'Finanzas y negocios'
       },
       {
         id: 'tecnologia',
-        name: 'Tecnología',
-        icon: '💻',
-        description: 'Tecnología y ciencia'
+        name: 'TecnologÃ­a',
+        icon: 'ðŸ’»',
+        description: 'TecnologÃ­a y ciencia'
       },
       {
         id: 'cultura',
         name: 'Cultura',
-        icon: '🎭',
+        icon: 'ðŸŽ­',
         description: 'Arte y entretenimiento'
       }
     ];
@@ -1478,18 +1464,18 @@ app.get('/api/news/categories', auth, async (req, res) => {
   }
 });
 
-// Obtener noticias por categoría
+// Obtener noticias por categorÃ­a
 app.get('/api/news', auth, async (req, res) => {
   try {
     const { category, page = 1, limit = 20 } = req.query;
 
-    // Noticias simuladas (en producción vendrían de una API real)
+    // Noticias simuladas (en producciÃ³n vendrÃ­an de una API real)
     const allNews = [
       {
         id: '1',
-        title: 'EGCHAT lanza nueva funcionalidad de mensajería instantánea',
+        title: 'EGCHAT lanza nueva funcionalidad de mensajerÃ­a instantÃ¡nea',
         category: 'tecnologia',
-        summary: 'La aplicación EGCHAT anuncia importantes mejoras...',
+        summary: 'La aplicaciÃ³n EGCHAT anuncia importantes mejoras...',
         content: '...',
         image_url: 'https://example.com/egchat-news.jpg',
         published_at: new Date().toISOString(),
@@ -1497,7 +1483,7 @@ app.get('/api/news', auth, async (req, res) => {
       },
       {
         id: '2',
-        title: 'Economía de Guinea Ecuatorial muestra crecimiento',
+        title: 'EconomÃ­a de Guinea Ecuatorial muestra crecimiento',
         category: 'economia',
         summary: 'El Banco Central de Guinea Ecuatorial reporta...',
         content: '...',
@@ -1533,16 +1519,16 @@ app.get('/api/news/search', auth, async (req, res) => {
     const { q, category } = req.query;
 
     if (!q || q.length < 2) {
-      return res.status(400).json({ message: 'La búsqueda debe tener al menos 2 caracteres' });
+      return res.status(400).json({ message: 'La bÃºsqueda debe tener al menos 2 caracteres' });
     }
 
-    // Noticias simuladas para búsqueda
+    // Noticias simuladas para bÃºsqueda
     const searchResults = [
       {
         id: 'search1',
         title: `Resultados para "${q}" en EGCHAT`,
         category: category || 'todos',
-        summary: `Se encontraron artículos relacionados con ${q}...`,
+        summary: `Se encontraron artÃ­culos relacionados con ${q}...`,
         published_at: new Date().toISOString(),
         source: 'SearchEG'
       }
@@ -1602,9 +1588,9 @@ app.get('/api/news/favorites', auth, async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // SEGUROS
-// ══════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 const ASEGURADORAS = [
   { id: '1', name: 'COGE Seguros', products: ['Vida', 'Salud', 'Auto', 'Hogar'] },
@@ -1624,16 +1610,16 @@ app.post('/api/seguros/solicitar', auth, async (req, res) => {
   res.json({ solicitudId: `SEG-${Date.now()}`, status: 'pending', message: 'Solicitud de seguro enviada. Te contactaremos en 24h.' });
 });
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // NOTICIAS
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 const NOTICIAS = [
-  { id: '1', title: 'Presidente anuncia nuevas medidas económicas para 2026', source: 'Presidencia GE', category: 'Política', time: '14:30', isLive: true },
+  { id: '1', title: 'Presidente anuncia nuevas medidas econÃ³micas para 2026', source: 'Presidencia GE', category: 'PolÃ­tica', time: '14:30', isLive: true },
   { id: '2', title: 'CEMAC aprueba nuevo marco financiero regional', source: 'Noticias CEMAC', category: 'Finanzas', time: '13:45' },
-  { id: '3', title: 'Ministerio de Salud reporta avances en vacunación', source: 'Ministerio de Información', category: 'Salud', time: '12:20' },
-  { id: '4', title: 'Nueva tecnología 5G llega a Malabo', source: 'TVGE', category: 'Tecnología', time: '11:15' },
-  { id: '5', title: 'Selección nacional se prepara para eliminatorias', source: 'Radio Nacional', category: 'Deportes', time: '10:30' },
-  { id: '6', title: 'BEAC anuncia nuevas políticas monetarias', source: 'BEAC', category: 'Finanzas', time: '09:00' },
+  { id: '3', title: 'Ministerio de Salud reporta avances en vacunaciÃ³n', source: 'Ministerio de InformaciÃ³n', category: 'Salud', time: '12:20' },
+  { id: '4', title: 'Nueva tecnologÃ­a 5G llega a Malabo', source: 'TVGE', category: 'TecnologÃ­a', time: '11:15' },
+  { id: '5', title: 'SelecciÃ³n nacional se prepara para eliminatorias', source: 'Radio Nacional', category: 'Deportes', time: '10:30' },
+  { id: '6', title: 'BEAC anuncia nuevas polÃ­ticas monetarias', source: 'BEAC', category: 'Finanzas', time: '09:00' },
 ];
 
 app.get('/api/noticias', auth, async (req, res) => {
@@ -1647,9 +1633,9 @@ app.get('/api/noticias/:id', auth, async (req, res) => {
   res.json({ ...noticia, content: `Contenido completo de: ${noticia.title}. Esta noticia fue publicada por ${noticia.source}.` });
 });
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // GRUPOS DE CHAT
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.post('/api/chats/group', auth, async (req, res) => {
   try {
     const { name, participant_ids, avatar_url } = req.body;
@@ -1667,21 +1653,21 @@ app.post('/api/chats/group', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// Añadir participante a grupo
+// AÃ±adir participante a grupo
 app.post('/api/chats/:chatId/participants', auth, async (req, res) => {
   try {
     const { user_id } = req.body;
     await supabase.from('chat_participants').upsert({ chat_id: req.params.chatId, user_id });
-    res.json({ message: 'Participante añadido' });
+    res.json({ message: 'Participante aÃ±adido' });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // NOTIFICACIONES
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.get('/api/notifications', auth, async (req, res) => {
   try {
-    // Mensajes no leídos como notificaciones
+    // Mensajes no leÃ­dos como notificaciones
     const { data: parts } = await supabase.from('chat_participants').select('chat_id').eq('user_id', req.user.id);
     const chatIds = (parts || []).map(p => p.chat_id);
     if (!chatIds.length) return res.json([]);
@@ -1698,20 +1684,20 @@ app.get('/api/notifications', auth, async (req, res) => {
   } catch (e) { res.json([]); }
 });
 
-// Marcar mensajes como leídos
+// Marcar mensajes como leÃ­dos
 app.post('/api/chats/:chatId/read', auth, async (req, res) => {
   try {
     await supabase.from('messages')
       .update({ status: 'read' })
       .eq('chat_id', req.params.chatId)
       .neq('sender_id', req.user.id);
-    res.json({ message: 'Mensajes marcados como leídos' });
+    res.json({ message: 'Mensajes marcados como leÃ­dos' });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // CONTACTOS CON FOTO Y PERFIL
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.get('/api/contacts', auth, async (req, res) => {
   try {
     const { data } = await supabase.from('contacts').select('*').eq('user_id', req.user.id);
@@ -1740,7 +1726,7 @@ app.post('/api/contacts', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// Perfil público de un usuario
+// Perfil pÃºblico de un usuario
 app.get('/api/users/:userId', auth, async (req, res) => {
   try {
     const { data } = await supabase.from('users').select('id, phone, full_name, avatar_url, created_at').eq('id', req.params.userId).single();
@@ -1749,13 +1735,14 @@ app.get('/api/users/:userId', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // START
-// ══════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.listen(PORT, () => {
-  console.log(`\n🚀 EGCHAT API + Supabase en http://localhost:${PORT}`);
-  console.log(`   Supabase: ${process.env.SUPABASE_URL ? '✅ Conectado' : '⚠️  Sin configurar'}`);
+  console.log(`\nðŸš€ EGCHAT API + Supabase en http://localhost:${PORT}`);
+  console.log(`   Supabase: ${process.env.SUPABASE_URL ? 'âœ… Conectado' : 'âš ï¸  Sin configurar'}`);
   console.log(`   Auth:   POST /api/auth/register | /api/auth/login`);
   console.log(`   Wallet: GET  /api/wallet/balance | POST /api/wallet/deposit`);
   console.log(`   Lia-25: POST /api/lia/chat\n`);
 });
+
