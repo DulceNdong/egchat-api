@@ -54,7 +54,7 @@ app.get('/debug', (req, res) => res.json({
 // ══════════════════════════════════════════════════════════════════
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { phone, password, full_name } = req.body;
+    const { phone, password, full_name, avatar_url } = req.body;
     if (!phone || !password || !full_name)
       return res.status(400).json({ message: 'phone, password y full_name son requeridos' });
 
@@ -66,8 +66,8 @@ app.post('/api/auth/register', async (req, res) => {
     const hashed = await bcrypt.hash(password, 10);
     const { data: user, error } = await supabase
       .from('users')
-      .insert({ phone, full_name, password_hash: hashed })
-      .select('id, phone, full_name')
+      .insert({ phone, full_name, password_hash: hashed, avatar_url: avatar_url || null })
+      .select('id, phone, full_name, avatar_url')
       .single();
 
     if (error) throw error;
@@ -101,7 +101,7 @@ app.post('/api/auth/login', async (req, res) => {
     await supabase.from('users').update({ last_login: new Date().toISOString() }).eq('id', user.id);
 
     const token = jwt.sign({ id: user.id, phone }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token, user: { id: user.id, phone: user.phone, full_name: user.full_name } });
+    res.json({ token, user: { id: user.id, phone: user.phone, full_name: user.full_name, avatar_url: user.avatar_url } });
   } catch (e) {
     console.error('Login error:', e);
     res.status(500).json({ message: e.message });
@@ -110,12 +110,92 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/auth/me', auth, async (req, res) => {
   const { data: user } = await supabase
-    .from('users').select('id, phone, full_name, created_at').eq('id', req.user.id).single();
+    .from('users').select('id, phone, full_name, avatar_url, created_at').eq('id', req.user.id).single();
   if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
   res.json(user);
 });
 
+app.put('/api/auth/profile', auth, async (req, res) => {
+  try {
+    const { full_name, avatar_url } = req.body;
+    const { data: user, error } = await supabase
+      .from('users')
+      .update({ full_name, avatar_url })
+      .eq('id', req.user.id)
+      .select('id, phone, full_name, avatar_url')
+      .single();
+    if (error) throw error;
+    res.json(user);
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'Sesión cerrada' }));
+
+// ══════════════════════════════════════════════════════════════════
+// CONTACTOS
+// ══════════════════════════════════════════════════════════════════
+app.get('/api/contacts', auth, async (req, res) => {
+  try {
+    const { data: contacts } = await supabase
+      .from('contacts')
+      .select('id, contact_user_id, name, phone, is_blocked, created_at, users(id, phone, full_name, avatar_url)')
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false });
+    res.json(contacts || []);
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.post('/api/contacts', auth, async (req, res) => {
+  try {
+    const { contact_user_id, name, phone } = req.body;
+    // Verificar que no sea el mismo usuario
+    if (contact_user_id === req.user.id) return res.status(400).json({ message: 'No puedes agregarte a ti mismo como contacto' });
+    
+    const { data: contact, error } = await supabase
+      .from('contacts')
+      .insert({ user_id: req.user.id, contact_user_id, name: name || '', phone })
+      .select('id, contact_user_id, name, phone, created_at')
+      .single();
+    if (error) throw error;
+    res.status(201).json(contact);
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.delete('/api/contacts/:contactId', auth, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('contacts')
+      .delete()
+      .eq('id', req.params.contactId)
+      .eq('user_id', req.user.id);
+    if (error) throw error;
+    res.json({ message: 'Contacto eliminado' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.post('/api/contacts/:contactId/block', auth, async (req, res) => {
+  try {
+    const { data: contact, error } = await supabase
+      .from('contacts')
+      .update({ is_blocked: true })
+      .eq('id', req.params.contactId)
+      .eq('user_id', req.user.id)
+      .select('id, is_blocked')
+      .single();
+    if (error) throw error;
+    res.json(contact);
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
 
 // ========================================================================
 // CHAT / MENSAJERÍA COMPLETA
@@ -239,65 +319,53 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
 });
 
 // Crear chat privado
+// Crear chat privado — usa chat_participants
 app.post('/api/chats/private', auth, async (req, res) => {
   try {
-    const { participant_id } = req.body;
+    const { participant_id, phone } = req.body;
+    let targetId = participant_id;
 
-    if (!participant_id) {
-      return res.status(400).json({ message: 'El ID del participante es requerido' });
+    // Si viene phone en vez de ID, buscar el usuario
+    if (!targetId && phone) {
+      const { data: found } = await supabase.from('users').select('id,full_name,phone,avatar_url').eq('phone', phone).single();
+      if (!found) return res.status(404).json({ message: 'Usuario no encontrado con ese numero' });
+      targetId = found.id;
     }
 
-    if (participant_id === req.user.id) {
-      return res.status(400).json({ message: 'No puedes crear un chat contigo mismo' });
+    if (!targetId) return res.status(400).json({ message: 'participant_id o phone requerido' });
+    if (targetId === req.user.id) return res.status(400).json({ message: 'No puedes chatear contigo mismo' });
+
+    // Buscar chat existente entre los dos
+    const { data: myChats } = await supabase.from('chat_participants').select('chat_id').eq('user_id', req.user.id);
+    const { data: theirChats } = await supabase.from('chat_participants').select('chat_id').eq('user_id', targetId);
+    const myIds = (myChats||[]).map((c:any)=>c.chat_id);
+    const theirIds = (theirChats||[]).map((c:any)=>c.chat_id);
+    const common = myIds.filter((id:string)=>theirIds.includes(id));
+
+    if (common.length > 0) {
+      const { data: existing } = await supabase.from('chats').select('*').eq('id', common[0]).single();
+      return res.json(existing);
     }
 
-    // Verificar si ya existe un chat privado entre estos usuarios
-    const { data: existingChat, error: checkError } = await supabase
-      .from('chats')
-      .select('id')
-      .eq('type', 'private')
-      .contains('participants', JSON.stringify([
-        { user_id: req.user.id },
-        { user_id: participant_id }
-      ]))
-      .single();
+    // Crear nuevo chat
+    const { data: chat, error } = await supabase.from('chats').insert({ type:'private', created_by: req.user.id }).select().single();
+    if (error) throw error;
 
-    if (existingChat) {
-      return res.json(existingChat);
-    }
+    // Añadir participantes
+    await supabase.from('chat_participants').insert([
+      { chat_id: chat.id, user_id: req.user.id },
+      { chat_id: chat.id, user_id: targetId }
+    ]);
 
-    // Obtener información del otro usuario
-    const { data: otherUser, error: userError } = await supabase
-      .from('users')
-      .select('id, phone, full_name, avatar_url')
-      .eq('id', participant_id)
-      .single();
+    // Obtener info del otro usuario
+    const { data: other } = await supabase.from('users').select('id,full_name,phone,avatar_url').eq('id', targetId).single();
 
-    if (userError || !otherUser) {
-      return res.status(404).json({ message: 'Usuario no encontrado' });
-    }
-
-    // Crear nuevo chat privado
-    const { data: chat, error: createError } = await supabase
-      .from('chats')
-      .insert({
-        type: 'private',
-        participants: [
-          { user_id: req.user.id },
-          { user_id: participant_id }
-        ],
-        created_by: req.user.id,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-      .select()
-      .single();
-
-    if (createError) throw createError;
-
-    // Formatear respuesta con información de participantes
-    const formattedChat = {
-      ...chat,
+    res.json({ ...chat, other_user: other });
+  } catch (e: any) {
+    console.error('Create private chat error:', e.message);
+    res.status(500).json({ message: e.message });
+  }
+});
       participants: [
         { user_id: req.user.id },
         { user_id: participant_id, ...otherUser }
@@ -875,7 +943,7 @@ app.get('/api/user/profile', auth, async (req, res) => {
 
 app.put('/api/user/profile', auth, async (req, res) => {
   const { full_name, avatar_url, city } = req.body;
-  const updates: any = {};
+  const updates = {};
   if (full_name) updates.full_name = full_name;
   if (avatar_url !== undefined) updates.avatar_url = avatar_url;
   if (city) updates.city = city;
