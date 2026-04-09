@@ -874,9 +874,13 @@ app.get('/api/user/profile', auth, async (req, res) => {
 });
 
 app.put('/api/user/profile', auth, async (req, res) => {
-  const { full_name } = req.body;
+  const { full_name, avatar_url, city } = req.body;
+  const updates: any = {};
+  if (full_name) updates.full_name = full_name;
+  if (avatar_url !== undefined) updates.avatar_url = avatar_url;
+  if (city) updates.city = city;
   const { data: user } = await supabase
-    .from('users').update({ full_name }).eq('id', req.user.id).select('id, phone, full_name').single();
+    .from('users').update(updates).eq('id', req.user.id).select('id, phone, full_name, avatar_url').single();
   res.json(user);
 });
 
