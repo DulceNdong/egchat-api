@@ -1714,14 +1714,17 @@ app.post('/api/chats/:chatId/read', auth, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════
 app.get('/api/contacts', auth, async (req, res) => {
   try {
-    const { data } = await supabase.from('contacts')
-      .select('*, users!contact_id(id, phone, full_name, avatar_url)')
-      .eq('user_id', req.user.id);
-    res.json((data || []).map(c => ({
+    const { data } = await supabase.from('contacts').select('*').eq('user_id', req.user.id);
+    if (!data || data.length === 0) return res.json([]);
+    // Obtener info de cada contacto
+    const contactIds = data.map(c => c.contact_id);
+    const { data: users } = await supabase.from('users').select('id, phone, full_name, avatar_url').in('id', contactIds);
+    const userMap = Object.fromEntries((users||[]).map(u => [u.id, u]));
+    res.json(data.map(c => ({
       id: c.contact_id,
-      name: c.nickname || c.users?.full_name || 'Contacto',
-      phone: c.users?.phone || '',
-      avatar_url: c.users?.avatar_url || '',
+      name: c.nickname || userMap[c.contact_id]?.full_name || 'Contacto',
+      phone: userMap[c.contact_id]?.phone || '',
+      avatar_url: userMap[c.contact_id]?.avatar_url || '',
       addedDate: c.created_at,
     })));
   } catch (e) { res.json([]); }
