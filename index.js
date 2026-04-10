@@ -1308,6 +1308,17 @@ app.get('/api/supermarkets/orders', auth, async (req, res) => {
   res.json(data || []);
 });
 
+app.get('/api/supermarkets/orders/:id', auth, async (req, res) => {
+  const { data } = await supabase
+    .from('transactions')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .eq('id', req.params.id)
+    .maybeSingle();
+  if (!data) return res.status(404).json({ message: 'Pedido no encontrado' });
+  res.json(data);
+});
+
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // SALUD
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -1835,6 +1846,17 @@ app.post('/api/seguros/solicitar', auth, async (req, res) => {
   res.json({ solicitudId: `SEG-${Date.now()}`, status: 'pending', message: 'Solicitud de seguro enviada. Te contactaremos en 24h.' });
 });
 
+app.post('/api/seguros/solicitudes/:solicitudId/documentos', auth, async (req, res) => {
+  const { solicitudId } = req.params;
+  const { tipo } = req.body || {};
+  res.status(201).json({
+    solicitudId,
+    tipo: tipo || 'documento',
+    status: 'uploaded',
+    message: 'Documento recibido'
+  });
+});
+
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // NOTICIAS
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -1856,6 +1878,21 @@ app.get('/api/noticias/:id', auth, async (req, res) => {
   const noticia = NOTICIAS.find(n => n.id === req.params.id);
   if (!noticia) return res.status(404).json({ message: 'Noticia no encontrada' });
   res.json({ ...noticia, content: `Contenido completo de: ${noticia.title}. Esta noticia fue publicada por ${noticia.source}.` });
+});
+
+app.post('/api/user/avatar', auth, async (req, res) => {
+  res.json({
+    message: 'Avatar recibido',
+    avatar_url: `https://egchat-api.onrender.com/static/avatars/${req.user.id}-${Date.now()}.jpg`
+  });
+});
+
+app.post('/lia/analyze', auth, async (_req, res) => {
+  res.json({ analysis: 'Análisis completado.' });
+});
+
+app.post('/lia/transcribe', auth, async (_req, res) => {
+  res.json({ text: 'Transcripción completada.' });
 });
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
