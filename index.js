@@ -77,6 +77,16 @@ const resetTable = async (table, column = 'id') => {
   }
 };
 
+const checkTable = async (table) => {
+  try {
+    const { error } = await supabase.from(table).select('*').limit(1);
+    if (error) return { table, ok: false, error: error.message };
+    return { table, ok: true };
+  } catch (e) {
+    return { table, ok: false, error: e.message || 'unknown error' };
+  }
+};
+
 // --- ROOT -------------------------------------------------------------
 app.get('/', (req, res) => res.json({
   message: 'EGCHAT API funcionando!',
@@ -94,6 +104,30 @@ app.get('/debug', (req, res) => res.json({
   node_env: process.env.NODE_ENV || 'not set',
   port: PORT
 }));
+
+app.get('/api/system/dependencies', async (_req, res) => {
+  const required = [
+    'users',
+    'wallets',
+    'transactions',
+    'recharge_codes',
+    'contacts',
+    'chats',
+    'chat_participants',
+    'messages',
+    'message_reads',
+    'lia_conversations'
+  ];
+  const checks = await Promise.all(required.map(checkTable));
+  const missing = checks.filter((c) => !c.ok);
+  res.json({
+    ok: missing.length === 0,
+    required_tables: required.length,
+    ready_tables: checks.filter((c) => c.ok).length,
+    missing,
+    hint: missing.length ? 'Ejecuta egchat-api/full_dependencies.sql en Supabase SQL Editor.' : 'Backend listo y sincronizado.'
+  });
+});
 
 // Reset completo de datos para reinicio limpio (usuarios/chats/contactos/etc.)
 app.post('/api/admin/reset-all', async (req, res) => {
