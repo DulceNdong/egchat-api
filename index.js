@@ -62,6 +62,21 @@ const emitToUsers = (userIds, payload) => {
   uniq.forEach((id) => emitToUser(id, payload));
 };
 
+const adminResetKey = process.env.ADMIN_RESET_KEY || JWT_SECRET;
+const ADMIN_RESET_MARKER = '00000000-0000-0000-0000-000000000000';
+const resetTable = async (table, column = 'id') => {
+  try {
+    const query = supabase.from(table).delete();
+    const { error } = (column === 'id')
+      ? await query.neq('id', ADMIN_RESET_MARKER)
+      : await query.not(column, 'is', null);
+    if (error) return { table, ok: false, error: error.message };
+    return { table, ok: true };
+  } catch (e) {
+    return { table, ok: false, error: e.message || 'unknown error' };
+  }
+};
+
 // --- ROOT -------------------------------------------------------------
 app.get('/', (req, res) => res.json({
   message: 'EGCHAT API funcionando!',
@@ -79,6 +94,36 @@ app.get('/debug', (req, res) => res.json({
   node_env: process.env.NODE_ENV || 'not set',
   port: PORT
 }));
+
+// Reset completo de datos para reinicio limpio (usuarios/chats/contactos/etc.)
+app.post('/api/admin/reset-all', async (req, res) => {
+  const keyFromHeader = req.headers['x-admin-key'];
+  const keyFromBody = req.body?.adminKey;
+  const providedKey = typeof keyFromHeader === 'string' ? keyFromHeader : keyFromBody;
+  if (!providedKey || providedKey !== adminResetKey) {
+    return res.status(403).json({ message: 'No autorizado' });
+  }
+
+  const results = [];
+  // Orden importante por claves foráneas (hijos -> padres)
+  results.push(await resetTable('message_reads', 'read_at'));
+  results.push(await resetTable('messages', 'created_at'));
+  results.push(await resetTable('chat_participants', 'joined_at'));
+  results.push(await resetTable('chats', 'created_at'));
+  results.push(await resetTable('contacts', 'created_at'));
+  results.push(await resetTable('wallet_transactions', 'created_at'));
+  results.push(await resetTable('wallets', 'created_at'));
+  results.push(await resetTable('notifications', 'created_at'));
+  results.push(await resetTable('users', 'created_at'));
+
+  const ok = results.filter((r) => r.ok).map((r) => r.table);
+  const failed = results.filter((r) => !r.ok);
+  return res.json({
+    message: 'Reset ejecutado',
+    ok_tables: ok,
+    failed
+  });
+});
 
 // Stream SSE para mensajería en tiempo real
 app.get('/api/chat/stream', authFromQuery, (req, res) => {
