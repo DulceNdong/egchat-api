@@ -1235,6 +1235,230 @@ app.post('/api/wallet/reverse/:txId', auth, async (req, res) => {
   res.json({ balance: newBalance, message: 'Reverso aplicado' });
 });
 
+const LEDGER_APPROVAL_THRESHOLD = Number(process.env.LEDGER_APPROVAL_THRESHOLD || 1000000);
+
+const ensureSystemLedgerAccounts = async () => {
+  const baseAccounts = [
+    { code: 'SYS-CASH', name: 'Caja Operativa', account_type: 'asset' },
+    { code: 'SYS-FEES', name: 'Ingresos por Comisiones', account_type: 'income' },
+    { code: 'SYS-SUSPENSE', name: 'Cuenta Puente', account_type: 'liability' }
+  ];
+  for (const a of baseAccounts) {
+    await supabase.from('ledger_accounts').upsert({
+      code: a.code,
+      name: a.name,
+      account_type: a.account_type,
+      currency: 'XAF',
+      is_system: true,
+      is_active: true
+    }, { onConflict: 'code' });
+  }
+};
+
+const makeAccountCode = (userId) => `USR-${String(userId).slice(0, 8)}-${Date.now()}`;
+
+app.get('/api/wallet/ledger/config', auth, async (_req, res) => {
+  res.json({
+    approval_threshold: LEDGER_APPROVAL_THRESHOLD,
+    currency: 'XAF',
+    modes: ['draft', 'posted', 'pending_approval', 'rejected']
+  });
+});
+
+app.get('/api/wallet/ledger/accounts', auth, async (req, res) => {
+  await ensureSystemLedgerAccounts();
+  const scope = String(req.query.scope || 'mine');
+  let query = supabase.from('ledger_accounts').select('*').order('created_at', { ascending: false });
+  if (scope === 'system') query = query.eq('is_system', true);
+  else if (scope === 'all') query = query.or(`is_system.eq.true,user_id.eq.${req.user.id}`);
+  else query = query.eq('user_id', req.user.id);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ message: error.message });
+  res.json(data || []);
+});
+
+app.post('/api/wallet/ledger/accounts', auth, async (req, res) => {
+  const { name, account_type, currency } = req.body || {};
+  if (!name || !account_type) return res.status(400).json({ message: 'name y account_type son requeridos' });
+  const payload = {
+    user_id: req.user.id,
+    code: makeAccountCode(req.user.id),
+    name: String(name).trim(),
+    account_type: String(account_type).trim(),
+    currency: String(currency || 'XAF'),
+    is_system: false,
+    is_active: true
+  };
+  const { data, error } = await supabase.from('ledger_accounts').insert(payload).select().single();
+  if (error) return res.status(500).json({ message: error.message });
+  res.status(201).json(data);
+});
+
+app.get('/api/wallet/ledger/journals', auth, async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 20;
+  const from = (page - 1) * limit;
+  const { data, count, error } = await supabase
+    .from('ledger_journals')
+    .select('*', { count: 'exact' })
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false })
+    .range(from, from + limit - 1);
+  if (error) return res.status(500).json({ message: error.message });
+  res.json({ journals: data || [], total: count || 0 });
+});
+
+app.get('/api/wallet/ledger/journals/:id', auth, async (req, res) => {
+  const id = req.params.id;
+  const { data: journal, error } = await supabase
+    .from('ledger_journals')
+    .select('*')
+    .eq('id', id)
+    .eq('user_id', req.user.id)
+    .maybeSingle();
+  if (error) return res.status(500).json({ message: error.message });
+  if (!journal) return res.status(404).json({ message: 'Asiento no encontrado' });
+  const { data: entries } = await supabase
+    .from('ledger_entries')
+    .select('*, ledger_accounts(code,name,account_type)')
+    .eq('journal_id', id)
+    .order('created_at', { ascending: true });
+  const { data: approval } = await supabase
+    .from('ledger_approvals')
+    .select('*')
+    .eq('journal_id', id)
+    .maybeSingle();
+  res.json({ journal, entries: entries || [], approval: approval || null });
+});
+
+app.post('/api/wallet/ledger/journals', auth, async (req, res) => {
+  await ensureSystemLedgerAccounts();
+  const { concept, reference, lines } = req.body || {};
+  if (!concept || !Array.isArray(lines) || lines.length < 2) {
+    return res.status(400).json({ message: 'concept y al menos 2 líneas son requeridos' });
+  }
+
+  let debit = 0;
+  let credit = 0;
+  const normalized = [];
+  for (const l of lines) {
+    const amount = Number(l?.amount || 0);
+    const entryType = String(l?.entry_type || '');
+    const accountId = String(l?.account_id || '');
+    if (!accountId || !['debit', 'credit'].includes(entryType) || amount <= 0) {
+      return res.status(400).json({ message: 'Líneas inválidas: account_id, entry_type y amount son obligatorios' });
+    }
+    if (entryType === 'debit') debit += amount;
+    else credit += amount;
+    normalized.push({
+      account_id: accountId,
+      entry_type: entryType,
+      amount,
+      currency: String(l?.currency || 'XAF'),
+      memo: l?.memo ? String(l.memo) : null,
+      counterparty_user_id: l?.counterparty_user_id || null
+    });
+  }
+  if (Math.abs(debit - credit) > 0.00001) {
+    return res.status(400).json({ message: 'Asiento no balanceado: total debit debe igualar total credit' });
+  }
+
+  const totalAmount = debit;
+  const requiresApproval = totalAmount >= LEDGER_APPROVAL_THRESHOLD;
+  const status = requiresApproval ? 'pending_approval' : 'posted';
+
+  const { data: journal, error: jErr } = await supabase.from('ledger_journals').insert({
+    user_id: req.user.id,
+    reference: reference || `JR-${Date.now()}`,
+    concept,
+    total_amount: totalAmount,
+    status,
+    requires_approval: requiresApproval,
+    created_by: req.user.id
+  }).select().single();
+  if (jErr) return res.status(500).json({ message: jErr.message });
+
+  const entriesPayload = normalized.map((e) => ({ ...e, journal_id: journal.id }));
+  const { error: eErr } = await supabase.from('ledger_entries').insert(entriesPayload);
+  if (eErr) return res.status(500).json({ message: eErr.message });
+
+  if (requiresApproval) {
+    await supabase.from('ledger_approvals').upsert({
+      journal_id: journal.id,
+      requested_by: req.user.id,
+      status: 'pending'
+    }, { onConflict: 'journal_id' });
+  }
+
+  res.status(201).json({
+    journal_id: journal.id,
+    status: journal.status,
+    requires_approval: journal.requires_approval,
+    total_amount: totalAmount
+  });
+});
+
+app.post('/api/wallet/ledger/journals/:id/approve', auth, async (req, res) => {
+  const id = req.params.id;
+  const { reason } = req.body || {};
+  const { data: journal } = await supabase
+    .from('ledger_journals')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
+  if (!journal) return res.status(404).json({ message: 'Asiento no encontrado' });
+  if (journal.status !== 'pending_approval') return res.status(400).json({ message: 'El asiento no está pendiente de aprobación' });
+  if (String(journal.created_by) === String(req.user.id)) {
+    return res.status(403).json({ message: 'Maker-checker activo: el creador no puede aprobar su propio asiento' });
+  }
+
+  const approvedAt = new Date().toISOString();
+  await supabase.from('ledger_journals').update({
+    status: 'posted',
+    approved_by: req.user.id,
+    approved_at: approvedAt
+  }).eq('id', id);
+
+  await supabase.from('ledger_approvals').upsert({
+    journal_id: id,
+    requested_by: journal.created_by,
+    approved_by: req.user.id,
+    status: 'approved',
+    reason: reason || null,
+    updated_at: approvedAt
+  }, { onConflict: 'journal_id' });
+
+  res.json({ message: 'Asiento aprobado y contabilizado', journal_id: id, approved_at: approvedAt });
+});
+
+app.post('/api/wallet/ledger/journals/:id/reject', auth, async (req, res) => {
+  const id = req.params.id;
+  const { reason } = req.body || {};
+  const { data: journal } = await supabase
+    .from('ledger_journals')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
+  if (!journal) return res.status(404).json({ message: 'Asiento no encontrado' });
+  if (journal.status !== 'pending_approval') return res.status(400).json({ message: 'El asiento no está pendiente de aprobación' });
+  if (String(journal.created_by) === String(req.user.id)) {
+    return res.status(403).json({ message: 'Maker-checker activo: el creador no puede rechazar su propio asiento' });
+  }
+
+  const updatedAt = new Date().toISOString();
+  await supabase.from('ledger_journals').update({ status: 'rejected' }).eq('id', id);
+  await supabase.from('ledger_approvals').upsert({
+    journal_id: id,
+    requested_by: journal.created_by,
+    approved_by: req.user.id,
+    status: 'rejected',
+    reason: reason || 'Rechazado por validador',
+    updated_at: updatedAt
+  }, { onConflict: 'journal_id' });
+
+  res.json({ message: 'Asiento rechazado', journal_id: id });
+});
+
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // LIA-25
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•

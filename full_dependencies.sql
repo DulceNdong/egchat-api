@@ -115,6 +115,56 @@ create table if not exists lia_conversations (
   created_at timestamptz default now()
 );
 
+create table if not exists ledger_accounts (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete cascade,
+  code varchar(40) unique not null,
+  name varchar(120) not null,
+  account_type varchar(30) not null,
+  currency varchar(3) default 'XAF',
+  is_system boolean default false,
+  is_active boolean default true,
+  created_at timestamptz default now()
+);
+
+create table if not exists ledger_journals (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete cascade,
+  reference varchar(80),
+  concept text not null,
+  total_amount numeric(15,2) not null default 0,
+  status varchar(20) not null default 'draft',
+  requires_approval boolean default false,
+  created_by uuid references users(id) on delete set null,
+  approved_by uuid references users(id) on delete set null,
+  approved_at timestamptz,
+  created_at timestamptz default now()
+);
+
+create table if not exists ledger_entries (
+  id uuid primary key default gen_random_uuid(),
+  journal_id uuid references ledger_journals(id) on delete cascade,
+  account_id uuid references ledger_accounts(id) on delete restrict,
+  entry_type varchar(6) not null check (entry_type in ('debit','credit')),
+  amount numeric(15,2) not null check (amount > 0),
+  currency varchar(3) default 'XAF',
+  memo text,
+  counterparty_user_id uuid references users(id) on delete set null,
+  created_at timestamptz default now()
+);
+
+create table if not exists ledger_approvals (
+  id uuid primary key default gen_random_uuid(),
+  journal_id uuid references ledger_journals(id) on delete cascade,
+  requested_by uuid references users(id) on delete set null,
+  approved_by uuid references users(id) on delete set null,
+  status varchar(20) not null default 'pending',
+  reason text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  unique(journal_id)
+);
+
 create index if not exists idx_contacts_user on contacts(user_id);
 create index if not exists idx_contacts_contact on contacts(contact_user_id);
 create index if not exists idx_wallets_user on wallets(user_id);
@@ -124,6 +174,10 @@ create index if not exists idx_chat_participants_user on chat_participants(user_
 create index if not exists idx_messages_chat on messages(chat_id);
 create index if not exists idx_messages_created on messages(created_at desc);
 create index if not exists idx_reads_chat_user on message_reads(chat_id, user_id);
+create index if not exists idx_ledger_accounts_user on ledger_accounts(user_id);
+create index if not exists idx_ledger_journals_user_created on ledger_journals(user_id, created_at desc);
+create index if not exists idx_ledger_entries_journal on ledger_entries(journal_id);
+create index if not exists idx_ledger_approvals_status on ledger_approvals(status);
 
 insert into recharge_codes (code, amount, expires_at)
 values
