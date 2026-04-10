@@ -166,8 +166,8 @@ app.get('/api/chat/stream', authFromQuery, (req, res) => {
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { phone, password, full_name, avatar_url } = req.body;
-    if (!phone || !password || !full_name)
-      return res.status(400).json({ message: 'phone, password y full_name son requeridos' });
+    if (!phone || !password || !full_name || !avatar_url)
+      return res.status(400).json({ message: 'phone, password, full_name y avatar_url son requeridos' });
 
     // Verificar si ya existe
     const { data: existing } = await supabase
@@ -177,7 +177,7 @@ app.post('/api/auth/register', async (req, res) => {
     const hashed = await bcrypt.hash(password, 10);
     const { data: user, error } = await supabase
       .from('users')
-      .insert({ phone, full_name, password_hash: hashed, avatar_url: avatar_url || null })
+      .insert({ phone, full_name, password_hash: hashed, avatar_url })
       .select('id, phone, full_name, avatar_url')
       .single();
 
