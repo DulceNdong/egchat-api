@@ -1102,6 +1102,139 @@ app.post('/api/wallet/recharge-code', auth, async (req, res) => {
   res.json({ balance: newBalance, amount, message: `${amount.toLocaleString()} XAF aÃ±adidos` });
 });
 
+const WALLET_LIMITS = {
+  dailyDeposit: 5000000,
+  dailyWithdraw: 3000000,
+  dailyTransfer: 3000000,
+  perTxTransfer: 1000000
+};
+
+const startOfTodayIso = () => {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+};
+
+const getWalletSafe = async (userId) => {
+  let { data: wallet } = await supabase.from('wallets').select('*').eq('user_id', userId).maybeSingle();
+  if (!wallet) {
+    const { data } = await supabase
+      .from('wallets')
+      .insert({ user_id: userId, balance: 5000, currency: 'XAF' })
+      .select()
+      .single();
+    wallet = data;
+  }
+  return wallet;
+};
+
+const sumTodayByType = async (userId, typePrefix) => {
+  const { data } = await supabase
+    .from('transactions')
+    .select('amount')
+    .eq('user_id', userId)
+    .gte('created_at', startOfTodayIso())
+    .like('type', `${typePrefix}%`);
+  return (data || []).reduce((s, t) => s + Number(t.amount || 0), 0);
+};
+
+app.get('/api/wallet/limits', auth, async (req, res) => {
+  const today = {
+    deposit: await sumTodayByType(req.user.id, 'deposit'),
+    withdraw: await sumTodayByType(req.user.id, 'withdraw'),
+    transfer: await sumTodayByType(req.user.id, 'transfer')
+  };
+  res.json({
+    limits: WALLET_LIMITS,
+    used_today: today,
+    remaining_today: {
+      deposit: Math.max(0, WALLET_LIMITS.dailyDeposit - today.deposit),
+      withdraw: Math.max(0, WALLET_LIMITS.dailyWithdraw - today.withdraw),
+      transfer: Math.max(0, WALLET_LIMITS.dailyTransfer - today.transfer)
+    }
+  });
+});
+
+app.get('/api/wallet/summary', auth, async (req, res) => {
+  const wallet = await getWalletSafe(req.user.id);
+  const { data: last10 } = await supabase
+    .from('transactions')
+    .select('id,type,amount,status,created_at')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false })
+    .limit(10);
+  const pendingHolds = (last10 || []).filter((t) => t.type === 'hold' && t.status === 'pending')
+    .reduce((s, t) => s + Number(t.amount || 0), 0);
+  res.json({
+    balance: Number(wallet?.balance || 0),
+    currency: wallet?.currency || 'XAF',
+    available_balance: Math.max(0, Number(wallet?.balance || 0) - pendingHolds),
+    pending_holds: pendingHolds,
+    recent: last10 || []
+  });
+});
+
+app.post('/api/wallet/hold', auth, async (req, res) => {
+  const amount = Number(req.body?.amount || 0);
+  const reference = req.body?.reference || `HOLD-${Date.now()}`;
+  if (amount <= 0) return res.status(400).json({ message: 'Importe inválido' });
+  const wallet = await getWalletSafe(req.user.id);
+  if (amount > Number(wallet.balance || 0)) return res.status(400).json({ message: 'Saldo insuficiente' });
+  const { data: tx } = await supabase.from('transactions').insert({
+    user_id: req.user.id, type: 'hold', amount, method: 'EGCHAT', reference, status: 'pending'
+  }).select().single();
+  res.status(201).json({ hold: tx, balance: Number(wallet.balance || 0) });
+});
+
+app.post('/api/wallet/hold/:id/capture', auth, async (req, res) => {
+  const holdId = req.params.id;
+  const { data: hold } = await supabase.from('transactions').select('*')
+    .eq('id', holdId).eq('user_id', req.user.id).eq('type', 'hold').maybeSingle();
+  if (!hold) return res.status(404).json({ message: 'Retención no encontrada' });
+  if (hold.status !== 'pending') return res.status(400).json({ message: 'Retención ya procesada' });
+  const wallet = await getWalletSafe(req.user.id);
+  const amount = Number(hold.amount || 0);
+  if (amount > Number(wallet.balance || 0)) return res.status(400).json({ message: 'Saldo insuficiente para captura' });
+  const newBalance = Number(wallet.balance || 0) - amount;
+  await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
+  await supabase.from('transactions').update({ status: 'captured' }).eq('id', holdId);
+  const { data: tx } = await supabase.from('transactions').insert({
+    user_id: req.user.id, type: 'payment_capture', amount, method: 'EGCHAT',
+    reference: `CAPTURE:${hold.reference || holdId}`, status: 'completed'
+  }).select().single();
+  res.json({ balance: newBalance, transaction: tx });
+});
+
+app.post('/api/wallet/hold/:id/cancel', auth, async (req, res) => {
+  const holdId = req.params.id;
+  const { data: hold } = await supabase.from('transactions').select('*')
+    .eq('id', holdId).eq('user_id', req.user.id).eq('type', 'hold').maybeSingle();
+  if (!hold) return res.status(404).json({ message: 'Retención no encontrada' });
+  if (hold.status !== 'pending') return res.status(400).json({ message: 'Retención ya procesada' });
+  await supabase.from('transactions').update({ status: 'cancelled' }).eq('id', holdId);
+  res.json({ message: 'Retención cancelada' });
+});
+
+app.post('/api/wallet/reverse/:txId', auth, async (req, res) => {
+  const txId = req.params.txId;
+  const { data: tx } = await supabase.from('transactions').select('*')
+    .eq('id', txId).eq('user_id', req.user.id).maybeSingle();
+  if (!tx) return res.status(404).json({ message: 'Transacción no encontrada' });
+  if (tx.status === 'reversed') return res.status(400).json({ message: 'Transacción ya revertida' });
+  const reversible = ['withdraw', 'transfer_sent', 'payment', 'payment_capture'];
+  if (!reversible.includes(tx.type)) return res.status(400).json({ message: 'Tipo no reversible' });
+  const wallet = await getWalletSafe(req.user.id);
+  const amount = Number(tx.amount || 0);
+  const newBalance = Number(wallet.balance || 0) + amount;
+  await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
+  await supabase.from('transactions').update({ status: 'reversed' }).eq('id', txId);
+  await supabase.from('transactions').insert({
+    user_id: req.user.id, type: 'reversal_credit', amount, method: 'EGCHAT',
+    reference: `REV:${txId}`, status: 'completed'
+  });
+  res.json({ balance: newBalance, message: 'Reverso aplicado' });
+});
+
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // LIA-25
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
