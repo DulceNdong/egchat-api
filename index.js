@@ -111,7 +111,12 @@ app.post('/api/admin/reset-all', async (req, res) => {
   results.push(await resetTable('chat_participants', 'joined_at'));
   results.push(await resetTable('chats', 'created_at'));
   results.push(await resetTable('contacts', 'created_at'));
-  results.push(await resetTable('wallet_transactions', 'created_at'));
+  results.push(await resetTable('transactions', 'created_at'));
+  results.push(await resetTable('recharge_codes', 'created_at'));
+  results.push(await resetTable('user_news_favorites', 'created_at'));
+  results.push(await resetTable('insurance_claims', 'created_at'));
+  results.push(await resetTable('insurance_policies', 'created_at'));
+  results.push(await resetTable('lia_conversations', 'created_at'));
   results.push(await resetTable('wallets', 'created_at'));
   results.push(await resetTable('notifications', 'created_at'));
   results.push(await resetTable('users', 'created_at'));
