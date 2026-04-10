@@ -15,6 +15,16 @@ CREATE TABLE IF NOT EXISTS chat_participants (
   chat_id UUID REFERENCES chats(id) ON DELETE CASCADE,
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
   joined_at TIMESTAMPTZ DEFAULT NOW(),
+  unread_count INTEGER DEFAULT 0,
+  UNIQUE(chat_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS message_reads (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  chat_id UUID REFERENCES chats(id) ON DELETE CASCADE,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  last_read_message_id UUID REFERENCES messages(id) ON DELETE SET NULL,
+  read_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(chat_id, user_id)
 );
 

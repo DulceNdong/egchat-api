@@ -6,8 +6,10 @@ CREATE TABLE IF NOT EXISTS users (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   phone VARCHAR(20) UNIQUE NOT NULL,
   full_name VARCHAR(100) NOT NULL,
-  password VARCHAR(255) NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
   avatar_url TEXT,
+  last_seen TIMESTAMPTZ,
+  status VARCHAR(20) DEFAULT 'offline',
   created_at TIMESTAMPTZ DEFAULT NOW(),
   last_login TIMESTAMPTZ,
   is_active BOOLEAN DEFAULT TRUE
@@ -59,10 +61,12 @@ CREATE TABLE IF NOT EXISTS contacts (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
   contact_user_id UUID REFERENCES users(id),
-  name VARCHAR(100),
+  nickname VARCHAR(100),
   phone VARCHAR(20),
   is_blocked BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  is_favorite BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user_id, contact_user_id)
 );
 
 -- Indices

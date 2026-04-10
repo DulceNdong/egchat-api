@@ -1,4 +1,4 @@
-﻿// dotenv solo en local (en Render las vars vienen del dashboard)
+// dotenv solo en local (en Render las vars vienen del dashboard)
 try { require('dotenv').config(); } catch(e) {}
 const express = require('express');
 const cors = require('cors');
@@ -9,8 +9,9 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'egchat_secret_2026';
+const chatStreams = new Map();
 
-// â”€â”€ Supabase â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// --- Supabase ---------------------------------------------------------
 const supabase = createClient(
   process.env.SUPABASE_URL || '',
   process.env.SUPABASE_SERVICE_KEY || ''
@@ -19,7 +20,7 @@ const supabase = createClient(
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// â”€â”€ Middleware auth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// --- Middleware auth --------------------------------------------------
 const auth = (req, res, next) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ message: 'Token requerido' });
@@ -27,11 +28,41 @@ const auth = (req, res, next) => {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch {
-    res.status(401).json({ message: 'Token invÃ¡lido o expirado' });
+    res.status(401).json({ message: 'Token inválido o expirado' });
   }
 };
 
-// â”€â”€ ROOT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const authFromQuery = (req, res, next) => {
+  const tokenFromQuery = typeof req.query.token === 'string' ? req.query.token : '';
+  const tokenFromHeader = req.headers.authorization?.replace('Bearer ', '') || '';
+  const token = tokenFromQuery || tokenFromHeader;
+  if (!token) return res.status(401).json({ message: 'Token requerido' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ message: 'Token inválido o expirado' });
+  }
+};
+
+const emitToUser = (userId, payload) => {
+  const key = String(userId);
+  const streams = chatStreams.get(key);
+  if (!streams || streams.size === 0) return;
+  const data = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of streams) {
+    try {
+      res.write(data);
+    } catch {}
+  }
+};
+
+const emitToUsers = (userIds, payload) => {
+  const uniq = Array.from(new Set((userIds || []).map((id) => String(id))));
+  uniq.forEach((id) => emitToUser(id, payload));
+};
+
+// --- ROOT -------------------------------------------------------------
 app.get('/', (req, res) => res.json({
   message: 'EGCHAT API funcionando!',
   version: '2.5.0',
@@ -42,14 +73,44 @@ app.get('/', (req, res) => res.json({
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
 app.get('/debug', (req, res) => res.json({
-  supabase_url: process.env.SUPABASE_URL ? 'âœ… set' : 'âŒ missing',
-  supabase_key: process.env.SUPABASE_SERVICE_KEY ? 'âœ… set' : 'âŒ missing',
-  jwt_secret: process.env.JWT_SECRET ? 'âœ… set' : 'âŒ missing',
+  supabase_url: process.env.SUPABASE_URL ? '✅ set' : '❌ missing',
+  supabase_key: process.env.SUPABASE_SERVICE_KEY ? '✅ set' : '❌ missing',
+  jwt_secret: process.env.JWT_SECRET ? '✅ set' : '❌ missing',
   node_env: process.env.NODE_ENV || 'not set',
   port: PORT
 }));
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Stream SSE para mensajería en tiempo real
+app.get('/api/chat/stream', authFromQuery, (req, res) => {
+  const userId = String(req.user.id);
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  if (!chatStreams.has(userId)) chatStreams.set(userId, new Set());
+  chatStreams.get(userId).add(res);
+
+  // Evento inicial
+  res.write(`data: ${JSON.stringify({ type: 'connected', userId, ts: Date.now() })}\n\n`);
+
+  // Keepalive para evitar timeout en proxies
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'heartbeat', ts: Date.now() })}\n\n`);
+    } catch {}
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    const streams = chatStreams.get(userId);
+    if (streams) {
+      streams.delete(res);
+      if (streams.size === 0) chatStreams.delete(userId);
+    }
+  });
+});
+
 // AUTH
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.post('/api/auth/register', async (req, res) => {
@@ -61,7 +122,7 @@ app.post('/api/auth/register', async (req, res) => {
     // Verificar si ya existe
     const { data: existing } = await supabase
       .from('users').select('id').eq('phone', phone).maybeSingle();
-    if (existing) return res.status(409).json({ message: 'El telÃ©fono ya estÃ¡ registrado' });
+    if (existing) return res.status(409).json({ message: 'El teléfono ya está registrado' });
 
     const hashed = await bcrypt.hash(password, 10);
     const { data: user, error } = await supabase
@@ -97,7 +158,7 @@ app.post('/api/auth/login', async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ message: 'Credenciales incorrectas' });
 
-    // Actualizar Ãºltimo acceso
+    // Actualizar último acceso
     await supabase.from('users').update({ last_login: new Date().toISOString() }).eq('id', user.id);
 
     const token = jwt.sign({ id: user.id, phone }, JWT_SECRET, { expiresIn: '30d' });
@@ -131,7 +192,7 @@ app.put('/api/auth/profile', auth, async (req, res) => {
   }
 });
 
-app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'SesiÃ³n cerrada' }));
+app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'Sesión cerrada' }));
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // CONTACTOS
@@ -198,7 +259,7 @@ app.post('/api/contacts/:contactId/block', auth, async (req, res) => {
 });
 
 // ========================================================================
-// CHAT / MENSAJERÃA COMPLETA
+// CHAT / MENSAJERÍA COMPLETA
 // ========================================================================
 
 // Obtener todos los chats del usuario
@@ -211,7 +272,7 @@ app.get('/api/chats', auth, async (req, res) => {
       .eq('user_id', req.user.id);
 
     if (pErr) {
-      // Si la tabla no existe, devolver array vacÃ­o
+      // Si la tabla no existe, devolver array vacío
       return res.json([]);
     }
 
@@ -255,7 +316,7 @@ app.get('/api/chats', auth, async (req, res) => {
     res.json(result);
   } catch (e) {
     console.error('Get chats error:', e.message);
-    res.json([]); // Devolver vacÃ­o en vez de 500
+    res.json([]); // Devolver vacío en vez de 500
   }
 });
 
@@ -311,6 +372,18 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
     if (error) throw error;
 
     await supabase.from('chats').update({ updated_at: new Date().toISOString() }).eq('id', chatId);
+
+    // Emitir evento en tiempo real a todos los participantes del chat
+    try {
+      const { data: parts } = await supabase
+        .from('chat_participants')
+        .select('user_id')
+        .eq('chat_id', chatId);
+      const targetUsers = (parts || []).map((p) => p.user_id);
+      emitToUsers(targetUsers, { type: 'new_message', chatId, message });
+      emitToUsers(targetUsers, { type: 'chat_updated', chatId, ts: Date.now() });
+    } catch {}
+
     res.status(201).json(message);
   } catch (e) {
     console.error('Send message error:', e.message);
@@ -325,42 +398,95 @@ app.post('/api/chats/private', auth, async (req, res) => {
     const { participant_id, phone } = req.body;
     let targetId = participant_id;
 
-    // Si viene phone en vez de ID, buscar el usuario
     if (!targetId && phone) {
-      const { data: found } = await supabase.from('users').select('id,full_name,phone,avatar_url').eq('phone', phone).single();
-      if (!found) return res.status(404).json({ message: 'Usuario no encontrado con ese numero' });
+      const { data: found, error: userError } = await supabase
+        .from('users')
+        .select('id, phone, full_name, avatar_url')
+        .eq('phone', phone)
+        .single();
+
+      if (userError || !found) {
+        return res.status(404).json({ message: 'Usuario no encontrado con ese número' });
+      }
+
       targetId = found.id;
     }
 
-    if (!targetId) return res.status(400).json({ message: 'participant_id o phone requerido' });
-    if (targetId === req.user.id) return res.status(400).json({ message: 'No puedes chatear contigo mismo' });
-
-    // Buscar chat existente entre los dos
-    const { data: myChats } = await supabase.from('chat_participants').select('chat_id').eq('user_id', req.user.id);
-    const { data: theirChats } = await supabase.from('chat_participants').select('chat_id').eq('user_id', targetId);
-    const myIds = (myChats||[]).map(c => c.chat_id);
-    const theirIds = (theirChats||[]).map(c => c.chat_id);
-    const common = myIds.filter(id => theirIds.includes(id));
-
-    if (common.length > 0) {
-      const { data: existing } = await supabase.from('chats').select('*').eq('id', common[0]).single();
-      return res.json(existing);
+    if (!targetId) {
+      return res.status(400).json({ message: 'participant_id o phone es requerido' });
     }
 
-    // Crear nuevo chat
-    const { data: chat, error } = await supabase.from('chats').insert({ type:'private', created_by: req.user.id }).select().single();
-    if (error) throw error;
+    if (targetId === req.user.id) {
+      return res.status(400).json({ message: 'No puedes crear un chat contigo mismo' });
+    }
 
-    // AÃ±adir participantes
+    const { data: myChats } = await supabase
+      .from('chat_participants')
+      .select('chat_id')
+      .eq('user_id', req.user.id);
+
+    const { data: theirChats } = await supabase
+      .from('chat_participants')
+      .select('chat_id')
+      .eq('user_id', targetId);
+
+    const myIds = (myChats || []).map((c) => c.chat_id);
+    const theirIds = (theirChats || []).map((c) => c.chat_id);
+    const common = myIds.filter((id) => theirIds.includes(id));
+
+    if (common.length > 0) {
+      const { data: existing } = await supabase
+        .from('chats')
+        .select('*')
+        .in('id', common)
+        .eq('type', 'private')
+        .limit(1)
+        .single();
+
+      if (existing) {
+        return res.json(existing);
+      }
+    }
+
+    const { data: targetUser, error: userError } = await supabase
+      .from('users')
+      .select('id, phone, full_name, avatar_url')
+      .eq('id', targetId)
+      .single();
+
+    if (userError || !targetUser) {
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+
+    const { data: chat, error: createError } = await supabase
+      .from('chats')
+      .insert({
+        type: 'private',
+        created_by: req.user.id,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (createError) throw createError;
+
     await supabase.from('chat_participants').insert([
       { chat_id: chat.id, user_id: req.user.id },
       { chat_id: chat.id, user_id: targetId }
     ]);
 
-    // Obtener info del otro usuario
-    const { data: other } = await supabase.from('users').select('id,full_name,phone,avatar_url').eq('id', targetId).single();
+    const formattedChat = {
+      ...chat,
+      participants: [
+        { user_id: req.user.id },
+        { user_id: targetId, ...targetUser }
+      ],
+      last_message: null,
+      unread_count: 0
+    };
 
-    res.json({ ...chat, other_user: other });
+    res.status(201).json(formattedChat);
   } catch (e) {
     console.error('Create private chat error:', e.message);
     res.status(500).json({ message: e.message });
@@ -380,7 +506,7 @@ app.post('/api/chats/group', auth, async (req, res) => {
       participant_ids.push(req.user.id);
     }
 
-    // Obtener informaciÃ³n de los participantes
+    // Obtener información de los participantes
     const { data: participants, error: userError } = await supabase
       .from('users')
       .select('id, phone, full_name, avatar_url')
@@ -422,25 +548,25 @@ app.post('/api/chats/group', auth, async (req, res) => {
   }
 });
 
-// Marcar mensajes como leÃ­dos
+// Marcar mensajes como leídos
 app.post('/api/chats/:chatId/read', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
     const { message_id } = req.body;
 
     // Verificar acceso al chat
-    const { data: chat, error: chatError } = await supabase
-      .from('chats')
+    const { data: part } = await supabase
+      .from('chat_participants')
       .select('id')
-      .eq('id', chatId)
-      .contains('participants', JSON.stringify([{ user_id: req.user.id }]))
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
       .single();
 
-    if (chatError || !chat) {
+    if (!part) {
       return res.status(403).json({ message: 'No tienes acceso a este chat' });
     }
 
-    // Marcar mensajes como leÃ­dos hasta el mensaje especificado
+    // Marcar mensajes como leídos hasta el mensaje especificado
     const { error: updateError } = await supabase
       .from('message_reads')
       .upsert({
@@ -474,18 +600,18 @@ app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
     const { chatId } = req.params;
     
     // Verificar acceso al chat
-    const { data: chat, error: chatError } = await supabase
-      .from('chats')
+    const { data: part } = await supabase
+      .from('chat_participants')
       .select('id')
-      .eq('id', chatId)
-      .contains('participants', JSON.stringify([{ user_id: req.user.id }]))
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
       .single();
 
-    if (chatError || !chat) {
+    if (!part) {
       return res.status(403).json({ message: 'No tienes acceso a este chat' });
     }
 
-    // AquÃ­ irÃ­a la lÃ³gica de subida de archivos a un servicio como AWS S3
+    // Aquí iría la lógica de subida de archivos a un servicio como AWS S3
     // Por ahora, simulamos la subida
     const fileUrl = `https://storage.egchat-gq.com/chats/${chatId}/${Date.now()}.jpg`;
     
@@ -577,17 +703,32 @@ app.get('/api/contacts', auth, async (req, res) => {
 // Agregar contacto
 app.post('/api/contacts', auth, async (req, res) => {
   try {
-    const { contact_user_id, nickname } = req.body;
+    const { contact_user_id, nickname, phone } = req.body;
+    let targetId = contact_user_id;
 
-    if (!contact_user_id) {
-      return res.status(400).json({ message: 'ID de contacto requerido' });
+    if (!targetId && phone) {
+      const { data: targetUser, error: userError } = await supabase
+        .from('users')
+        .select('id, phone, full_name')
+        .eq('phone', phone)
+        .single();
+
+      if (userError || !targetUser) {
+        return res.status(404).json({ message: 'Usuario no encontrado con ese número' });
+      }
+
+      targetId = targetUser.id;
+    }
+
+    if (!targetId) {
+      return res.status(400).json({ message: 'ID de contacto o teléfono requerido' });
     }
 
     // Verificar que el usuario a agregar existe
     const { data: targetUser, error: userError } = await supabase
       .from('users')
       .select('id, phone, full_name')
-      .eq('id', contact_user_id)
+      .eq('id', targetId)
       .single();
 
     if (userError || !targetUser) {
@@ -599,7 +740,7 @@ app.post('/api/contacts', auth, async (req, res) => {
       .from('contacts')
       .select('id')
       .eq('user_id', req.user.id)
-      .eq('contact_user_id', contact_user_id)
+      .eq('contact_user_id', targetId)
       .single();
 
     if (existingContact) {
@@ -611,7 +752,7 @@ app.post('/api/contacts', auth, async (req, res) => {
       .from('contacts')
       .insert({
         user_id: req.user.id,
-        contact_user_id,
+        contact_user_id: targetId,
         nickname: nickname || targetUser.full_name
       })
       .select(`
@@ -743,7 +884,7 @@ app.get('/api/contacts/search', auth, async (req, res) => {
       return res.status(400).json({ message: 'La bÃºsqueda debe tener al menos 2 caracteres' });
     }
 
-    // Buscar usuarios por telÃ©fono o nombre
+    // Buscar usuarios por teléfono o nombre
     const { data: users, error } = await supabase
       .from('users')
       .select('id, phone, full_name, avatar_url, last_seen')
@@ -1473,7 +1614,7 @@ app.get('/api/news', auth, async (req, res) => {
     const allNews = [
       {
         id: '1',
-        title: 'EGCHAT lanza nueva funcionalidad de mensajerÃ­a instantÃ¡nea',
+        title: 'EGCHAT lanza nueva funcionalidad de mensajería instantánea',
         category: 'tecnologia',
         summary: 'La aplicaciÃ³n EGCHAT anuncia importantes mejoras...',
         content: '...',
