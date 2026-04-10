@@ -116,7 +116,15 @@ app.get('/api/system/dependencies', async (_req, res) => {
     'chat_participants',
     'messages',
     'message_reads',
-    'lia_conversations'
+    'lia_conversations',
+    'ledger_accounts',
+    'ledger_journals',
+    'ledger_entries',
+    'ledger_approvals',
+    'taxi_rides',
+    'service_orders',
+    'cemac_transfers',
+    'audit_logs'
   ];
   const checks = await Promise.all(required.map(checkTable));
   const missing = checks.filter((c) => !c.ok);
@@ -1459,6 +1467,92 @@ app.post('/api/wallet/ledger/journals/:id/reject', auth, async (req, res) => {
   res.json({ message: 'Asiento rechazado', journal_id: id });
 });
 
+const ensureUserCashAccount = async (userId) => {
+  const code = `USR-CASH-${String(userId).slice(0, 8)}`;
+  let { data: acc } = await supabase.from('ledger_accounts').select('*').eq('code', code).maybeSingle();
+  if (!acc) {
+    const { data } = await supabase.from('ledger_accounts').insert({
+      user_id: userId,
+      code,
+      name: 'Caja Usuario EGCHAT',
+      account_type: 'asset',
+      currency: 'XAF',
+      is_system: false,
+      is_active: true
+    }).select().single();
+    acc = data;
+  }
+  return acc;
+};
+
+app.get('/api/cemac/rates', auth, async (_req, res) => {
+  res.json({
+    base: 'XAF',
+    countries: ['GQ', 'CM', 'GA', 'CG', 'TD', 'CF'],
+    transfer_fee_flat: 750,
+    sandbox: true
+  });
+});
+
+app.post('/api/cemac/transfers', auth, async (req, res) => {
+  const { from_country, to_country, beneficiary_name, beneficiary_account, amount, external_id } = req.body || {};
+  if (!from_country || !to_country || !beneficiary_name || !beneficiary_account || Number(amount || 0) <= 0) {
+    return res.status(400).json({ message: 'Datos de transferencia invalidos', code: 'VALIDATION_ERROR' });
+  }
+  if (external_id) {
+    const { data: existing } = await supabase.from('cemac_transfers').select('*').eq('transfer_ref', external_id).eq('user_id', req.user.id).maybeSingle();
+    if (existing) return res.json({ transfer: existing, idempotent: true });
+  }
+
+  const fee = 750;
+  const total = Number(amount) + fee;
+  const deb = await debitWalletWithTx(req.user.id, total, 'EGCHAT', `CEMAC-${to_country}-${beneficiary_account}`, 'cemac_transfer');
+  if (!deb.ok) return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
+
+  const transferRef = external_id || safeRef('CEMAC');
+  const { data: transfer } = await supabase.from('cemac_transfers').insert({
+    transfer_ref: transferRef,
+    user_id: req.user.id,
+    from_country,
+    to_country,
+    beneficiary_name,
+    beneficiary_account,
+    amount: Number(amount),
+    fee,
+    status: 'processing',
+    metadata: { sandbox: true }
+  }).select().single();
+
+  await ensureSystemLedgerAccounts();
+  const userCash = await ensureUserCashAccount(req.user.id);
+  const { data: suspense } = await supabase.from('ledger_accounts').select('*').eq('code', 'SYS-SUSPENSE').single();
+  const { data: journal } = await supabase.from('ledger_journals').insert({
+    user_id: req.user.id,
+    reference: `CEMAC:${transferRef}`,
+    concept: `Transferencia CEMAC ${from_country}->${to_country}`,
+    total_amount: Number(amount),
+    status: 'posted',
+    requires_approval: false,
+    created_by: req.user.id
+  }).select().single();
+  await supabase.from('ledger_entries').insert([
+    { journal_id: journal.id, account_id: suspense.id, entry_type: 'debit', amount: Number(amount), currency: 'XAF', memo: 'Salida CEMAC' },
+    { journal_id: journal.id, account_id: userCash.id, entry_type: 'credit', amount: Number(amount), currency: 'XAF', memo: 'Debito usuario CEMAC' }
+  ]);
+  await logAudit(req.user.id, 'cemac_transfer_create', 'cemac', transfer.id, { transfer_ref: transferRef, amount: Number(amount), fee });
+
+  res.status(201).json({
+    transfer,
+    ledger_journal_id: journal.id,
+    balance: deb.balance
+  });
+});
+
+app.get('/api/cemac/transfers', auth, async (req, res) => {
+  const { data } = await supabase.from('cemac_transfers').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
+  res.json(data || []);
+});
+
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // LIA-25
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -1568,57 +1662,121 @@ app.put('/api/contacts/:id/unblock', auth, async (req, res) => {
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // SERVICIOS PÃšBLICOS (simulados con datos reales de GE)
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+const sandboxStatus = ['pending', 'processing', 'completed', 'failed'];
+const safeRef = (prefix) => `${prefix}-${Date.now()}-${Math.floor(Math.random() * 9999)}`;
+const toNum = (v) => Number(v || 0);
+
+const logAudit = async (userId, action, module, entityId, details) => {
+  await supabase.from('audit_logs').insert({
+    user_id: userId,
+    action,
+    module,
+    entity_id: entityId || null,
+    details: details || {}
+  }).catch(() => {});
+};
+
+const createServiceOrder = async (userId, provider, serviceType, amount, contractRef, payload, response) => {
+  const orderRef = safeRef(provider.toUpperCase());
+  const insert = {
+    order_ref: orderRef,
+    user_id: userId,
+    provider,
+    service_type: serviceType,
+    contract_ref: contractRef || null,
+    amount: toNum(amount),
+    status: 'completed',
+    payload: payload || {},
+    response: response || {}
+  };
+  const { data } = await supabase.from('service_orders').insert(insert).select().maybeSingle();
+  await logAudit(userId, 'service_order_create', 'services', data?.id || orderRef, insert);
+  return { orderRef, record: data || insert };
+};
+
+const debitWalletWithTx = async (userId, amount, method, reference, txType = 'payment') => {
+  const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', userId).single();
+  if (!wallet || amount > Number(wallet.balance || 0)) return { ok: false, message: 'Saldo insuficiente' };
+  const newBalance = Number(wallet.balance || 0) - Number(amount || 0);
+  await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', userId);
+  const { data: tx } = await supabase.from('transactions').insert({
+    user_id: userId,
+    type: txType,
+    amount,
+    method: method || 'EGCHAT',
+    reference,
+    status: 'completed'
+  }).select().maybeSingle();
+  await logAudit(userId, 'wallet_debit', 'wallet', tx?.id || reference, { amount, reference, txType });
+  return { ok: true, balance: newBalance, tx };
+};
+
 app.post('/api/servicios/segesa/consultar', auth, async (req, res) => {
   const { contrato } = req.body;
-  if (!contrato) return res.status(400).json({ message: 'NÃºmero de contrato requerido' });
-  res.json({ contrato, titular: 'Cliente SEGESA', importe: Math.floor(Math.random()*15000)+5000, vencimiento: '2026-04-30', estado: 'pendiente', direccion: 'Malabo, Guinea Ecuatorial' });
+  if (!contrato) return res.status(400).json({ message: 'Numero de contrato requerido', code: 'VALIDATION_ERROR' });
+  const response = { contrato, titular: 'Cliente SEGESA', importe: Math.floor(Math.random()*15000)+5000, vencimiento: '2026-04-30', estado: 'pendiente', direccion: 'Malabo, Guinea Ecuatorial' };
+  await createServiceOrder(req.user.id, 'segesa', 'consultar', 0, contrato, req.body, response);
+  res.json(response);
 });
 
 app.post('/api/servicios/segesa/pagar', auth, async (req, res) => {
   const { contrato, importe, metodo } = req.body;
-  const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', req.user.id).single();
-  if (!wallet || importe > wallet.balance) return res.status(400).json({ message: 'Saldo insuficiente' });
-  const newBalance = wallet.balance - importe;
-  await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
-  await supabase.from('transactions').insert({ user_id: req.user.id, type: 'payment', amount: importe, method: metodo || 'EGCHAT', reference: `SEGESA-${contrato}`, status: 'completed' });
-  res.json({ success: true, balance: newBalance, referencia: `SEG-${Date.now()}`, message: 'Pago de electricidad completado' });
+  if (!contrato || toNum(importe) <= 0) return res.status(400).json({ message: 'Datos invalidos', code: 'VALIDATION_ERROR' });
+  const deb = await debitWalletWithTx(req.user.id, toNum(importe), metodo || 'EGCHAT', `SEGESA-${contrato}`, 'service_payment');
+  if (!deb.ok) return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
+  const response = { success: true, balance: deb.balance, referencia: safeRef('SEG'), message: 'Pago de electricidad completado' };
+  await createServiceOrder(req.user.id, 'segesa', 'pagar', importe, contrato, req.body, response);
+  res.json(response);
 });
 
 app.post('/api/servicios/snge/consultar', auth, async (req, res) => {
   const { contrato } = req.body;
-  if (!contrato) return res.status(400).json({ message: 'NÃºmero de contrato requerido' });
-  res.json({ contrato, titular: 'Cliente SNGE', importe: Math.floor(Math.random()*8000)+2000, vencimiento: '2026-04-30', estado: 'pendiente', direccion: 'Malabo, Guinea Ecuatorial' });
+  if (!contrato) return res.status(400).json({ message: 'Numero de contrato requerido', code: 'VALIDATION_ERROR' });
+  const response = { contrato, titular: 'Cliente SNGE', importe: Math.floor(Math.random()*8000)+2000, vencimiento: '2026-04-30', estado: 'pendiente', direccion: 'Malabo, Guinea Ecuatorial' };
+  await createServiceOrder(req.user.id, 'snge', 'consultar', 0, contrato, req.body, response);
+  res.json(response);
 });
 
 app.post('/api/servicios/snge/pagar', auth, async (req, res) => {
   const { contrato, importe, metodo } = req.body;
-  const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', req.user.id).single();
-  if (!wallet || importe > wallet.balance) return res.status(400).json({ message: 'Saldo insuficiente' });
-  const newBalance = wallet.balance - importe;
-  await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
-  await supabase.from('transactions').insert({ user_id: req.user.id, type: 'payment', amount: importe, method: metodo || 'EGCHAT', reference: `SNGE-${contrato}`, status: 'completed' });
-  res.json({ success: true, balance: newBalance, referencia: `SNGE-${Date.now()}`, message: 'Pago de agua completado' });
+  if (!contrato || toNum(importe) <= 0) return res.status(400).json({ message: 'Datos invalidos', code: 'VALIDATION_ERROR' });
+  const deb = await debitWalletWithTx(req.user.id, toNum(importe), metodo || 'EGCHAT', `SNGE-${contrato}`, 'service_payment');
+  if (!deb.ok) return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
+  const response = { success: true, balance: deb.balance, referencia: safeRef('SNGE'), message: 'Pago de agua completado' };
+  await createServiceOrder(req.user.id, 'snge', 'pagar', importe, contrato, req.body, response);
+  res.json(response);
 });
 
 app.post('/api/servicios/dgi/consultar', auth, async (req, res) => {
   const { nif, tipo } = req.body;
-  res.json({ nif, tipo, importe: Math.floor(Math.random()*50000)+10000, periodo: '2026-T1', estado: 'pendiente', descripcion: `Impuesto ${tipo || 'general'}` });
+  if (!nif) return res.status(400).json({ message: 'NIF requerido', code: 'VALIDATION_ERROR' });
+  const response = { nif, tipo, importe: Math.floor(Math.random()*50000)+10000, periodo: '2026-T1', estado: 'pendiente', descripcion: `Impuesto ${tipo || 'general'}` };
+  await createServiceOrder(req.user.id, 'dgi', 'consultar', 0, nif, req.body, response);
+  res.json(response);
 });
 
 app.post('/api/servicios/dgi/pagar', auth, async (req, res) => {
   const { nif, importe, referencia } = req.body;
-  const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', req.user.id).single();
-  if (!wallet || importe > wallet.balance) return res.status(400).json({ message: 'Saldo insuficiente' });
-  const newBalance = wallet.balance - importe;
-  await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
-  await supabase.from('transactions').insert({ user_id: req.user.id, type: 'payment', amount: importe, method: 'EGCHAT', reference: `DGI-${nif}-${referencia}`, status: 'completed' });
-  res.json({ success: true, balance: newBalance, referencia: `DGI-${Date.now()}`, message: 'Pago de impuesto completado' });
+  if (!nif || toNum(importe) <= 0) return res.status(400).json({ message: 'Datos invalidos', code: 'VALIDATION_ERROR' });
+  const deb = await debitWalletWithTx(req.user.id, toNum(importe), 'EGCHAT', `DGI-${nif}-${referencia || 'R'}`, 'tax_payment');
+  if (!deb.ok) return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
+  const response = { success: true, balance: deb.balance, referencia: safeRef('DGI'), message: 'Pago de impuesto completado' };
+  await createServiceOrder(req.user.id, 'dgi', 'pagar', importe, nif, req.body, response);
+  res.json(response);
 });
 
 app.post('/api/servicios/correos/enviar', auth, async (req, res) => {
   const { destinatario, peso, tipo } = req.body;
+  if (!destinatario) return res.status(400).json({ message: 'destinatario requerido', code: 'VALIDATION_ERROR' });
   const tarifa = tipo === 'express' ? 5000 : 2500;
-  res.json({ tracking: `EG${Date.now()}`, tarifa, estimado: tipo === 'express' ? '1-2 dÃ­as' : '3-5 dÃ­as', destinatario, message: 'Paquete registrado correctamente' });
+  const response = { tracking: `EG${Date.now()}`, tarifa, estimado: tipo === 'express' ? '1-2 dias' : '3-5 dias', destinatario, message: 'Paquete registrado correctamente' };
+  await createServiceOrder(req.user.id, 'correos', 'enviar', tarifa, destinatario, { destinatario, peso, tipo }, response);
+  res.json(response);
+});
+
+app.get('/api/servicios/orders', auth, async (req, res) => {
+  const { data } = await supabase.from('service_orders').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
+  res.json(data || []);
 });
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -1642,35 +1800,70 @@ app.get('/api/supermarkets', auth, async (req, res) => {
   const result = city ? SUPERMERCADOS.filter(s => s.city.toLowerCase() === city.toLowerCase()) : SUPERMERCADOS;
   res.json(result);
 });
+app.get('/supermarkets', auth, async (req, res) => {
+  const { city } = req.query;
+  const result = city ? SUPERMERCADOS.filter(s => s.city.toLowerCase() === String(city).toLowerCase()) : SUPERMERCADOS;
+  res.json(result);
+});
 
 app.get('/api/supermarkets/:smId/products', auth, async (req, res) => {
   const { cat } = req.query;
   const result = cat ? PRODUCTOS.filter(p => p.category === cat) : PRODUCTOS;
   res.json(result);
 });
+app.get('/supermarkets/:smId/products', auth, async (req, res) => {
+  const { cat } = req.query;
+  const result = cat ? PRODUCTOS.filter(p => p.category === cat) : PRODUCTOS;
+  res.json(result);
+});
 
 app.post('/api/supermarkets/orders', auth, async (req, res) => {
-  const { items, supermarketId, address } = req.body;
+  const { items, supermarketId, address, external_id } = req.body;
+  if (external_id) {
+    const { data: existing } = await supabase.from('service_orders').select('*').eq('order_ref', external_id).eq('user_id', req.user.id).maybeSingle();
+    if (existing) return res.json({ orderId: existing.order_ref, status: existing.status, total: existing.amount, balance: null, eta: '30-45 min', idempotent: true });
+  }
   const total = items?.reduce((s, i) => s + (i.price * i.qty), 0) || 0;
-  const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', req.user.id).single();
-  if (!wallet || total > wallet.balance) return res.status(400).json({ message: 'Saldo insuficiente' });
-  const newBalance = wallet.balance - total;
-  await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
-  await supabase.from('transactions').insert({ user_id: req.user.id, type: 'payment', amount: total, method: 'EGCHAT', reference: `SUPER-${supermarketId}`, status: 'completed' });
-  res.json({ orderId: `ORD-${Date.now()}`, status: 'confirmed', total, balance: newBalance, eta: '30-45 min' });
+  const deb = await debitWalletWithTx(req.user.id, total, 'EGCHAT', `SUPER-${supermarketId}`, 'shopping_payment');
+  if (!deb.ok) return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
+  const orderId = external_id || safeRef('ORD');
+  await supabase.from('service_orders').upsert({
+    order_ref: orderId,
+    user_id: req.user.id,
+    provider: 'supermarkets',
+    service_type: 'order',
+    contract_ref: String(supermarketId || ''),
+    amount: total,
+    status: 'completed',
+    payload: { items: items || [], address: address || '' },
+    response: { eta: '30-45 min' }
+  }, { onConflict: 'order_ref' });
+  await logAudit(req.user.id, 'supermarket_order_create', 'supermarkets', orderId, { total, supermarketId });
+  res.json({ orderId, status: 'confirmed', total, balance: deb.balance, eta: '30-45 min' });
 });
 
 app.get('/api/supermarkets/orders', auth, async (req, res) => {
-  const { data } = await supabase.from('transactions').select('*').eq('user_id', req.user.id).like('reference', 'SUPER-%').order('created_at', { ascending: false });
+  const { data } = await supabase.from('service_orders').select('*')
+    .eq('user_id', req.user.id).eq('provider', 'supermarkets').order('created_at', { ascending: false });
   res.json(data || []);
 });
 
 app.get('/api/supermarkets/orders/:id', auth, async (req, res) => {
   const { data } = await supabase
-    .from('transactions')
+    .from('service_orders')
     .select('*')
     .eq('user_id', req.user.id)
-    .eq('id', req.params.id)
+    .eq('order_ref', req.params.id)
+    .maybeSingle();
+  if (!data) return res.status(404).json({ message: 'Pedido no encontrado' });
+  res.json(data);
+});
+app.get('/supermarkets/orders/:id', auth, async (req, res) => {
+  const { data } = await supabase
+    .from('service_orders')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .eq('order_ref', req.params.id)
     .maybeSingle();
   if (!data) return res.status(404).json({ message: 'Pedido no encontrado' });
   res.json(data);
@@ -1693,16 +1886,27 @@ app.get('/api/salud/hospitales', auth, async (req, res) => {
   const { city } = req.query;
   res.json(city ? HOSPITALES.filter(h => h.city.toLowerCase() === city.toLowerCase()) : HOSPITALES);
 });
+app.get('/salud/hospitales', auth, async (req, res) => {
+  const { city } = req.query;
+  res.json(city ? HOSPITALES.filter(h => h.city.toLowerCase() === String(city).toLowerCase()) : HOSPITALES);
+});
 
 app.get('/api/salud/farmacias', auth, async (req, res) => {
   const { city } = req.query;
   res.json(city ? FARMACIAS.filter(f => f.city.toLowerCase() === city.toLowerCase()) : FARMACIAS);
 });
+app.get('/salud/farmacias', auth, async (req, res) => {
+  const { city } = req.query;
+  res.json(city ? FARMACIAS.filter(f => f.city.toLowerCase() === String(city).toLowerCase()) : FARMACIAS);
+});
 
 app.post('/api/salud/citas', auth, async (req, res) => {
   const { hospitalId, especialidad, fecha, motivo } = req.body;
   const hospital = HOSPITALES.find(h => h.id === hospitalId) || HOSPITALES[0];
-  res.json({ citaId: `CITA-${Date.now()}`, hospital: hospital.name, especialidad, fecha, motivo, confirmado: true, message: 'Cita mÃ©dica confirmada' });
+  const citaId = safeRef('CITA');
+  const response = { citaId, hospital: hospital.name, especialidad, fecha, motivo, confirmado: true, message: 'Cita medica confirmada' };
+  await createServiceOrder(req.user.id, 'salud', 'cita', 0, hospitalId, req.body, response);
+  res.json(response);
 });
 
 app.get('/api/salud/medicamentos', auth, async (req, res) => {
@@ -1716,11 +1920,34 @@ app.get('/api/salud/medicamentos', auth, async (req, res) => {
   const result = q ? meds.filter(m => m.name.toLowerCase().includes(q.toLowerCase())) : meds;
   res.json(result);
 });
+app.get('/salud/medicamentos', auth, async (req, res) => {
+  const { q } = req.query;
+  const meds = [
+    { id: '1', name: 'Paracetamol 500mg', price: 500, stock: true },
+    { id: '2', name: 'Ibuprofeno 400mg', price: 800, stock: true },
+    { id: '3', name: 'Amoxicilina 500mg', price: 1500, stock: false },
+    { id: '4', name: 'Omeprazol 20mg', price: 1200, stock: true },
+  ];
+  const result = q ? meds.filter(m => m.name.toLowerCase().includes(String(q).toLowerCase())) : meds;
+  res.json(result);
+});
 
 app.post('/api/salud/medicamentos/pedido', auth, async (req, res) => {
-  const { items, farmaciaId, direccion } = req.body;
+  const { items, farmaciaId, direccion, external_id } = req.body;
   const total = items?.reduce((s, i) => s + (i.price * i.qty), 0) || 0;
-  res.json({ orderId: `MED-${Date.now()}`, status: 'confirmed', total, eta: '20-30 min', message: 'Pedido de medicamentos confirmado' });
+  const orderId = external_id || safeRef('MED');
+  await supabase.from('service_orders').upsert({
+    order_ref: orderId,
+    user_id: req.user.id,
+    provider: 'salud',
+    service_type: 'medicamentos',
+    contract_ref: String(farmaciaId || ''),
+    amount: total,
+    status: 'completed',
+    payload: { items: items || [], direccion: direccion || '' },
+    response: { eta: '20-30 min' }
+  }, { onConflict: 'order_ref' });
+  res.json({ orderId, status: 'confirmed', total, eta: '20-30 min', message: 'Pedido de medicamentos confirmado' });
 });
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -1728,29 +1955,76 @@ app.post('/api/salud/medicamentos/pedido', auth, async (req, res) => {
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.post('/api/taxi/request', auth, async (req, res) => {
   const { origin, dest, type } = req.body;
+  if (!origin || !dest) return res.status(400).json({ message: 'origin y dest requeridos', code: 'VALIDATION_ERROR' });
   const tarifa = type === 'premium' ? 3500 : type === 'moto' ? 800 : 1500;
   const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', req.user.id).single();
-  if (!wallet || tarifa > wallet.balance) return res.status(400).json({ message: 'Saldo insuficiente' });
-  res.json({
-    rideId: `RIDE-${Date.now()}`,
-    driver: { name: 'Carlos Mba', phone: '+240 222 555', rating: 4.8, plate: 'GE-1234', vehicle: type === 'moto' ? 'Moto Honda' : 'Toyota Corolla' },
-    eta: Math.floor(Math.random() * 8) + 3,
-    tarifa, type,
-    status: 'searching'
-  });
+  if (!wallet || tarifa > Number(wallet.balance || 0)) return res.status(400).json({ message: 'Saldo insuficiente', code: 'INSUFFICIENT_BALANCE' });
+  const rideId = safeRef('RIDE');
+  const driver = { name: 'Carlos Mba', phone: '+240 222 555', rating: 4.8, plate: 'GE-1234', vehicle: type === 'moto' ? 'Moto Honda' : 'Toyota Corolla' };
+  const { data: ride } = await supabase.from('taxi_rides').insert({
+    ride_ref: rideId,
+    user_id: req.user.id,
+    origin,
+    destination: dest,
+    ride_type: type || 'basic',
+    fare: tarifa,
+    status: 'searching',
+    driver
+  }).select().maybeSingle();
+  await logAudit(req.user.id, 'taxi_request', 'taxi', ride?.id || rideId, { tarifa, type });
+  res.json({ rideId, driver, eta: Math.floor(Math.random() * 8) + 3, tarifa, type, status: 'searching' });
 });
 
 app.get('/api/taxi/:rideId/status', auth, async (req, res) => {
-  res.json({ rideId: req.params.rideId, status: 'en_route', eta: 2, driver_location: { lat: 3.75, lng: 8.78 } });
+  const { data: ride } = await supabase.from('taxi_rides')
+    .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
+  if (!ride) return res.status(404).json({ message: 'Viaje no encontrado' });
+  const status = sandboxStatus.includes(ride.status) ? ride.status : 'processing';
+  res.json({ rideId: ride.ride_ref, status, eta: status === 'completed' ? 0 : 2, driver_location: { lat: 3.75, lng: 8.78 }, fare: ride.fare, driver: ride.driver });
 });
 
 app.post('/api/taxi/:rideId/cancel', auth, async (req, res) => {
+  const { data: ride } = await supabase.from('taxi_rides')
+    .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
+  if (!ride) return res.status(404).json({ message: 'Viaje no encontrado' });
+  await supabase.from('taxi_rides').update({ status: 'failed', updated_at: new Date().toISOString() }).eq('id', ride.id);
+  await logAudit(req.user.id, 'taxi_cancel', 'taxi', ride.id, { ride_ref: ride.ride_ref });
   res.json({ message: 'Viaje cancelado', rideId: req.params.rideId });
 });
 
 app.post('/api/taxi/:rideId/rate', auth, async (req, res) => {
   const { rating, comment } = req.body;
-  res.json({ message: 'ValoraciÃ³n enviada', rating, rideId: req.params.rideId });
+  const { data: ride } = await supabase.from('taxi_rides')
+    .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
+  if (!ride) return res.status(404).json({ message: 'Viaje no encontrado' });
+  await supabase.from('taxi_rides').update({
+    rating: Number(rating || 0),
+    rating_comment: comment || null,
+    status: 'completed',
+    updated_at: new Date().toISOString()
+  }).eq('id', ride.id);
+  const deb = await debitWalletWithTx(req.user.id, Number(ride.fare || 0), 'EGCHAT', `TAXI-${ride.ride_ref}`, 'taxi_payment');
+  if (!deb.ok) return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
+  res.json({ message: 'Valoracion enviada', rating, rideId: req.params.rideId, balance: deb.balance });
+});
+
+app.get('/api/taxi/rides', auth, async (req, res) => {
+  const { data } = await supabase.from('taxi_rides').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
+  res.json(data || []);
+});
+
+// Alias legacy sin /api
+app.post('/taxi/:rideId/cancel', auth, async (req, res) => {
+  req.url = `/api/taxi/${req.params.rideId}/cancel`;
+  return app._router.handle(req, res, () => {});
+});
+app.get('/taxi/:rideId/status', auth, async (req, res) => {
+  req.url = `/api/taxi/${req.params.rideId}/status`;
+  return app._router.handle(req, res, () => {});
+});
+app.post('/taxi/:rideId/rate', auth, async (req, res) => {
+  req.url = `/api/taxi/${req.params.rideId}/rate`;
+  return app._router.handle(req, res, () => {});
 });
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -2197,10 +2471,28 @@ app.get('/api/seguros/companias/:companyId/productos', auth, async (req, res) =>
   const company = ASEGURADORAS.find(a => a.id === req.params.companyId) || ASEGURADORAS[0];
   res.json(company.products.map((p, i) => ({ id: String(i+1), name: p, price: (i+1)*5000, coverage: '12 meses' })));
 });
+app.get('/seguros/companias/:companyId/productos', auth, async (req, res) => {
+  const company = ASEGURADORAS.find(a => a.id === req.params.companyId) || ASEGURADORAS[0];
+  res.json(company.products.map((p, i) => ({ id: String(i + 1), name: p, price: (i + 1) * 5000, coverage: '12 meses' })));
+});
 
 app.post('/api/seguros/solicitar', auth, async (req, res) => {
-  const { companyId, producto, datos } = req.body;
-  res.json({ solicitudId: `SEG-${Date.now()}`, status: 'pending', message: 'Solicitud de seguro enviada. Te contactaremos en 24h.' });
+  const { companyId, producto, datos, external_id } = req.body || {};
+  if (!companyId || !producto) return res.status(400).json({ message: 'companyId y producto requeridos', code: 'VALIDATION_ERROR' });
+  const solicitudId = external_id || safeRef('SEG');
+  await supabase.from('service_orders').upsert({
+    order_ref: solicitudId,
+    user_id: req.user.id,
+    provider: 'seguros',
+    service_type: 'solicitud',
+    contract_ref: String(companyId),
+    amount: 0,
+    status: 'pending',
+    payload: { producto, datos: datos || null },
+    response: { message: 'Solicitud de seguro enviada. Te contactaremos en 24h.' }
+  }, { onConflict: 'order_ref' });
+  await logAudit(req.user.id, 'insurance_request', 'seguros', solicitudId, { companyId, producto });
+  res.json({ solicitudId, status: 'pending', message: 'Solicitud de seguro enviada. Te contactaremos en 24h.' });
 });
 
 app.post('/api/seguros/solicitudes/:solicitudId/documentos', auth, async (req, res) => {
@@ -2212,6 +2504,11 @@ app.post('/api/seguros/solicitudes/:solicitudId/documentos', auth, async (req, r
     status: 'uploaded',
     message: 'Documento recibido'
   });
+});
+app.post('/seguros/solicitudes/:solicitudId/documentos', auth, async (req, res) => {
+  const { solicitudId } = req.params;
+  const { tipo } = req.body || {};
+  res.status(201).json({ solicitudId, tipo: tipo || 'documento', status: 'uploaded', message: 'Documento recibido' });
 });
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -2230,8 +2527,17 @@ app.get('/api/noticias', auth, async (req, res) => {
   const { cat } = req.query;
   res.json(cat ? NOTICIAS.filter(n => n.category.toLowerCase() === cat.toLowerCase()) : NOTICIAS);
 });
+app.get('/noticias', auth, async (req, res) => {
+  const { cat } = req.query;
+  res.json(cat ? NOTICIAS.filter(n => n.category.toLowerCase() === String(cat).toLowerCase()) : NOTICIAS);
+});
 
 app.get('/api/noticias/:id', auth, async (req, res) => {
+  const noticia = NOTICIAS.find(n => n.id === req.params.id);
+  if (!noticia) return res.status(404).json({ message: 'Noticia no encontrada' });
+  res.json({ ...noticia, content: `Contenido completo de: ${noticia.title}. Esta noticia fue publicada por ${noticia.source}.` });
+});
+app.get('/noticias/:id', auth, async (req, res) => {
   const noticia = NOTICIAS.find(n => n.id === req.params.id);
   if (!noticia) return res.status(404).json({ message: 'Noticia no encontrada' });
   res.json({ ...noticia, content: `Contenido completo de: ${noticia.title}. Esta noticia fue publicada por ${noticia.source}.` });

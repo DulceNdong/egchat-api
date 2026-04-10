@@ -165,6 +165,63 @@ create table if not exists ledger_approvals (
   unique(journal_id)
 );
 
+create table if not exists taxi_rides (
+  id uuid primary key default gen_random_uuid(),
+  ride_ref varchar(60) unique not null,
+  user_id uuid references users(id) on delete cascade,
+  origin jsonb not null,
+  destination jsonb not null,
+  ride_type varchar(30) not null,
+  fare numeric(15,2) not null,
+  status varchar(30) not null default 'searching',
+  driver jsonb,
+  rating integer,
+  rating_comment text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists service_orders (
+  id uuid primary key default gen_random_uuid(),
+  order_ref varchar(60) unique not null,
+  user_id uuid references users(id) on delete cascade,
+  provider varchar(30) not null,
+  service_type varchar(40) not null,
+  contract_ref varchar(80),
+  amount numeric(15,2) default 0,
+  status varchar(30) not null default 'pending',
+  payload jsonb default '{}'::jsonb,
+  response jsonb default '{}'::jsonb,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists cemac_transfers (
+  id uuid primary key default gen_random_uuid(),
+  transfer_ref varchar(80) unique not null,
+  user_id uuid references users(id) on delete cascade,
+  from_country varchar(4) not null,
+  to_country varchar(4) not null,
+  beneficiary_name varchar(120) not null,
+  beneficiary_account varchar(60) not null,
+  amount numeric(15,2) not null,
+  fee numeric(15,2) not null default 0,
+  status varchar(30) not null default 'pending',
+  metadata jsonb default '{}'::jsonb,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists audit_logs (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete set null,
+  action varchar(80) not null,
+  module varchar(40) not null,
+  entity_id varchar(80),
+  details jsonb default '{}'::jsonb,
+  created_at timestamptz default now()
+);
+
 create index if not exists idx_contacts_user on contacts(user_id);
 create index if not exists idx_contacts_contact on contacts(contact_user_id);
 create index if not exists idx_wallets_user on wallets(user_id);
@@ -178,6 +235,13 @@ create index if not exists idx_ledger_accounts_user on ledger_accounts(user_id);
 create index if not exists idx_ledger_journals_user_created on ledger_journals(user_id, created_at desc);
 create index if not exists idx_ledger_entries_journal on ledger_entries(journal_id);
 create index if not exists idx_ledger_approvals_status on ledger_approvals(status);
+create index if not exists idx_taxi_rides_user_created on taxi_rides(user_id, created_at desc);
+create index if not exists idx_taxi_rides_ref on taxi_rides(ride_ref);
+create index if not exists idx_service_orders_user_created on service_orders(user_id, created_at desc);
+create index if not exists idx_service_orders_provider_status on service_orders(provider, status);
+create index if not exists idx_cemac_transfers_user_created on cemac_transfers(user_id, created_at desc);
+create index if not exists idx_cemac_transfers_ref on cemac_transfers(transfer_ref);
+create index if not exists idx_audit_logs_user_created on audit_logs(user_id, created_at desc);
 
 insert into recharge_codes (code, amount, expires_at)
 values
