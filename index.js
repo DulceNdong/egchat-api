@@ -81,7 +81,6 @@ const emitToUsers = (userIds, payload) => {
   uniq.forEach((id) => emitToUser(id, payload));
 };
 
-const registerAdminRoutes = require('./adminRoutes');
 const adminResetKey = process.env.ADMIN_RESET_KEY || JWT_SECRET;
 const ADMIN_RESET_MARKER = '00000000-0000-0000-0000-000000000000';
 const resetTable = async (table, column = 'id') => {
@@ -107,7 +106,52 @@ const checkTable = async (table) => {
   }
 };
 
-registerAdminRoutes(app, supabase, adminResetKey, APP_VERSION, resetTable);
+// --- ADMIN ROUTES (inline) -------------------------------------------
+app.post('/api/admin/reset-all', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.body?.adminKey;
+  if (!key || key !== adminResetKey) return res.status(403).json({ message: 'No autorizado' });
+  const results = [];
+  results.push(await resetTable('message_reads', 'read_at'));
+  results.push(await resetTable('messages', 'created_at'));
+  results.push(await resetTable('chat_participants', 'joined_at'));
+  results.push(await resetTable('chats', 'created_at'));
+  results.push(await resetTable('contacts', 'created_at'));
+  results.push(await resetTable('transactions', 'created_at'));
+  results.push(await resetTable('recharge_codes', 'created_at'));
+  results.push(await resetTable('user_news_favorites', 'created_at'));
+  results.push(await resetTable('insurance_claims', 'created_at'));
+  results.push(await resetTable('insurance_policies', 'created_at'));
+  results.push(await resetTable('lia_conversations', 'created_at'));
+  results.push(await resetTable('wallets', 'created_at'));
+  results.push(await resetTable('notifications', 'created_at'));
+  results.push(await resetTable('users', 'created_at'));
+  return res.json({ message: 'Reset ejecutado', ok_tables: results.filter(r=>r.ok).map(r=>r.table), failed: results.filter(r=>!r.ok) });
+});
+
+app.post('/api/admin/users/update-version', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.body?.adminKey;
+  if (!key || key !== adminResetKey) return res.status(403).json({ message: 'No autorizado' });
+  const version = typeof req.body?.version === 'string' ? req.body.version : APP_VERSION;
+  try {
+    const { error } = await supabase.from('users').update({ app_version: version });
+    if (error) return res.status(500).json({ message: 'No se pudo actualizar', detail: error.message });
+    return res.json({ message: 'Versiones actualizadas', version });
+  } catch (e) {
+    return res.status(500).json({ message: 'Error interno', detail: e.message });
+  }
+});
+
+// Reset contraseña por admin
+app.post('/api/admin/reset-password', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.body?.adminKey;
+  if (!key || key !== adminResetKey) return res.status(403).json({ message: 'No autorizado' });
+  const { phone, newPassword } = req.body;
+  if (!phone || !newPassword) return res.status(400).json({ message: 'phone y newPassword requeridos' });
+  const hashed = await bcrypt.hash(newPassword, 10);
+  const { data, error } = await supabase.from('users').update({ password_hash: hashed }).eq('phone', phone).select('id, phone, full_name').single();
+  if (error || !data) return res.status(404).json({ message: 'Usuario no encontrado', error: error?.message });
+  res.json({ message: 'Contrasena reseteada', user: data });
+});
 
 // --- ROOT -------------------------------------------------------------
 app.get('/', (req, res) => res.json({
