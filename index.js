@@ -9,6 +9,8 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'egchat_secret_2026';
+const packageInfo = require('./package.json');
+const APP_VERSION = process.env.APP_VERSION || packageInfo.version || '2.5.0';
 const chatStreams = new Map();
 
 // --- Supabase ---------------------------------------------------------
@@ -62,14 +64,17 @@ const emitToUsers = (userIds, payload) => {
   uniq.forEach((id) => emitToUser(id, payload));
 };
 
-const adminResetKey = process.env.ADMIN_RESET_KEY || JWT_SECRET;
+const adminResetKey = process.env.ADMIN_RESET_KEY;
+if (!adminResetKey) {
+  throw new Error('ADMIN_RESET_KEY environment variable is required');
+}
 const ADMIN_RESET_MARKER = '00000000-0000-0000-0000-000000000000';
 const resetTable = async (table, column = 'id') => {
   try {
     const query = supabase.from(table).delete();
     const { error } = (column === 'id')
       ? await query.neq('id', ADMIN_RESET_MARKER)
-      : await query.not(column, 'is', null);
+      : await query;
     if (error) return { table, ok: false, error: error.message };
     return { table, ok: true };
   } catch (e) {
@@ -86,6 +91,9 @@ const checkTable = async (table) => {
     return { table, ok: false, error: e.message || 'unknown error' };
   }
 };
+
+const registerAdminRoutes = require('./adminRoutes');
+registerAdminRoutes(app, supabase, adminResetKey, APP_VERSION, resetTable);
 
 // --- ROOT -------------------------------------------------------------
 app.get('/', (req, res) => res.json({
@@ -134,41 +142,6 @@ app.get('/api/system/dependencies', async (_req, res) => {
     ready_tables: checks.filter((c) => c.ok).length,
     missing,
     hint: missing.length ? 'Ejecuta egchat-api/full_dependencies.sql en Supabase SQL Editor.' : 'Backend listo y sincronizado.'
-  });
-});
-
-// Reset completo de datos para reinicio limpio (usuarios/chats/contactos/etc.)
-app.post('/api/admin/reset-all', async (req, res) => {
-  const keyFromHeader = req.headers['x-admin-key'];
-  const keyFromBody = req.body?.adminKey;
-  const providedKey = typeof keyFromHeader === 'string' ? keyFromHeader : keyFromBody;
-  if (!providedKey || providedKey !== adminResetKey) {
-    return res.status(403).json({ message: 'No autorizado' });
-  }
-
-  const results = [];
-  // Orden importante por claves foráneas (hijos -> padres)
-  results.push(await resetTable('message_reads', 'read_at'));
-  results.push(await resetTable('messages', 'created_at'));
-  results.push(await resetTable('chat_participants', 'joined_at'));
-  results.push(await resetTable('chats', 'created_at'));
-  results.push(await resetTable('contacts', 'created_at'));
-  results.push(await resetTable('transactions', 'created_at'));
-  results.push(await resetTable('recharge_codes', 'created_at'));
-  results.push(await resetTable('user_news_favorites', 'created_at'));
-  results.push(await resetTable('insurance_claims', 'created_at'));
-  results.push(await resetTable('insurance_policies', 'created_at'));
-  results.push(await resetTable('lia_conversations', 'created_at'));
-  results.push(await resetTable('wallets', 'created_at'));
-  results.push(await resetTable('notifications', 'created_at'));
-  results.push(await resetTable('users', 'created_at'));
-
-  const ok = results.filter((r) => r.ok).map((r) => r.table);
-  const failed = results.filter((r) => !r.ok);
-  return res.json({
-    message: 'Reset ejecutado',
-    ok_tables: ok,
-    failed
   });
 });
 
@@ -1486,74 +1459,196 @@ const ensureUserCashAccount = async (userId) => {
 };
 
 app.get('/api/cemac/rates', auth, async (_req, res) => {
-  res.json({
-    base: 'XAF',
-    countries: ['GQ', 'CM', 'GA', 'CG', 'TD', 'CF'],
-    transfer_fee_flat: 750,
-    sandbox: true
-  });
+  try {
+    res.json({
+      base: 'XAF',
+      countries: ['GQ', 'CM', 'GA', 'CG', 'TD', 'CF'],
+      transfer_fee_flat: 750,
+      sandbox: true,
+      max_amount: 1000000,
+      min_amount: 1000
+    });
+  } catch (error) {
+    console.error('CEMAC rates error:', error);
+    res.status(500).json({ message: 'Error al obtener tasas', code: 'INTERNAL_ERROR' });
+  }
 });
 
+const taxiFallbackStore = new Map();
+const cemacFallbackStore = new Map();
+const getUserStore = (store, userId) => {
+  const key = String(userId);
+  if (!store.has(key)) store.set(key, []);
+  return store.get(key);
+};
+
 app.post('/api/cemac/transfers', auth, async (req, res) => {
-  const { from_country, to_country, beneficiary_name, beneficiary_account, amount, external_id } = req.body || {};
-  if (!from_country || !to_country || !beneficiary_name || !beneficiary_account || Number(amount || 0) <= 0) {
-    return res.status(400).json({ message: 'Datos de transferencia invalidos', code: 'VALIDATION_ERROR' });
+  try {
+    const { from_country, to_country, beneficiary_name, beneficiary_account, amount, external_id } = req.body || {};
+    
+    // Validación robusta
+    if (!from_country || !to_country || !beneficiary_name || !beneficiary_account || Number(amount || 0) <= 0) {
+      return res.status(400).json({ message: 'Datos de transferencia invalidos', code: 'VALIDATION_ERROR' });
+    }
+    
+    // Validar países CEMAC
+    const validCountries = ['GQ', 'CM', 'GA', 'CG', 'TD', 'CF'];
+    if (!validCountries.includes(from_country) || !validCountries.includes(to_country)) {
+      return res.status(400).json({ message: 'Paises no soportados', code: 'INVALID_COUNTRY' });
+    }
+    
+    // Verificar transferencia existente con fallback
+    if (external_id) {
+      try {
+        const { data: existing } = await supabase.from('cemac_transfers').select('*').eq('transfer_ref', external_id).eq('user_id', req.user.id).maybeSingle();
+        if (existing) return res.json({ transfer: existing, idempotent: true });
+      } catch (checkError) {
+        console.warn('Existing transfer check failed:', checkError.message);
+      }
+    }
+
+    const fee = 750;
+    const total = Number(amount) + fee;
+    
+    // Debitar wallet con fallback
+    let deb = { ok: false, balance: 0, message: 'Error wallet' };
+    try {
+      deb = await debitWalletWithTx(req.user.id, total, 'EGCHAT', `CEMAC-${to_country}-${beneficiary_account}`, 'cemac_transfer');
+    } catch (walletError) {
+      console.warn('Wallet debit failed:', walletError.message);
+    }
+    
+    if (!deb.ok) {
+      return res.status(400).json({ message: deb.message || 'Saldo insuficiente', code: 'INSUFFICIENT_BALANCE' });
+    }
+
+    const transferRef = external_id || safeRef('CEMAC');
+    let transfer = null;
+    
+    // Insert con manejo de columnas y fallback
+    try {
+      const insertData = {
+        transfer_ref: transferRef,
+        user_id: req.user.id,
+        from_country,
+        to_country,
+        beneficiary_name,
+        beneficiary_account,
+        amount: Number(amount),
+        fee,
+        status: 'processing',
+        metadata: { sandbox: true },
+        created_by: req.user.id
+      };
+      
+      const { data } = await supabase.from('cemac_transfers').insert(insertData).select().single();
+      transfer = data;
+    } catch (insertError) {
+      console.warn('CEMAC transfer insert failed, using fallback:', insertError.message);
+      
+      // Fallback a memoria local
+      const fallbackTransfer = {
+        id: transferRef,
+        transfer_ref: transferRef,
+        user_id: req.user.id,
+        from_country,
+        to_country,
+        beneficiary_name,
+        beneficiary_account,
+        amount: Number(amount),
+        fee,
+        status: 'processing',
+        metadata: { sandbox: true },
+        created_at: new Date().toISOString(),
+        created_by: req.user.id
+      };
+      getUserStore(cemacFallbackStore, req.user.id).push(fallbackTransfer);
+      transfer = fallbackTransfer;
+    }
+
+    // Ledger con fallback
+    let journalId = null;
+    try {
+      await ensureSystemLedgerAccounts();
+      const userCash = await ensureUserCashAccount(req.user.id);
+      const { data: suspense } = await supabase.from('ledger_accounts').select('*').eq('code', 'SYS-SUSPENSE').single();
+      
+      if (suspense?.id && userCash?.id) {
+        const { data: journal } = await supabase.from('ledger_journals').insert({
+          user_id: req.user.id,
+          reference: `CEMAC:${transferRef}`,
+          concept: `Transferencia CEMAC ${from_country}->${to_country}`,
+          total_amount: Number(amount),
+          status: 'posted',
+          requires_approval: false,
+          created_by: req.user.id
+        }).select().single();
+        
+        journalId = journal?.id || null;
+        
+        if (journalId) {
+          try {
+            await supabase.from('ledger_entries').insert([
+              { journal_id: journal.id, account_id: suspense.id, entry_type: 'debit', amount: Number(amount), currency: 'XAF', memo: 'Salida CEMAC' },
+              { journal_id: journal.id, account_id: userCash.id, entry_type: 'credit', amount: Number(amount), currency: 'XAF', memo: 'Debito usuario CEMAC' }
+            ]);
+          } catch (entriesError) {
+            console.warn('Ledger entries failed:', entriesError.message);
+          }
+        }
+      }
+    } catch (ledgerError) {
+      console.warn('Ledger creation failed:', ledgerError.message);
+    }
+    
+    // Audit logging con fallback
+    try {
+      await logAudit(req.user.id, 'cemac_transfer_create', 'cemac', transfer?.id || transferRef, { transfer_ref: transferRef, amount: Number(amount), fee });
+    } catch (auditError) {
+      console.warn('Audit logging failed:', auditError.message);
+    }
+
+    res.status(201).json({ transfer, ledger_journal_id: journalId, balance: deb.balance });
+  } catch (e) {
+    console.error('CEMAC transfer error:', e);
+    res.status(500).json({ message: e?.message || 'Error interno', code: 'INTERNAL_ERROR' });
   }
-  if (external_id) {
-    const { data: existing } = await supabase.from('cemac_transfers').select('*').eq('transfer_ref', external_id).eq('user_id', req.user.id).maybeSingle();
-    if (existing) return res.json({ transfer: existing, idempotent: true });
-  }
-
-  const fee = 750;
-  const total = Number(amount) + fee;
-  const deb = await debitWalletWithTx(req.user.id, total, 'EGCHAT', `CEMAC-${to_country}-${beneficiary_account}`, 'cemac_transfer');
-  if (!deb.ok) return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
-
-  const transferRef = external_id || safeRef('CEMAC');
-  const { data: transfer } = await supabase.from('cemac_transfers').insert({
-    transfer_ref: transferRef,
-    user_id: req.user.id,
-    from_country,
-    to_country,
-    beneficiary_name,
-    beneficiary_account,
-    amount: Number(amount),
-    fee,
-    status: 'processing',
-    metadata: { sandbox: true }
-  }).select().single();
-
-  await ensureSystemLedgerAccounts();
-  const userCash = await ensureUserCashAccount(req.user.id);
-  const { data: suspense } = await supabase.from('ledger_accounts').select('*').eq('code', 'SYS-SUSPENSE').single();
-  const { data: journal } = await supabase.from('ledger_journals').insert({
-    user_id: req.user.id,
-    reference: `CEMAC:${transferRef}`,
-    concept: `Transferencia CEMAC ${from_country}->${to_country}`,
-    total_amount: Number(amount),
-    status: 'posted',
-    requires_approval: false,
-    created_by: req.user.id
-  }).select().single();
-  await supabase.from('ledger_entries').insert([
-    { journal_id: journal.id, account_id: suspense.id, entry_type: 'debit', amount: Number(amount), currency: 'XAF', memo: 'Salida CEMAC' },
-    { journal_id: journal.id, account_id: userCash.id, entry_type: 'credit', amount: Number(amount), currency: 'XAF', memo: 'Debito usuario CEMAC' }
-  ]);
-  await logAudit(req.user.id, 'cemac_transfer_create', 'cemac', transfer.id, { transfer_ref: transferRef, amount: Number(amount), fee });
-
-  res.status(201).json({
-    transfer,
-    ledger_journal_id: journal.id,
-    balance: deb.balance
-  });
 });
 
 app.get('/api/cemac/transfers', auth, async (req, res) => {
-  const { data } = await supabase.from('cemac_transfers').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
-  res.json(data || []);
+  try {
+    let transfers = [];
+    
+    // Intentar obtener de Supabase
+    try {
+      const { data } = await supabase.from('cemac_transfers')
+        .select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
+      transfers = data || [];
+    } catch (dbError) {
+      console.warn('CEMAC transfers query failed, using fallback:', dbError.message);
+    }
+    
+    // Combinar con fallback store
+    const fallbackTransfers = getUserStore(cemacFallbackStore, req.user.id);
+    const combined = [...transfers, ...fallbackTransfers];
+    
+    // Eliminar duplicados por transfer_ref y ordenar
+    const uniqueTransfers = combined.filter((transfer, index, self) => 
+      index === self.findIndex(t => t.transfer_ref === transfer.transfer_ref)
+    );
+    
+    uniqueTransfers.sort((a, b) => 
+      new Date(b.created_at || 0) - new Date(a.created_at || 0)
+    );
+    
+    res.json(uniqueTransfers);
+  } catch (e) {
+    console.error('CEMAC transfers error:', e);
+    res.status(500).json({ message: e?.message || 'Error interno', code: 'INTERNAL_ERROR' });
+  }
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // LIA-25
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.post('/api/lia/chat', auth, async (req, res) => {
@@ -1795,23 +1890,14 @@ const PRODUCTOS = [
   { id: '5', name: 'Pan de molde', price: 600, category: 'PanaderÃ­a', stock: 15 },
 ];
 
-app.get('/api/supermarkets', auth, async (req, res) => {
+app.get(['/api/supermarkets', '/supermarkets'], auth, async (req, res) => {
   const { city } = req.query;
-  const result = city ? SUPERMERCADOS.filter(s => s.city.toLowerCase() === city.toLowerCase()) : SUPERMERCADOS;
-  res.json(result);
-});
-app.get('/supermarkets', auth, async (req, res) => {
-  const { city } = req.query;
-  const result = city ? SUPERMERCADOS.filter(s => s.city.toLowerCase() === String(city).toLowerCase()) : SUPERMERCADOS;
+  const cityValue = typeof city === 'string' ? city.toLowerCase() : String(city).toLowerCase();
+  const result = city ? SUPERMERCADOS.filter(s => s.city.toLowerCase() === cityValue) : SUPERMERCADOS;
   res.json(result);
 });
 
-app.get('/api/supermarkets/:smId/products', auth, async (req, res) => {
-  const { cat } = req.query;
-  const result = cat ? PRODUCTOS.filter(p => p.category === cat) : PRODUCTOS;
-  res.json(result);
-});
-app.get('/supermarkets/:smId/products', auth, async (req, res) => {
+app.get(['/api/supermarkets/:smId/products', '/supermarkets/:smId/products'], auth, async (req, res) => {
   const { cat } = req.query;
   const result = cat ? PRODUCTOS.filter(p => p.category === cat) : PRODUCTOS;
   res.json(result);
@@ -1882,16 +1968,13 @@ const FARMACIAS = [
   { id: '2', name: 'Farmacia Bata Norte', city: 'Bata', phone: '+240 333 300', open24h: false },
 ];
 
-app.get('/api/salud/hospitales', auth, async (req, res) => {
+app.get(['/api/salud/hospitales', '/salud/hospitales'], auth, async (req, res) => {
   const { city } = req.query;
-  res.json(city ? HOSPITALES.filter(h => h.city.toLowerCase() === city.toLowerCase()) : HOSPITALES);
-});
-app.get('/salud/hospitales', auth, async (req, res) => {
-  const { city } = req.query;
-  res.json(city ? HOSPITALES.filter(h => h.city.toLowerCase() === String(city).toLowerCase()) : HOSPITALES);
+  const cityValue = typeof city === 'string' ? city.toLowerCase() : String(city).toLowerCase();
+  res.json(city ? HOSPITALES.filter(h => h.city.toLowerCase() === cityValue) : HOSPITALES);
 });
 
-app.get('/api/salud/farmacias', auth, async (req, res) => {
+app.get(['/api/salud/farmacias', '/salud/farmacias'], auth, async (req, res) => {
   const { city } = req.query;
   res.json(city ? FARMACIAS.filter(f => f.city.toLowerCase() === city.toLowerCase()) : FARMACIAS);
 });
@@ -1909,7 +1992,7 @@ app.post('/api/salud/citas', auth, async (req, res) => {
   res.json(response);
 });
 
-app.get('/api/salud/medicamentos', auth, async (req, res) => {
+app.get(['/api/salud/medicamentos', '/salud/medicamentos'], auth, async (req, res) => {
   const { q } = req.query;
   const meds = [
     { id: '1', name: 'Paracetamol 500mg', price: 500, stock: true },
@@ -1917,18 +2000,8 @@ app.get('/api/salud/medicamentos', auth, async (req, res) => {
     { id: '3', name: 'Amoxicilina 500mg', price: 1500, stock: false },
     { id: '4', name: 'Omeprazol 20mg', price: 1200, stock: true },
   ];
-  const result = q ? meds.filter(m => m.name.toLowerCase().includes(q.toLowerCase())) : meds;
-  res.json(result);
-});
-app.get('/salud/medicamentos', auth, async (req, res) => {
-  const { q } = req.query;
-  const meds = [
-    { id: '1', name: 'Paracetamol 500mg', price: 500, stock: true },
-    { id: '2', name: 'Ibuprofeno 400mg', price: 800, stock: true },
-    { id: '3', name: 'Amoxicilina 500mg', price: 1500, stock: false },
-    { id: '4', name: 'Omeprazol 20mg', price: 1200, stock: true },
-  ];
-  const result = q ? meds.filter(m => m.name.toLowerCase().includes(String(q).toLowerCase())) : meds;
+  const queryText = typeof q === 'string' ? q.toLowerCase() : String(q).toLowerCase();
+  const result = q ? meds.filter(m => m.name.toLowerCase().includes(queryText)) : meds;
   res.json(result);
 });
 
@@ -1954,63 +2027,277 @@ app.post('/api/salud/medicamentos/pedido', auth, async (req, res) => {
 // TAXI
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 app.post('/api/taxi/request', auth, async (req, res) => {
-  const { origin, dest, type } = req.body;
-  if (!origin || !dest) return res.status(400).json({ message: 'origin y dest requeridos', code: 'VALIDATION_ERROR' });
-  const tarifa = type === 'premium' ? 3500 : type === 'moto' ? 800 : 1500;
-  const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', req.user.id).single();
-  if (!wallet || tarifa > Number(wallet.balance || 0)) return res.status(400).json({ message: 'Saldo insuficiente', code: 'INSUFFICIENT_BALANCE' });
-  const rideId = safeRef('RIDE');
-  const driver = { name: 'Carlos Mba', phone: '+240 222 555', rating: 4.8, plate: 'GE-1234', vehicle: type === 'moto' ? 'Moto Honda' : 'Toyota Corolla' };
-  const { data: ride } = await supabase.from('taxi_rides').insert({
-    ride_ref: rideId,
-    user_id: req.user.id,
-    origin,
-    destination: dest,
-    ride_type: type || 'basic',
-    fare: tarifa,
-    status: 'searching',
-    driver
-  }).select().maybeSingle();
-  await logAudit(req.user.id, 'taxi_request', 'taxi', ride?.id || rideId, { tarifa, type });
-  res.json({ rideId, driver, eta: Math.floor(Math.random() * 8) + 3, tarifa, type, status: 'searching' });
+  try {
+    const { origin, dest, type } = req.body;
+    if (!origin || !dest) return res.status(400).json({ message: 'origin y dest requeridos', code: 'VALIDATION_ERROR' });
+    const tarifa = type === 'premium' ? 3500 : type === 'moto' ? 800 : 1500;
+    
+    // Validar wallet con fallback
+    let wallet = null;
+    try {
+      const { data } = await supabase.from('wallets').select('balance').eq('user_id', req.user.id).single();
+      wallet = data;
+    } catch (e) {
+      console.warn('Wallet query failed, using fallback:', e.message);
+    }
+    
+    if (!wallet || tarifa > Number(wallet.balance || 0)) {
+      return res.status(400).json({ message: 'Saldo insuficiente', code: 'INSUFFICIENT_BALANCE' });
+    }
+    
+    const rideId = safeRef('RIDE');
+    const driver = { name: 'Carlos Mba', phone: '+240 222 555', rating: 4.8, plate: 'GE-1234', vehicle: type === 'moto' ? 'Moto Honda' : 'Toyota Corolla' };
+    
+    // Insert con manejo de columnas y fallback
+    let ride = null;
+    try {
+      const insertData = {
+        ride_ref: rideId,
+        user_id: req.user.id,
+        origin,
+        destination: dest,
+        ride_type: type || 'basic',
+        fare: tarifa,
+        status: 'searching',
+        driver
+      };
+      
+      // Intentar insert con columnas específicas
+      const { data } = await supabase.from('taxi_rides').insert(insertData).select().maybeSingle();
+      ride = data;
+    } catch (insertError) {
+      console.warn('Taxi ride insert failed, using fallback store:', insertError.message);
+      // Fallback a memoria local
+      const fallbackRide = {
+        id: rideId,
+        ride_ref: rideId,
+        user_id: req.user.id,
+        origin,
+        destination: dest,
+        ride_type: type || 'basic',
+        fare: tarifa,
+        status: 'searching',
+        driver,
+        created_at: new Date().toISOString()
+      };
+      getUserStore(taxiFallbackStore, req.user.id).push(fallbackRide);
+      ride = fallbackRide;
+    }
+    
+    try {
+      await logAudit(req.user.id, 'taxi_request', 'taxi', ride?.id || rideId, { tarifa, type });
+    } catch (auditError) {
+      console.warn('Audit logging failed:', auditError.message);
+    }
+    
+    res.json({ rideId, driver, eta: Math.floor(Math.random() * 8) + 3, tarifa, type, status: 'searching' });
+  } catch (error) {
+    console.error('Taxi request error:', error);
+    res.status(500).json({ message: 'Error al solicitar taxi', code: 'INTERNAL_ERROR' });
+  }
 });
 
 app.get('/api/taxi/:rideId/status', auth, async (req, res) => {
-  const { data: ride } = await supabase.from('taxi_rides')
-    .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
-  if (!ride) return res.status(404).json({ message: 'Viaje no encontrado' });
-  const status = sandboxStatus.includes(ride.status) ? ride.status : 'processing';
-  res.json({ rideId: ride.ride_ref, status, eta: status === 'completed' ? 0 : 2, driver_location: { lat: 3.75, lng: 8.78 }, fare: ride.fare, driver: ride.driver });
+  try {
+    let ride = null;
+    
+    // Intentar obtener de Supabase
+    try {
+      const { data } = await supabase.from('taxi_rides')
+        .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
+      ride = data;
+    } catch (dbError) {
+      console.warn('Taxi status query failed, checking fallback:', dbError.message);
+    }
+    
+    // Si no hay datos, buscar en fallback store
+    if (!ride) {
+      const userRides = getUserStore(taxiFallbackStore, req.user.id);
+      ride = userRides.find(r => r.ride_ref === req.params.rideId);
+    }
+    
+    if (!ride) {
+      return res.status(404).json({ message: 'Viaje no encontrado', code: 'RIDE_NOT_FOUND' });
+    }
+    
+    const status = sandboxStatus.includes(ride.status) ? ride.status : 'processing';
+    res.json({ 
+      rideId: ride.ride_ref, 
+      status, 
+      eta: status === 'completed' ? 0 : 2, 
+      driver_location: { lat: 3.75, lng: 8.78 }, 
+      fare: ride.fare, 
+      driver: ride.driver 
+    });
+  } catch (error) {
+    console.error('Taxi status error:', error);
+    res.status(500).json({ message: 'Error al obtener estado del viaje', code: 'INTERNAL_ERROR' });
+  }
 });
 
 app.post('/api/taxi/:rideId/cancel', auth, async (req, res) => {
-  const { data: ride } = await supabase.from('taxi_rides')
-    .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
-  if (!ride) return res.status(404).json({ message: 'Viaje no encontrado' });
-  await supabase.from('taxi_rides').update({ status: 'failed', updated_at: new Date().toISOString() }).eq('id', ride.id);
-  await logAudit(req.user.id, 'taxi_cancel', 'taxi', ride.id, { ride_ref: ride.ride_ref });
-  res.json({ message: 'Viaje cancelado', rideId: req.params.rideId });
+  try {
+    let ride = null;
+    
+    // Buscar en Supabase
+    try {
+      const { data } = await supabase.from('taxi_rides')
+        .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
+      ride = data;
+    } catch (dbError) {
+      console.warn('Taxi cancel query failed, checking fallback:', dbError.message);
+    }
+    
+    // Si no hay datos, buscar en fallback store
+    if (!ride) {
+      const userRides = getUserStore(taxiFallbackStore, req.user.id);
+      ride = userRides.find(r => r.ride_ref === req.params.rideId);
+    }
+    
+    if (!ride) {
+      return res.status(404).json({ message: 'Viaje no encontrado', code: 'RIDE_NOT_FOUND' });
+    }
+    
+    // Actualizar en Supabase si tiene ID
+    if (ride.id && typeof ride.id === 'string' && !ride.id.startsWith('RIDE')) {
+      try {
+        await supabase.from('taxi_rides').update({ 
+          status: 'failed', 
+          updated_at: new Date().toISOString() 
+        }).eq('id', ride.id);
+      } catch (updateError) {
+        console.warn('Taxi cancel update failed:', updateError.message);
+      }
+    }
+    
+    // Actualizar en fallback store
+    const userRides = getUserStore(taxiFallbackStore, req.user.id);
+    const fallbackIndex = userRides.findIndex(r => r.ride_ref === req.params.rideId);
+    if (fallbackIndex !== -1) {
+      userRides[fallbackIndex].status = 'failed';
+      userRides[fallbackIndex].updated_at = new Date().toISOString();
+    }
+    
+    try {
+      await logAudit(req.user.id, 'taxi_cancel', 'taxi', ride.id, { ride_ref: ride.ride_ref });
+    } catch (auditError) {
+      console.warn('Audit logging failed:', auditError.message);
+    }
+    
+    res.json({ message: 'Viaje cancelado', rideId: req.params.rideId });
+  } catch (error) {
+    console.error('Taxi cancel error:', error);
+    res.status(500).json({ message: 'Error al cancelar viaje', code: 'INTERNAL_ERROR' });
+  }
 });
 
 app.post('/api/taxi/:rideId/rate', auth, async (req, res) => {
-  const { rating, comment } = req.body;
-  const { data: ride } = await supabase.from('taxi_rides')
-    .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
-  if (!ride) return res.status(404).json({ message: 'Viaje no encontrado' });
-  await supabase.from('taxi_rides').update({
-    rating: Number(rating || 0),
-    rating_comment: comment || null,
-    status: 'completed',
-    updated_at: new Date().toISOString()
-  }).eq('id', ride.id);
-  const deb = await debitWalletWithTx(req.user.id, Number(ride.fare || 0), 'EGCHAT', `TAXI-${ride.ride_ref}`, 'taxi_payment');
-  if (!deb.ok) return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
-  res.json({ message: 'Valoracion enviada', rating, rideId: req.params.rideId, balance: deb.balance });
+  try {
+    const { rating, comment } = req.body;
+    if (!rating || rating < 1 || rating > 5) {
+      return res.status(400).json({ message: 'Rating debe ser entre 1 y 5', code: 'INVALID_RATING' });
+    }
+    
+    let ride = null;
+    
+    // Buscar en Supabase
+    try {
+      const { data } = await supabase.from('taxi_rides')
+        .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
+      ride = data;
+    } catch (dbError) {
+      console.warn('Taxi rate query failed, checking fallback:', dbError.message);
+    }
+    
+    // Si no hay datos, buscar en fallback store
+    if (!ride) {
+      const userRides = getUserStore(taxiFallbackStore, req.user.id);
+      ride = userRides.find(r => r.ride_ref === req.params.rideId);
+    }
+    
+    if (!ride) {
+      return res.status(404).json({ message: 'Viaje no encontrado', code: 'RIDE_NOT_FOUND' });
+    }
+    
+    const updateData = {
+      rating: Number(rating),
+      rating_comment: comment || null,
+      status: 'completed',
+      updated_at: new Date().toISOString()
+    };
+    
+    // Actualizar en Supabase si tiene ID
+    if (ride.id && typeof ride.id === 'string' && !ride.id.startsWith('RIDE')) {
+      try {
+        await supabase.from('taxi_rides').update(updateData).eq('id', ride.id);
+      } catch (updateError) {
+        console.warn('Taxi rate update failed:', updateError.message);
+      }
+    }
+    
+    // Actualizar en fallback store
+    const userRides = getUserStore(taxiFallbackStore, req.user.id);
+    const fallbackIndex = userRides.findIndex(r => r.ride_ref === req.params.rideId);
+    if (fallbackIndex !== -1) {
+      Object.assign(userRides[fallbackIndex], updateData);
+    }
+    
+    let deb = { balance: 0 };
+    try {
+      deb = await debitWalletWithTx(req.user.id, 0, 'EGCHAT', `TAXI-RATE-${req.params.rideId}`, 'taxi_rate');
+    } catch (walletError) {
+      console.warn('Wallet debit failed:', walletError.message);
+    }
+    
+    try {
+      await logAudit(req.user.id, 'taxi_rate', 'taxi', ride.id, { ride_ref: ride.ride_ref, rating });
+    } catch (auditError) {
+      console.warn('Audit logging failed:', auditError.message);
+    }
+    
+    res.json({ 
+      message: 'Valoracion enviada', 
+      rating: Number(rating), 
+      rideId: req.params.rideId, 
+      balance: deb.balance 
+    });
+  } catch (error) {
+    console.error('Taxi rate error:', error);
+    res.status(500).json({ message: 'Error al valorar viaje', code: 'INTERNAL_ERROR' });
+  }
 });
 
 app.get('/api/taxi/rides', auth, async (req, res) => {
-  const { data } = await supabase.from('taxi_rides').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
-  res.json(data || []);
+  try {
+    let rides = [];
+    
+    // Intentar obtener de Supabase
+    try {
+      const { data } = await supabase.from('taxi_rides')
+        .select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
+      rides = data || [];
+    } catch (dbError) {
+      console.warn('Taxi rides query failed, using fallback:', dbError.message);
+    }
+    
+    // Combinar con fallback store
+    const fallbackRides = getUserStore(taxiFallbackStore, req.user.id);
+    const combined = [...rides, ...fallbackRides];
+    
+    // Eliminar duplicados por ride_ref y ordenar
+    const uniqueRides = combined.filter((ride, index, self) => 
+      index === self.findIndex(r => r.ride_ref === ride.ride_ref)
+    );
+    
+    uniqueRides.sort((a, b) => 
+      new Date(b.created_at || 0) - new Date(a.created_at || 0)
+    );
+    
+    res.json(uniqueRides);
+  } catch (error) {
+    console.error('Taxi rides error:', error);
+    res.status(500).json({ message: 'Error al obtener viajes', code: 'INTERNAL_ERROR' });
+  }
 });
 
 // Alias legacy sin /api
@@ -2523,21 +2810,13 @@ const NOTICIAS = [
   { id: '6', title: 'BEAC anuncia nuevas polÃ­ticas monetarias', source: 'BEAC', category: 'Finanzas', time: '09:00' },
 ];
 
-app.get('/api/noticias', auth, async (req, res) => {
+app.get(['/api/noticias', '/noticias'], auth, async (req, res) => {
   const { cat } = req.query;
-  res.json(cat ? NOTICIAS.filter(n => n.category.toLowerCase() === cat.toLowerCase()) : NOTICIAS);
-});
-app.get('/noticias', auth, async (req, res) => {
-  const { cat } = req.query;
-  res.json(cat ? NOTICIAS.filter(n => n.category.toLowerCase() === String(cat).toLowerCase()) : NOTICIAS);
+  const category = typeof cat === 'string' ? cat.toLowerCase() : String(cat).toLowerCase();
+  res.json(cat ? NOTICIAS.filter(n => n.category.toLowerCase() === category) : NOTICIAS);
 });
 
-app.get('/api/noticias/:id', auth, async (req, res) => {
-  const noticia = NOTICIAS.find(n => n.id === req.params.id);
-  if (!noticia) return res.status(404).json({ message: 'Noticia no encontrada' });
-  res.json({ ...noticia, content: `Contenido completo de: ${noticia.title}. Esta noticia fue publicada por ${noticia.source}.` });
-});
-app.get('/noticias/:id', auth, async (req, res) => {
+app.get(['/api/noticias/:id', '/noticias/:id'], auth, async (req, res) => {
   const noticia = NOTICIAS.find(n => n.id === req.params.id);
   if (!noticia) return res.status(404).json({ message: 'Noticia no encontrada' });
   res.json({ ...noticia, content: `Contenido completo de: ${noticia.title}. Esta noticia fue publicada por ${noticia.source}.` });

@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS users (
   avatar_url TEXT,
   last_seen TIMESTAMPTZ,
   status VARCHAR(20) DEFAULT 'offline',
+  app_version VARCHAR(20) DEFAULT '2.5.0',
   created_at TIMESTAMPTZ DEFAULT NOW(),
   last_login TIMESTAMPTZ,
   is_active BOOLEAN DEFAULT TRUE
