@@ -28,7 +28,7 @@ const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'https://egchat-app.
   .filter(Boolean);
 
 const corsOptions = {
-  origin: (origin: any, callback: any) => {
+  origin: (origin, callback) => {
     // Permitir sin origin (Electron file://, apps móviles, Postman)
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
