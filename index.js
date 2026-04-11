@@ -1688,11 +1688,24 @@ app.post('/api/user/change-password', auth, async (req, res) => {
   const { oldPassword, newPassword } = req.body;
   const { data: user } = await supabase.from('users').select('password_hash').eq('id', req.user.id).single();
   const ok = await bcrypt.compare(oldPassword, user.password_hash);
-  if (!ok) return res.status(401).json({ message: 'ContraseÃƒÂ±a actual incorrecta' });
+  if (!ok) return res.status(401).json({ message: 'Contraseña actual incorrecta' });
   const hashed = await bcrypt.hash(newPassword, 10);
   await supabase.from('users').update({ password_hash: hashed }).eq('id', req.user.id);
-  res.json({ message: 'ContraseÃƒÂ±a actualizada' });
+  res.json({ message: 'Contraseña actualizada' });
 });
+
+// Reset de contraseña por admin (protegido con ADMIN_RESET_KEY)
+app.post('/api/admin/reset-password', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.body?.adminKey;
+  if (!key || key !== adminResetKey) return res.status(403).json({ message: 'No autorizado' });
+  const { phone, newPassword } = req.body;
+  if (!phone || !newPassword) return res.status(400).json({ message: 'phone y newPassword requeridos' });
+  const hashed = await bcrypt.hash(newPassword, 10);
+  const { data, error } = await supabase.from('users').update({ password_hash: hashed }).eq('phone', phone).select('id, phone, full_name').single();
+  if (error || !data) return res.status(404).json({ message: 'Usuario no encontrado', error: error?.message });
+  res.json({ message: 'Contraseña reseteada', user: data });
+});
+
 
 // Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 // CONTACTOS
