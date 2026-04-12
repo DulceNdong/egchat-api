@@ -960,6 +960,50 @@ app.post('/api/contacts/:contactId/favorite', auth, async (req, res) => {
   }
 });
 
+// Desmarcar contacto como favorito
+app.delete('/api/contacts/:contactId/favorite', auth, async (req, res) => {
+  try {
+    const { contactId } = req.params;
+    const { data: contact, error } = await supabase
+      .from('contacts')
+      .update({ is_favorite: false })
+      .eq('id', contactId)
+      .eq('user_id', req.user.id)
+      .select()
+      .single();
+    if (error) throw error;
+    if (!contact) return res.status(404).json({ message: 'Contacto no encontrado' });
+    res.json({ message: 'Contacto desmarcado como favorito', contact });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Listar solo contactos favoritos
+app.get('/api/contacts/favorites', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('contacts')
+      .select('*, contact_user:users!contacts_contact_user_id_fkey(id, name, phone, avatar_url, is_online, last_seen)')
+      .eq('user_id', req.user.id)
+      .eq('is_favorite', true)
+      .order('name');
+    if (error) throw error;
+    res.json((data || []).map(c => ({
+      id: c.id,
+      name: c.name || c.contact_user?.name,
+      phone: c.phone || c.contact_user?.phone,
+      avatar_url: c.contact_user?.avatar_url,
+      is_online: c.contact_user?.is_online,
+      is_favorite: true,
+      contact_user_id: c.contact_user_id,
+      user: c.contact_user
+    })));
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // Obtener contactos para chat
 app.get('/api/contacts/search', auth, async (req, res) => {
   try {
