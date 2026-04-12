@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: egchat-api
+    env: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node index.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_VERSION
+        value: 2.5.1
+      - key: CORS_ALLOWED_ORIGINS
+        value: https://egchat-app.vercel.app,http://localhost:3003,http://localhost:5173
+services:
+  - type: web
+    name: egchat-api
+    env: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node index.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_VERSION
+        value: 2.5.1
+      - key: CORS_ALLOWED_ORIGINS
+        value: https://egchat-app.vercel.app,http://localhost:3003,http://localhost:5173
