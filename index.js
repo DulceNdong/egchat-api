@@ -1,5 +1,8 @@
-﻿// dotenv solo en local (en Render las vars vienen del dashboard)
-try { require('dotenv').config(); } catch(e) {}
+﻿// Cargar variables de entorno (solo en local, en Render vienen del dashboard)
+try { 
+  const dotenv = require('dotenv');
+  dotenv.config();
+} catch(e) {}
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
