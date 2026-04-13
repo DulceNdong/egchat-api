@@ -849,6 +849,8 @@ app.post('/api/contacts', auth, async (req, res) => {
       .from('contacts')
       .insert({
         user_id: req.user.id,
+        user_id_min: req.user.id < targetId ? req.user.id : targetId,
+        user_id_max: req.user.id < targetId ? targetId : req.user.id,
         contact_user_id: targetId,
         nickname: nickname || targetUser.full_name
       })
