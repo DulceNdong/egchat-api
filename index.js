@@ -991,22 +991,29 @@ app.delete('/api/contacts/:contactId/favorite', auth, async (req, res) => {
 // Listar solo contactos favoritos
 app.get('/api/contacts/favorites', auth, async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data: contacts, error } = await supabase
       .from('contacts')
-      .select('*, contact_user:users!contacts_contact_user_id_fkey(id, name, phone, avatar_url, is_online, last_seen)')
+      .select('*')
       .eq('user_id', req.user.id)
-      .eq('is_favorite', true)
-      .order('name');
+      .eq('is_favorite', true);
     if (error) throw error;
-    res.json((data || []).map(c => ({
+    if (!contacts || contacts.length === 0) return res.json([]);
+
+    const userIds = contacts.map(c => c.contact_user_id).filter(Boolean);
+    const { data: users } = await supabase
+      .from('users')
+      .select('id, phone, full_name, avatar_url')
+      .in('id', userIds);
+    const usersMap = (users || []).reduce((acc, u) => { acc[u.id] = u; return acc; }, {});
+
+    res.json(contacts.map(c => ({
       id: c.id,
-      name: c.name || c.contact_user?.name,
-      phone: c.phone || c.contact_user?.phone,
-      avatar_url: c.contact_user?.avatar_url,
-      is_online: c.contact_user?.is_online,
+      name: c.nickname || usersMap[c.contact_user_id]?.full_name || 'Sin nombre',
+      phone: usersMap[c.contact_user_id]?.phone || '',
+      avatar_url: usersMap[c.contact_user_id]?.avatar_url || '',
       is_favorite: true,
       contact_user_id: c.contact_user_id,
-      user: c.contact_user
+      user: usersMap[c.contact_user_id] || null
     })));
   } catch (e) {
     res.status(500).json({ message: e.message });
