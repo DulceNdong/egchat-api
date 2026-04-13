@@ -11,9 +11,9 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || 'egchat_secret_2026';
-if (!process.env.JWT_SECRET) {
-  console.warn('⚠️  JWT_SECRET not set, using default (insecure for production)');
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET environment variable is required. Set it in .env for local development and in Render settings for production.');
 }
 const APP_VERSION = '2.5.0';
 const chatStreams = new Map();
@@ -45,27 +45,33 @@ app.use(cors(corsOptions));
 app.use(express.json());
 
 // --- Middleware auth --------------------------------------------------
+const parseBearerToken = (header) => {
+  if (typeof header !== 'string') return '';
+  const match = header.match(/^\s*Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : '';
+};
+
 const auth = (req, res, next) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
+  const token = parseBearerToken(req.headers.authorization);
   if (!token) return res.status(401).json({ message: 'Token requerido' });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch {
-    res.status(401).json({ message: 'Token invÃ¡lido o expirado' });
+    res.status(401).json({ message: 'Token inválido o expirado' });
   }
 };
 
 const authFromQuery = (req, res, next) => {
   const tokenFromQuery = typeof req.query.token === 'string' ? req.query.token : '';
-  const tokenFromHeader = req.headers.authorization?.replace('Bearer ', '') || '';
+  const tokenFromHeader = parseBearerToken(req.headers.authorization);
   const token = tokenFromQuery || tokenFromHeader;
   if (!token) return res.status(401).json({ message: 'Token requerido' });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch {
-    res.status(401).json({ message: 'Token invÃ¡lido o expirado' });
+    res.status(401).json({ message: 'Token inválido o expirado' });
   }
 };
 
