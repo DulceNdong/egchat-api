@@ -762,26 +762,32 @@ app.get('/api/contacts', auth, async (req, res) => {
   try {
     const { data: contacts, error } = await supabase
       .from('contacts')
-      .select(`
-        *,
-        contact_user:users!contact_user_id_fkey(
-          id, phone, full_name, avatar_url, last_seen, status
-        )
-      `)
+      .select('*')
       .eq('user_id', req.user.id)
       .order('created_at', { ascending: false });
 
     if (error) throw error;
+    if (!contacts || contacts.length === 0) return res.json([]);
 
-    // Formatear contactos
+    // Obtener datos de usuarios por separado
+    const userIds = contacts.map(c => c.contact_user_id).filter(Boolean);
+    const { data: users } = await supabase
+      .from('users')
+      .select('id, phone, full_name, avatar_url')
+      .in('id', userIds);
+
+    const usersMap = (users || []).reduce((acc, u) => { acc[u.id] = u; return acc; }, {});
+
     const formattedContacts = contacts.map(contact => ({
       id: contact.id,
       contact_user_id: contact.contact_user_id,
-      nickname: contact.nickname,
+      name: contact.nickname || usersMap[contact.contact_user_id]?.full_name || 'Sin nombre',
+      phone: usersMap[contact.contact_user_id]?.phone || '',
+      avatar_url: usersMap[contact.contact_user_id]?.avatar_url || '',
       is_blocked: contact.is_blocked,
       is_favorite: contact.is_favorite,
       created_at: contact.created_at,
-      user: contact.contact_user
+      user: usersMap[contact.contact_user_id] || null
     }));
 
     res.json(formattedContacts);
@@ -846,12 +852,7 @@ app.post('/api/contacts', auth, async (req, res) => {
         contact_user_id: targetId,
         nickname: nickname || targetUser.full_name
       })
-      .select(`
-        *,
-        contact_user:users!contact_user_id_fkey(
-          id, phone, full_name, avatar_url, last_seen, status
-        )
-      `)
+      .select('*')
       .single();
 
     if (error) throw error;
@@ -859,11 +860,13 @@ app.post('/api/contacts', auth, async (req, res) => {
     res.json({
       id: contact.id,
       contact_user_id: contact.contact_user_id,
-      nickname: contact.nickname,
+      name: contact.nickname || targetUser.full_name,
+      phone: targetUser.phone,
+      avatar_url: targetUser.avatar_url || '',
       is_blocked: contact.is_blocked,
       is_favorite: contact.is_favorite,
       created_at: contact.created_at,
-      user: contact.contact_user
+      user: targetUser
     });
   } catch (e) {
     console.error('Add contact error:', e);
