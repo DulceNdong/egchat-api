@@ -48,7 +48,7 @@ const corsOptions = {
     return callback(new Error('CORS policy: origin not allowed'));
   },
   credentials: true,
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
 };
 
