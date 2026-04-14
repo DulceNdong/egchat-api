@@ -12,7 +12,17 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'EGchat2025!xK9mP3nQ7rL2vW8tY4uJ6hF1bN5cA0dE_prod_secret';
+const JWT_SECRET_FALLBACK = 'EGchat2025!xK9mP3nQ7rL2vW8tY4uJ6hF1bN5cA0dE_prod_secret';
 console.log('JWT_SECRET source:', process.env.JWT_SECRET ? 'environment' : 'fallback');
+
+// Verificar token con múltiples secrets para compatibilidad
+const verifyToken = (token) => {
+  const secrets = [JWT_SECRET, JWT_SECRET_FALLBACK].filter((s, i, arr) => arr.indexOf(s) === i);
+  for (const secret of secrets) {
+    try { return jwt.verify(token, secret); } catch {}
+  }
+  throw new Error('Token inválido o expirado');
+};
 const APP_VERSION = '2.5.0';
 const chatStreams = new Map();
 const dependencyCache = { timestamp: 0, result: null };
@@ -53,7 +63,7 @@ const auth = (req, res, next) => {
   const token = parseBearerToken(req.headers.authorization);
   if (!token) return res.status(401).json({ message: 'Token requerido' });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    req.user = verifyToken(token);
     next();
   } catch {
     res.status(401).json({ message: 'Token inválido o expirado' });
@@ -66,7 +76,7 @@ const authFromQuery = (req, res, next) => {
   const token = tokenFromQuery || tokenFromHeader;
   if (!token) return res.status(401).json({ message: 'Token requerido' });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    req.user = verifyToken(token);
     next();
   } catch {
     res.status(401).json({ message: 'Token inválido o expirado' });
