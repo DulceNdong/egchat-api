@@ -67,7 +67,8 @@ const auth = (req, res, next) => {
   // Intentar obtener token de múltiples fuentes
   const authHeader = parseBearerToken(req.headers.authorization);
   const xAuthToken = req.headers['x-auth-token'] || '';
-  const token = authHeader || xAuthToken;
+  const queryToken = typeof req.query._t === 'string' ? req.query._t : '';
+  const token = authHeader || xAuthToken || queryToken;
   if (!token) return res.status(401).json({ message: 'Token requerido' });
   try {
     req.user = verifyToken(token);
