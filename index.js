@@ -185,6 +185,12 @@ app.get('/', (req, res) => res.json({
 
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
+app.get('/jwt-debug', (req, res) => res.json({
+  jwt_secret_source: process.env.JWT_SECRET ? 'environment' : 'fallback',
+  jwt_secret_first10: JWT_SECRET.substring(0, 10),
+  jwt_secret_length: JWT_SECRET.length,
+}));
+
 app.get('/debug', (req, res) => res.json({
   supabase_url: process.env.SUPABASE_URL ? 'âœ… set' : 'âŒ missing',
   supabase_key: process.env.SUPABASE_SERVICE_KEY ? 'âœ… set' : 'âŒ missing',
@@ -3003,5 +3009,6 @@ if (require.main === module) {
 }
 
 module.exports = app;
+
 
 
