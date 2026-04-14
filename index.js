@@ -398,7 +398,7 @@ app.get('/api/chats', auth, async (req, res) => {
 
     const [{ data: participants }, { data: messages }] = await Promise.all([
       supabase.from('chat_participants')
-        .select('chat_id, user_id, users(id, phone, full_name)')
+        .select('chat_id, user_id, users(id, phone, full_name, avatar_url)')
         .in('chat_id', chatIds),
       supabase.from('messages')
         .select('id, text, type, created_at, sender_id, chat_id')
