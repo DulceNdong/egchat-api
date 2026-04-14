@@ -64,7 +64,10 @@ const parseBearerToken = (header) => {
 };
 
 const auth = (req, res, next) => {
-  const token = parseBearerToken(req.headers.authorization);
+  // Intentar obtener token de múltiples fuentes
+  const authHeader = parseBearerToken(req.headers.authorization);
+  const xAuthToken = req.headers['x-auth-token'] || '';
+  const token = authHeader || xAuthToken;
   if (!token) return res.status(401).json({ message: 'Token requerido' });
   try {
     req.user = verifyToken(token);
@@ -77,7 +80,8 @@ const auth = (req, res, next) => {
 const authFromQuery = (req, res, next) => {
   const tokenFromQuery = typeof req.query.token === 'string' ? req.query.token : '';
   const tokenFromHeader = parseBearerToken(req.headers.authorization);
-  const token = tokenFromQuery || tokenFromHeader;
+  const xAuthToken = req.headers['x-auth-token'] || '';
+  const token = tokenFromQuery || tokenFromHeader || xAuthToken;
   if (!token) return res.status(401).json({ message: 'Token requerido' });
   try {
     req.user = verifyToken(token);
