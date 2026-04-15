@@ -33,7 +33,7 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY || ''
 );
 
-const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'https://egchat-app.vercel.app,http://localhost:5173,http://localhost:3001,http://localhost:3000,http://127.0.0.1:3001')
+const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'https://egchat-app.vercel.app,https://egchat-v2.vercel.app,http://localhost:5173,http://localhost:3001,http://localhost:3000,http://127.0.0.1:3001')
   .split(',')
   .map(origin => origin.trim())
   .filter(Boolean);
@@ -45,6 +45,8 @@ const corsOptions = {
     if (allowedOrigins.includes(origin)) return callback(null, true);
     // Permitir cualquier localhost en desarrollo
     if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true);
+    // Permitir cualquier subdominio de vercel.app (egchat-v2, egchat-app, etc.)
+    if (/^https:\/\/egchat.*\.vercel\.app$/.test(origin)) return callback(null, true);
     return callback(new Error('CORS policy: origin not allowed'));
   },
   credentials: true,
