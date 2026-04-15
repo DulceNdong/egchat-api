@@ -3004,6 +3004,69 @@ const updateUserVersions = async () => {
   }
 };
 
+// ─── WebRTC Signaling (in-memory, TTL 60s) ────────────────────────────────────
+const signalingStore = new Map(); // key: callId, value: { offer, answer, callerCandidates[], calleeCandidates[], ts }
+
+const cleanSignaling = () => {
+  const now = Date.now();
+  for (const [k, v] of signalingStore) { if (now - v.ts > 120000) signalingStore.delete(k); }
+};
+setInterval(cleanSignaling, 30000);
+
+// Iniciar llamada — caller envía offer
+app.post('/api/call/offer', auth, (req, res) => {
+  const { callId, offer, targetUserId, type } = req.body;
+  if (!callId || !offer) return res.status(400).json({ error: 'callId y offer requeridos' });
+  signalingStore.set(callId, { offer, answer: null, callerCandidates: [], calleeCandidates: [], type: type||'audio', callerId: req.user.id, targetUserId, ts: Date.now() });
+  res.json({ ok: true });
+});
+
+// Callee responde con answer
+app.post('/api/call/answer', auth, (req, res) => {
+  const { callId, answer } = req.body;
+  const session = signalingStore.get(callId);
+  if (!session) return res.status(404).json({ error: 'Llamada no encontrada' });
+  session.answer = answer;
+  session.ts = Date.now();
+  res.json({ ok: true });
+});
+
+// Enviar ICE candidate
+app.post('/api/call/ice', auth, (req, res) => {
+  const { callId, candidate, role } = req.body; // role: 'caller' | 'callee'
+  const session = signalingStore.get(callId);
+  if (!session) return res.status(404).json({ error: 'Llamada no encontrada' });
+  if (role === 'caller') session.callerCandidates.push(candidate);
+  else session.calleeCandidates.push(candidate);
+  session.ts = Date.now();
+  res.json({ ok: true });
+});
+
+// Polling — obtener estado de la llamada
+app.get('/api/call/:callId', auth, (req, res) => {
+  const session = signalingStore.get(req.params.callId);
+  if (!session) return res.status(404).json({ error: 'Llamada no encontrada' });
+  res.json(session);
+});
+
+// Terminar llamada
+app.delete('/api/call/:callId', auth, (req, res) => {
+  signalingStore.delete(req.params.callId);
+  res.json({ ok: true });
+});
+
+// Notificar llamada entrante (el callee hace polling de esto)
+app.get('/api/call/incoming/:userId', auth, (req, res) => {
+  const incoming = [];
+  for (const [callId, s] of signalingStore) {
+    if (s.targetUserId === req.params.userId && !s.answer) {
+      incoming.push({ callId, callerId: s.callerId, type: s.type, offer: s.offer });
+    }
+  }
+  res.json(incoming);
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`\n😎 EGCHAT API + Supabase en http://localhost:${PORT}`);
