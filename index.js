@@ -731,7 +731,7 @@ app.post('/api/chats/:chatId/read', auth, async (req, res) => {
 app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
-    
+
     // Verificar acceso al chat
     const { data: part } = await supabase
       .from('chat_participants')
@@ -740,19 +740,47 @@ app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
       .eq('user_id', req.user.id)
       .single();
 
-    if (!part) {
-      return res.status(403).json({ message: 'No tienes acceso a este chat' });
+    if (!part) return res.status(403).json({ message: 'No tienes acceso a este chat' });
+
+    // Leer el body como buffer (multipart/form-data o raw base64)
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const buffer = Buffer.concat(chunks);
+
+    // Detectar content-type y nombre del archivo desde headers
+    const contentType = req.headers['content-type'] || 'application/octet-stream';
+    const fileName = req.headers['x-file-name']
+      ? decodeURIComponent(req.headers['x-file-name'])
+      : `file_${Date.now()}`;
+    const ext = fileName.split('.').pop()?.toLowerCase() || 'bin';
+    const storagePath = `chats/${chatId}/${Date.now()}_${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+
+    // Subir a Supabase Storage (bucket: chat-files)
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('chat-files')
+      .upload(storagePath, buffer, {
+        contentType,
+        upsert: false,
+      });
+
+    if (uploadError) {
+      console.error('Supabase storage upload error:', uploadError.message);
+      return res.status(500).json({ message: 'Error al subir archivo: ' + uploadError.message });
     }
 
-    // AquÃ­ irÃ­a la lÃ³gica de subida de archivos a un servicio como AWS S3
-    // Por ahora, simulamos la subida
-    const fileUrl = `https://storage.egchat-gq.com/chats/${chatId}/${Date.now()}.jpg`;
-    
+    // Obtener URL pública
+    const { data: urlData } = supabase.storage
+      .from('chat-files')
+      .getPublicUrl(storagePath);
+
+    const publicUrl = urlData?.publicUrl || '';
+
     res.json({
-      file_url: fileUrl,
-      file_type: 'image',
-      file_size: 1024000, // 1MB
-      thumbnail_url: `${fileUrl}?thumbnail=true`
+      file_url: publicUrl,
+      file_name: fileName,
+      file_type: contentType,
+      file_size: buffer.length,
+      file_ext: ext,
     });
   } catch (e) {
     console.error('Upload file error:', e);
