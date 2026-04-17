@@ -249,7 +249,7 @@ app.get('/api/system/dependencies', async (_req, res) => {
   res.json(payload);
 });
 
-// Stream SSE para mensajerÃ­a en tiempo real
+// Stream SSE para mensajería en tiempo real
 app.get('/api/chat/stream', authFromQuery, (req, res) => {
   const userId = String(req.user.id);
   res.setHeader('Content-Type', 'text/event-stream');
@@ -281,7 +281,7 @@ app.get('/api/chat/stream', authFromQuery, (req, res) => {
 });
 
 // AUTH
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { phone, password, full_name, avatar_url } = req.body;
@@ -293,7 +293,7 @@ app.post('/api/auth/register', async (req, res) => {
     // Verificar si ya existe
     const { data: existing } = await supabase
       .from('users').select('id').eq('phone', phone).maybeSingle();
-    if (existing) return res.status(409).json({ message: 'El telÃ©fono ya estÃ¡ registrado' });
+    if (existing) return res.status(409).json({ message: 'El teléfono ya está registrado' });
 
     const hashed = await bcrypt.hash(password, 10);
     const { data: user, error } = await supabase
@@ -365,13 +365,13 @@ app.put('/api/auth/profile', auth, async (req, res) => {
   }
 });
 
-app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'SesiÃ³n cerrada' }));
+app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'Sesión cerrada' }));
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // CONTACTOS
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // ========================================================================
-// CHAT / MENSAJERÃA COMPLETA
+// CHAT / MENSAJERÁA COMPLETA
 // ========================================================================
 
 // Obtener todos los chats del usuario
@@ -384,7 +384,7 @@ app.get('/api/chats', auth, async (req, res) => {
       .eq('user_id', req.user.id);
 
     if (pErr) {
-      // Si la tabla no existe, devolver array vacÃ­o
+      // Si la tabla no existe, devolver array vacío
       return res.json([]);
     }
 
@@ -435,11 +435,11 @@ app.get('/api/chats', auth, async (req, res) => {
     res.json(result);
   } catch (e) {
     console.error('Get chats error:', e.message);
-    res.json([]); // Devolver vacÃ­o en vez de 500
+    res.json([]); // Devolver vacío en vez de 500
   }
 });
 
-// Obtener mensajes de un chat especÃƒÂ­fico
+// Obtener mensajes de un chat especÁƒÂ­fico
 app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
@@ -527,7 +527,7 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
 });
 
 // Crear chat privado
-// Crear chat privado Ã¢â‚¬â€ usa chat_participants
+// Crear chat privado ââ‚¬â€ usa chat_participants
 app.post('/api/chats/private', auth, async (req, res) => {
   try {
     const { participant_id, phone } = req.body;
@@ -541,7 +541,7 @@ app.post('/api/chats/private', auth, async (req, res) => {
         .single();
 
       if (userError || !found) {
-        return res.status(404).json({ message: 'Usuario no encontrado con ese nÃºmero' });
+        return res.status(404).json({ message: 'Usuario no encontrado con ese nÁºmero' });
       }
 
       targetId = found.id;
@@ -641,7 +641,7 @@ app.post('/api/chats/group', auth, async (req, res) => {
       participant_ids.push(req.user.id);
     }
 
-    // Obtener informaciÃ³n de los participantes
+    // Obtener información de los participantes
     const { data: participants, error: userError } = await supabase
       .from('users')
       .select('id, phone, full_name, avatar_url')
@@ -683,7 +683,7 @@ app.post('/api/chats/group', auth, async (req, res) => {
   }
 });
 
-// Marcar mensajes como leÃ­dos
+// Marcar mensajes como leídos
 app.post('/api/chats/:chatId/read', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
@@ -701,7 +701,7 @@ app.post('/api/chats/:chatId/read', auth, async (req, res) => {
       return res.status(403).json({ message: 'No tienes acceso a este chat' });
     }
 
-    // Marcar mensajes como leÃ­dos hasta el mensaje especificado
+    // Marcar mensajes como leídos hasta el mensaje especificado
     const { error: updateError } = await supabase
       .from('message_reads')
       .upsert({
@@ -715,14 +715,14 @@ app.post('/api/chats/:chatId/read', auth, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Resetear contador de no leÃƒÂ­dos
+    // Resetear contador de no leÁƒÂ­dos
     await supabase
       .from('chat_participants')
       .update({ unread_count: 0 })
       .eq('chat_id', chatId)
       .eq('user_id', req.user.id);
 
-    res.json({ message: 'Mensajes marcados como leÃƒÂ­dos' });
+    res.json({ message: 'Mensajes marcados como leÁƒÂ­dos' });
   } catch (e) {
     console.error('Mark as read error:', e);
     res.status(500).json({ message: e.message });
@@ -825,9 +825,9 @@ app.delete('/api/messages/:messageId', auth, async (req, res) => {
   }
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
-// CONTACTOS - GESTIÃƒâ€œN COMPLETA
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
+// CONTACTOS - GESTIÁƒâ€œN COMPLETA
+// ════════════════════════════════════════════════════════════════════
 
 // Obtener todos los contactos del usuario
 app.get('/api/contacts', auth, async (req, res) => {
@@ -883,14 +883,14 @@ app.post('/api/contacts', auth, async (req, res) => {
         .single();
 
       if (userError || !targetUser) {
-        return res.status(404).json({ message: 'Usuario no encontrado con ese nÃºmero' });
+        return res.status(404).json({ message: 'Usuario no encontrado con ese nÁºmero' });
       }
 
       targetId = targetUser.id;
     }
 
     if (!targetId) {
-      return res.status(400).json({ message: 'ID de contacto o telÃ©fono requerido' });
+      return res.status(400).json({ message: 'ID de contacto o teléfono requerido' });
     }
 
     // Verificar que el usuario a agregar existe
@@ -1125,10 +1125,10 @@ app.get('/api/contacts/search', auth, async (req, res) => {
     const { q } = req.query;
     
     if (!q || q.length < 2) {
-      return res.status(400).json({ message: 'La bÃƒÂºsqueda debe tener al menos 2 caracteres' });
+      return res.status(400).json({ message: 'La bÁƒÂºsqueda debe tener al menos 2 caracteres' });
     }
 
-    // Buscar usuarios por telÃ©fono o nombre
+    // Buscar usuarios por teléfono o nombre
     const { data: users, error } = await supabase
       .from('users')
       .select('id, phone, full_name, avatar_url')
@@ -1145,9 +1145,9 @@ app.get('/api/contacts/search', auth, async (req, res) => {
   }
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // WALLET
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 app.get('/api/wallet/balance', auth, async (req, res) => {
   let { data: wallet } = await supabase
     .from('wallets').select('balance, currency').eq('user_id', req.user.id).single();
@@ -1176,7 +1176,7 @@ app.get('/api/wallet/transactions', auth, async (req, res) => {
 
 app.post('/api/wallet/deposit', auth, async (req, res) => {
   const { amount, method, reference } = req.body;
-  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe invÃƒÂ¡lido' });
+  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe invÁƒÂ¡lido' });
 
   const { data: wallet } = await supabase
     .from('wallets').select('balance').eq('user_id', req.user.id).single();
@@ -1197,7 +1197,7 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
   const { data: wallet } = await supabase
     .from('wallets').select('balance').eq('user_id', req.user.id).single();
 
-  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe invÃƒÂ¡lido' });
+  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe invÁƒÂ¡lido' });
   if (!wallet || amount > wallet.balance) return res.status(400).json({ message: 'Saldo insuficiente' });
 
   const newBalance = wallet.balance - amount;
@@ -1223,7 +1223,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
 
   const { data: tx } = await supabase.from('transactions').insert({
     user_id: req.user.id, type: 'transfer_sent', amount, method: 'EGCHAT',
-    reference: `A: ${to} Ã‚Â· ${concept || ''}`, status: 'completed'
+    reference: `A: ${to} Á‚Â· ${concept || ''}`, status: 'completed'
   }).select().single();
 
   res.json({ balance: newBalance, transaction: tx });
@@ -1232,16 +1232,16 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
 app.post('/api/wallet/recharge-code', auth, async (req, res) => {
   const { code } = req.body;
   if (!code || code.replace(/-/g, '').length !== 16)
-    return res.status(400).json({ message: 'CÃƒÂ³digo invÃƒÂ¡lido' });
+    return res.status(400).json({ message: 'CÁƒÂ³digo invÁƒÂ¡lido' });
 
-  // Verificar si el cÃƒÂ³digo ya fue usado
+  // Verificar si el cÁƒÂ³digo ya fue usado
   const { data: usedCode } = await supabase
     .from('recharge_codes').select('*').eq('code', code).single();
 
-  if (!usedCode) return res.status(400).json({ message: 'CÃƒÂ³digo no vÃƒÂ¡lido' });
-  if (usedCode.used || usedCode.is_used) return res.status(400).json({ message: 'CÃƒÂ³digo ya utilizado' });
+  if (!usedCode) return res.status(400).json({ message: 'CÁƒÂ³digo no vÁƒÂ¡lido' });
+  if (usedCode.used || usedCode.is_used) return res.status(400).json({ message: 'CÁƒÂ³digo ya utilizado' });
   if (usedCode.expires_at && new Date(usedCode.expires_at) < new Date())
-    return res.status(400).json({ message: 'CÃƒÂ³digo expirado' });
+    return res.status(400).json({ message: 'CÁƒÂ³digo expirado' });
 
   const amount = usedCode?.amount || 5000;
 
@@ -1255,11 +1255,11 @@ app.post('/api/wallet/recharge-code', auth, async (req, res) => {
   await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
 
   await supabase.from('transactions').insert({
-    user_id: req.user.id, type: 'deposit', amount, method: 'CÃƒÂ³digo de recarga',
+    user_id: req.user.id, type: 'deposit', amount, method: 'CÁƒÂ³digo de recarga',
     reference: code, status: 'completed'
   });
 
-  res.json({ balance: newBalance, amount, message: `${amount.toLocaleString()} XAF aÃƒÂ±adidos` });
+  res.json({ balance: newBalance, amount, message: `${amount.toLocaleString()} XAF aÁƒÂ±adidos` });
 });
 
 const WALLET_LIMITS = {
@@ -1341,7 +1341,7 @@ app.get('/api/wallet/summary', auth, async (req, res) => {
 app.post('/api/wallet/hold', auth, async (req, res) => {
   const amount = Number(req.body?.amount || 0);
   const reference = req.body?.reference || `HOLD-${Date.now()}`;
-  if (amount <= 0) return res.status(400).json({ message: 'Importe invÃ¡lido' });
+  if (amount <= 0) return res.status(400).json({ message: 'Importe inválido' });
   const wallet = await getWalletSafe(req.user.id);
   if (amount > Number(wallet.balance || 0)) return res.status(400).json({ message: 'Saldo insuficiente' });
   const { data: tx } = await supabase.from('transactions').insert({
@@ -1354,8 +1354,8 @@ app.post('/api/wallet/hold/:id/capture', auth, async (req, res) => {
   const holdId = req.params.id;
   const { data: hold } = await supabase.from('transactions').select('*')
     .eq('id', holdId).eq('user_id', req.user.id).eq('type', 'hold').maybeSingle();
-  if (!hold) return res.status(404).json({ message: 'RetenciÃ³n no encontrada' });
-  if (hold.status !== 'pending') return res.status(400).json({ message: 'RetenciÃ³n ya procesada' });
+  if (!hold) return res.status(404).json({ message: 'Retención no encontrada' });
+  if (hold.status !== 'pending') return res.status(400).json({ message: 'Retención ya procesada' });
   const wallet = await getWalletSafe(req.user.id);
   const amount = Number(hold.amount || 0);
   if (amount > Number(wallet.balance || 0)) return res.status(400).json({ message: 'Saldo insuficiente para captura' });
@@ -1373,18 +1373,18 @@ app.post('/api/wallet/hold/:id/cancel', auth, async (req, res) => {
   const holdId = req.params.id;
   const { data: hold } = await supabase.from('transactions').select('*')
     .eq('id', holdId).eq('user_id', req.user.id).eq('type', 'hold').maybeSingle();
-  if (!hold) return res.status(404).json({ message: 'RetenciÃ³n no encontrada' });
-  if (hold.status !== 'pending') return res.status(400).json({ message: 'RetenciÃ³n ya procesada' });
+  if (!hold) return res.status(404).json({ message: 'Retención no encontrada' });
+  if (hold.status !== 'pending') return res.status(400).json({ message: 'Retención ya procesada' });
   await supabase.from('transactions').update({ status: 'cancelled' }).eq('id', holdId);
-  res.json({ message: 'RetenciÃ³n cancelada' });
+  res.json({ message: 'Retención cancelada' });
 });
 
 app.post('/api/wallet/reverse/:txId', auth, async (req, res) => {
   const txId = req.params.txId;
   const { data: tx } = await supabase.from('transactions').select('*')
     .eq('id', txId).eq('user_id', req.user.id).maybeSingle();
-  if (!tx) return res.status(404).json({ message: 'TransacciÃ³n no encontrada' });
-  if (tx.status === 'reversed') return res.status(400).json({ message: 'TransacciÃ³n ya revertida' });
+  if (!tx) return res.status(404).json({ message: 'Transacción no encontrada' });
+  if (tx.status === 'reversed') return res.status(400).json({ message: 'Transacción ya revertida' });
   const reversible = ['withdraw', 'transfer_sent', 'payment', 'payment_capture'];
   if (!reversible.includes(tx.type)) return res.status(400).json({ message: 'Tipo no reversible' });
   const wallet = await getWalletSafe(req.user.id);
@@ -1499,7 +1499,7 @@ app.post('/api/wallet/ledger/journals', auth, async (req, res) => {
   await ensureSystemLedgerAccounts();
   const { concept, reference, lines } = req.body || {};
   if (!concept || !Array.isArray(lines) || lines.length < 2) {
-    return res.status(400).json({ message: 'concept y al menos 2 lÃ­neas son requeridos' });
+    return res.status(400).json({ message: 'concept y al menos 2 líneas son requeridos' });
   }
 
   let debit = 0;
@@ -1510,7 +1510,7 @@ app.post('/api/wallet/ledger/journals', auth, async (req, res) => {
     const entryType = String(l?.entry_type || '');
     const accountId = String(l?.account_id || '');
     if (!accountId || !['debit', 'credit'].includes(entryType) || amount <= 0) {
-      return res.status(400).json({ message: 'LÃ­neas invÃ¡lidas: account_id, entry_type y amount son obligatorios' });
+      return res.status(400).json({ message: 'Líneas inválidas: account_id, entry_type y amount son obligatorios' });
     }
     if (entryType === 'debit') debit += amount;
     else credit += amount;
@@ -1571,7 +1571,7 @@ app.post('/api/wallet/ledger/journals/:id/approve', auth, async (req, res) => {
     .eq('id', id)
     .maybeSingle();
   if (!journal) return res.status(404).json({ message: 'Asiento no encontrado' });
-  if (journal.status !== 'pending_approval') return res.status(400).json({ message: 'El asiento no estÃ¡ pendiente de aprobaciÃ³n' });
+  if (journal.status !== 'pending_approval') return res.status(400).json({ message: 'El asiento no está pendiente de aprobación' });
   if (String(journal.created_by) === String(req.user.id)) {
     return res.status(403).json({ message: 'Maker-checker activo: el creador no puede aprobar su propio asiento' });
   }
@@ -1604,7 +1604,7 @@ app.post('/api/wallet/ledger/journals/:id/reject', auth, async (req, res) => {
     .eq('id', id)
     .maybeSingle();
   if (!journal) return res.status(404).json({ message: 'Asiento no encontrado' });
-  if (journal.status !== 'pending_approval') return res.status(400).json({ message: 'El asiento no estÃ¡ pendiente de aprobaciÃ³n' });
+  if (journal.status !== 'pending_approval') return res.status(400).json({ message: 'El asiento no está pendiente de aprobación' });
   if (String(journal.created_by) === String(req.user.id)) {
     return res.status(403).json({ message: 'Maker-checker activo: el creador no puede rechazar su propio asiento' });
   }
@@ -1669,12 +1669,12 @@ app.post('/api/cemac/transfers', auth, async (req, res) => {
   try {
     const { from_country, to_country, beneficiary_name, beneficiary_account, amount, external_id } = req.body || {};
     
-    // ValidaciÃ³n robusta
+    // Validación robusta
     if (!from_country || !to_country || !beneficiary_name || !beneficiary_account || Number(amount || 0) <= 0) {
       return res.status(400).json({ message: 'Datos de transferencia invalidos', code: 'VALIDATION_ERROR' });
     }
     
-    // Validar paÃ­ses CEMAC
+    // Validar países CEMAC
     const validCountries = ['GQ', 'CM', 'GA', 'CG', 'TD', 'CF'];
     if (!validCountries.includes(from_country) || !validCountries.includes(to_country)) {
       return res.status(400).json({ message: 'Paises no soportados', code: 'INVALID_COUNTRY' });
@@ -1831,9 +1831,9 @@ app.get('/api/cemac/transfers', auth, async (req, res) => {
   }
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // LIA-25
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 app.post('/api/lia/chat', auth, async (req, res) => {
   const { message } = req.body;
   const lower = message.toLowerCase();
@@ -1843,27 +1843,27 @@ app.post('/api/lia/chat', auth, async (req, res) => {
 
   let reply = '';
   if (lower.includes('saldo') || lower.includes('balance'))
-    reply = `Tu saldo actual es **${balance.toLocaleString()} XAF**. Ã‚Â¿Deseas recargar o retirar?`;
+    reply = `Tu saldo actual es **${balance.toLocaleString()} XAF**. Á‚Â¿Deseas recargar o retirar?`;
   else if (lower.includes('hola') || lower.includes('buenos'))
-    reply = 'Ã‚Â¡Hola! Soy Lia-25, tu asistente inteligente de EGCHAT. Ã‚Â¿En quÃƒÂ© puedo ayudarte hoy?';
+    reply = 'Á‚Â¡Hola! Soy Lia-25, tu asistente inteligente de EGCHAT. Á‚Â¿En quÁƒÂ© puedo ayudarte hoy?';
   else if (lower.includes('taxi'))
-    reply = 'Puedo ayudarte a pedir un taxi. Ve a la secciÃƒÂ³n MiTaxi desde el menÃƒÂº principal.';
+    reply = 'Puedo ayudarte a pedir un taxi. Ve a la secciÁƒÂ³n MiTaxi desde el menÁƒÂº principal.';
   else if (lower.includes('salud') || lower.includes('hospital'))
-    reply = 'En la secciÃƒÂ³n Salud encontrarÃƒÂ¡s hospitales, farmacias y puedes pedir citas mÃƒÂ©dicas.';
+    reply = 'En la secciÁƒÂ³n Salud encontrarÁƒÂ¡s hospitales, farmacias y puedes pedir citas mÁƒÂ©dicas.';
   else if (lower.includes('supermercado') || lower.includes('compra'))
-    reply = 'Puedes hacer compras en lÃƒÂ­nea desde la secciÃƒÂ³n Supermercados. Tenemos tiendas en Malabo y Bata.';
+    reply = 'Puedes hacer compras en lÁƒÂ­nea desde la secciÁƒÂ³n Supermercados. Tenemos tiendas en Malabo y Bata.';
   else if (lower.includes('transferir') || lower.includes('enviar dinero'))
-    reply = 'Para enviar dinero, ve a Mi Monedero Ã¢â€ â€™ Enviar, o dime el nÃƒÂºmero y el importe.';
+    reply = 'Para enviar dinero, ve a Mi Monedero ââ€ â€™ Enviar, o dime el nÁƒÂºmero y el importe.';
   else if (lower.includes('seguro'))
-    reply = 'Puedes contratar seguros de salud, vehÃƒÂ­culo, vida y hogar en la secciÃƒÂ³n Seguros.';
+    reply = 'Puedes contratar seguros de salud, vehÁƒÂ­culo, vida y hogar en la secciÁƒÂ³n Seguros.';
   else if (lower.includes('noticias'))
-    reply = 'Las ÃƒÂºltimas noticias de Guinea Ecuatorial y del mundo estÃƒÂ¡n en la secciÃƒÂ³n Noticias.';
+    reply = 'Las ÁƒÂºltimas noticias de Guinea Ecuatorial y del mundo estÁƒÂ¡n en la secciÁƒÂ³n Noticias.';
   else if (lower.includes('gracias'))
-    reply = 'Ã‚Â¡De nada! Estoy aquÃƒÂ­ para ayudarte. Ã‚Â¿Hay algo mÃƒÂ¡s?';
+    reply = 'Á‚Â¡De nada! Estoy aquÁƒÂ­ para ayudarte. Á‚Â¿Hay algo mÁƒÂ¡s?';
   else
     reply = `Entendido: "${message}". Puedo ayudarte con saldo, transferencias, taxi, salud, supermercados, seguros y noticias.`;
 
-  // Guardar conversaciÃƒÂ³n en Supabase
+  // Guardar conversaciÁƒÂ³n en Supabase
   await supabase.from('lia_conversations').insert({
     user_id: req.user.id, message, reply
   }).catch(() => {});
@@ -1871,9 +1871,9 @@ app.post('/api/lia/chat', auth, async (req, res) => {
   res.json({ reply, timestamp: new Date().toISOString() });
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // USER
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 app.get('/api/user/profile', auth, async (req, res) => {
   const { data: user } = await supabase
     .from('users').select('id, phone, full_name, created_at, avatar_url').eq('id', req.user.id).single();
@@ -1915,10 +1915,10 @@ app.post('/api/admin/reset-password', async (req, res) => {
 });
 
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // CONTACTOS
-// SERVICIOS PÃƒÅ¡BLICOS (simulados con datos reales de GE)
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// SERVICIOS PÁƒÅ¡BLICOS (simulados con datos reales de GE)
+// ════════════════════════════════════════════════════════════════════
 const sandboxStatus = ['pending', 'processing', 'completed', 'failed'];
 const safeRef = (prefix) => `${prefix}-${Date.now()}-${Math.floor(Math.random() * 9999)}`;
 const toNum = (v) => Number(v || 0);
@@ -2036,20 +2036,20 @@ app.get('/api/servicios/orders', auth, async (req, res) => {
   res.json(data || []);
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // SUPERMERCADOS
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 const SUPERMERCADOS = [
   { id: '1', name: 'Supermarket Malabo', city: 'Malabo', address: 'Calle de la Independencia', phone: '+240 222 001', open: true },
   { id: '2', name: 'Tienda Bata Centro', city: 'Bata', address: 'Av. Hassan II', phone: '+240 333 001', open: true },
   { id: '3', name: 'Mercado Mongomo', city: 'Mongomo', address: 'Plaza Central', phone: '+240 444 001', open: false },
 ];
 const PRODUCTOS = [
-  { id: '1', name: 'Arroz 5kg', price: 3500, category: 'AlimentaciÃƒÂ³n', stock: 50 },
-  { id: '2', name: 'Aceite 1L', price: 1200, category: 'AlimentaciÃƒÂ³n', stock: 30 },
+  { id: '1', name: 'Arroz 5kg', price: 3500, category: 'AlimentaciÁƒÂ³n', stock: 50 },
+  { id: '2', name: 'Aceite 1L', price: 1200, category: 'AlimentaciÁƒÂ³n', stock: 30 },
   { id: '3', name: 'Agua 6x1.5L', price: 2000, category: 'Bebidas', stock: 100 },
-  { id: '4', name: 'Leche 1L', price: 800, category: 'LÃƒÂ¡cteos', stock: 20 },
-  { id: '5', name: 'Pan de molde', price: 600, category: 'PanaderÃƒÂ­a', stock: 15 },
+  { id: '4', name: 'Leche 1L', price: 800, category: 'LÁƒÂ¡cteos', stock: 20 },
+  { id: '5', name: 'Pan de molde', price: 600, category: 'PanaderÁƒÂ­a', stock: 15 },
 ];
 
 app.get('/api/supermarkets', auth, async (req, res) => {
@@ -2106,13 +2106,13 @@ app.get('/api/supermarkets/orders/:id', auth, async (req, res) => {
   res.json(data);
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // SALUD
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 const HOSPITALES = [
-  { id: '1', name: 'Hospital General de Malabo', city: 'Malabo', phone: '+240 222 100', emergency: true, specialties: ['Urgencias', 'CirugÃƒÂ­a', 'PediatrÃƒÂ­a'] },
-  { id: '2', name: 'ClÃƒÂ­nica Santa Isabel', city: 'Malabo', phone: '+240 222 200', emergency: false, specialties: ['Medicina General', 'GinecologÃƒÂ­a'] },
-  { id: '3', name: 'Hospital Regional de Bata', city: 'Bata', phone: '+240 333 100', emergency: true, specialties: ['Urgencias', 'TraumatologÃƒÂ­a'] },
+  { id: '1', name: 'Hospital General de Malabo', city: 'Malabo', phone: '+240 222 100', emergency: true, specialties: ['Urgencias', 'CirugÁƒÂ­a', 'PediatrÁƒÂ­a'] },
+  { id: '2', name: 'ClÁƒÂ­nica Santa Isabel', city: 'Malabo', phone: '+240 222 200', emergency: false, specialties: ['Medicina General', 'GinecologÁƒÂ­a'] },
+  { id: '3', name: 'Hospital Regional de Bata', city: 'Bata', phone: '+240 333 100', emergency: true, specialties: ['Urgencias', 'TraumatologÁƒÂ­a'] },
 ];
 const FARMACIAS = [
   { id: '1', name: 'Farmacia Central Malabo', city: 'Malabo', phone: '+240 222 300', open24h: true },
@@ -2168,9 +2168,9 @@ app.post('/api/salud/medicamentos/pedido', auth, async (req, res) => {
   res.json({ orderId, status: 'confirmed', total, eta: '20-30 min', message: 'Pedido de medicamentos confirmado' });
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // TAXI
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 app.post('/api/taxi/request', auth, async (req, res) => {
   try {
     const { origin, dest, type } = req.body;
@@ -2207,7 +2207,7 @@ app.post('/api/taxi/request', auth, async (req, res) => {
         driver
       };
       
-      // Intentar insert con columnas especÃ­ficas
+      // Intentar insert con columnas específicas
       const { data } = await supabase.from('taxi_rides').insert(insertData).select().maybeSingle();
       ride = data;
     } catch (insertError) {
@@ -2459,9 +2459,9 @@ app.post('/taxi/:rideId/rate', auth, async (req, res) => {
   return app._router.handle(req, res, () => {});
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
-// SEGUROS - COTIZACIONES, PÃƒâ€œLIZAS, RECLAMACIONES
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
+// SEGUROS - COTIZACIONES, PÁƒâ€œLIZAS, RECLAMACIONES
+// ════════════════════════════════════════════════════════════════════
 
 // Obtener tipos de seguros disponibles
 app.get('/api/insurance/types', auth, async (req, res) => {
@@ -2470,23 +2470,23 @@ app.get('/api/insurance/types', auth, async (req, res) => {
       {
         id: 'salud',
         name: 'Seguro de Salud',
-        icon: 'Ã°Å¸ÂÂ¥',
-        description: 'Cobertura mÃƒÂ©dica completa',
-        coverage: ['consultas', 'urgencias', 'hospitalizaciÃƒÂ³n', 'medicamentos'],
+        icon: 'ðÅ¸ÂÂ¥',
+        description: 'Cobertura mÁƒÂ©dica completa',
+        coverage: ['consultas', 'urgencias', 'hospitalizaciÁƒÂ³n', 'medicamentos'],
         starting_price: 5000
       },
       {
         id: 'vehiculo',
-        name: 'Seguro de VehÃƒÂ­culo',
-        icon: 'Ã°Å¸Å¡â€”',
-        description: 'ProtecciÃƒÂ³n para tu vehÃƒÂ­culo',
-        coverage: ['colisiÃƒÂ³n', 'robo', 'daÃƒÂ±os', 'responsabilidad civil'],
+        name: 'Seguro de VehÁƒÂ­culo',
+        icon: 'ðÅ¸Å¡â€”',
+        description: 'ProtecciÁƒÂ³n para tu vehÁƒÂ­culo',
+        coverage: ['colisiÁƒÂ³n', 'robo', 'daÁƒÂ±os', 'responsabilidad civil'],
         starting_price: 8000
       },
       {
         id: 'vida',
         name: 'Seguro de Vida',
-        icon: 'Ã°Å¸â€ºÂ¡Ã¯Â¸Â',
+        icon: 'ðÅ¸â€ºÂ¡Á¯Â¸Â',
         description: 'Seguridad para tu familia',
         coverage: ['fallecimiento', 'invalidez', 'enfermedades graves'],
         starting_price: 3000
@@ -2494,9 +2494,9 @@ app.get('/api/insurance/types', auth, async (req, res) => {
       {
         id: 'hogar',
         name: 'Seguro de Hogar',
-        icon: 'Ã°Å¸ÂÂ ',
-        description: 'ProtecciÃƒÂ³n para tu vivienda',
-        coverage: ['incendio', 'robo', 'daÃƒÂ±os estructurales', 'responsabilidad civil'],
+        icon: 'ðÅ¸ÂÂ ',
+        description: 'ProtecciÁƒÂ³n para tu vivienda',
+        coverage: ['incendio', 'robo', 'daÁƒÂ±os estructurales', 'responsabilidad civil'],
         starting_price: 4000
       }
     ];
@@ -2508,13 +2508,13 @@ app.get('/api/insurance/types', auth, async (req, res) => {
   }
 });
 
-// Obtener cotizaciÃƒÂ³n de seguro
+// Obtener cotizaciÁƒÂ³n de seguro
 app.post('/api/insurance/quote', auth, async (req, res) => {
   try {
     const { insurance_type, coverage_amount, duration_months } = req.body;
 
     if (!insurance_type || !coverage_amount || !duration_months) {
-      return res.status(400).json({ message: 'Datos incompletos para cotizaciÃƒÂ³n' });
+      return res.status(400).json({ message: 'Datos incompletos para cotizaciÁƒÂ³n' });
     }
 
     // Calcular prima mensual (ejemplo simple)
@@ -2574,7 +2574,7 @@ app.post('/api/insurance/contract', auth, async (req, res) => {
       return res.status(400).json({ message: 'Saldo insuficiente para contratar seguro' });
     }
 
-    // Crear pÃƒÂ³liza
+    // Crear pÁƒÂ³liza
     const { data: policy } = await supabase
       .from('insurance_policies')
       .insert({
@@ -2598,7 +2598,7 @@ app.post('/api/insurance/contract', auth, async (req, res) => {
       .update({ balance: newBalance })
       .eq('user_id', req.user.id);
 
-    // Registrar transacciÃƒÂ³n
+    // Registrar transacciÁƒÂ³n
     await supabase
       .from('transactions')
       .insert({
@@ -2626,7 +2626,7 @@ app.post('/api/insurance/contract', auth, async (req, res) => {
   }
 });
 
-// Obtener pÃƒÂ³lizas del usuario
+// Obtener pÁƒÂ³lizas del usuario
 app.get('/api/insurance/policies', auth, async (req, res) => {
   try {
     const { data: policies } = await supabase
@@ -2642,16 +2642,16 @@ app.get('/api/insurance/policies', auth, async (req, res) => {
   }
 });
 
-// Presentar reclamaciÃƒÂ³n
+// Presentar reclamaciÁƒÂ³n
 app.post('/api/insurance/claim', auth, async (req, res) => {
   try {
     const { policy_id, claim_type, description, amount } = req.body;
 
     if (!policy_id || !claim_type || !description) {
-      return res.status(400).json({ message: 'Datos incompletos para reclamaciÃƒÂ³n' });
+      return res.status(400).json({ message: 'Datos incompletos para reclamaciÁƒÂ³n' });
     }
 
-    // Verificar que la pÃƒÂ³liza pertenece al usuario
+    // Verificar que la pÁƒÂ³liza pertenece al usuario
     const { data: policy } = await supabase
       .from('insurance_policies')
       .select('id, user_id, status')
@@ -2659,14 +2659,14 @@ app.post('/api/insurance/claim', auth, async (req, res) => {
       .single();
 
     if (!policy || policy.user_id !== req.user.id) {
-      return res.status(404).json({ message: 'PÃƒÂ³liza no encontrada' });
+      return res.status(404).json({ message: 'PÁƒÂ³liza no encontrada' });
     }
 
     if (policy.status !== 'active') {
-      return res.status(400).json({ message: 'La pÃƒÂ³liza no estÃƒÂ¡ activa' });
+      return res.status(400).json({ message: 'La pÁƒÂ³liza no estÁƒÂ¡ activa' });
     }
 
-    // Crear reclamaciÃƒÂ³n
+    // Crear reclamaciÁƒÂ³n
     const { data: claim } = await supabase
       .from('insurance_claims')
       .insert({
@@ -2682,7 +2682,7 @@ app.post('/api/insurance/claim', auth, async (req, res) => {
       .single();
 
     res.json({
-      message: 'ReclamaciÃƒÂ³n presentada exitosamente',
+      message: 'ReclamaciÁƒÂ³n presentada exitosamente',
       claim
     });
   } catch (e) {
@@ -2710,48 +2710,48 @@ app.get('/api/insurance/claims', auth, async (req, res) => {
   }
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
-// NOTICIAS - CATEGORÃƒÂAS, FEEDS, BÃƒÅ¡SQUEDA, PERSONALIZACIÃƒâ€œN
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
+// NOTICIAS - CATEGORÁƒÂAS, FEEDS, BÁƒÅ¡SQUEDA, PERSONALIZACIÁƒâ€œN
+// ════════════════════════════════════════════════════════════════════
 
-// Obtener categorÃƒÂ­as de noticias
+// Obtener categorÁƒÂ­as de noticias
 app.get('/api/news/categories', auth, async (req, res) => {
   try {
     const categories = [
       {
         id: 'nacional',
         name: 'Nacional',
-        icon: 'Ã°Å¸â€¡Â¬Ã°Å¸â€¡Â¶',
+        icon: 'ðÅ¸â€¡Â¬ðÅ¸â€¡Â¶',
         description: 'Noticias de Guinea Ecuatorial'
       },
       {
         id: 'internacional',
         name: 'Internacional',
-        icon: 'Ã°Å¸Å’Â',
+        icon: 'ðÅ¸Å’Â',
         description: 'Noticias del mundo'
       },
       {
         id: 'deportes',
         name: 'Deportes',
-        icon: 'Ã¢Å¡Â½',
-        description: 'FÃƒÂºtbol y otros deportes'
+        icon: 'âÅ¡Â½',
+        description: 'FÁƒÂºtbol y otros deportes'
       },
       {
         id: 'economia',
-        name: 'EconomÃƒÂ­a',
-        icon: 'Ã°Å¸â€™Â°',
+        name: 'EconomÁƒÂ­a',
+        icon: 'ðÅ¸â€™Â°',
         description: 'Finanzas y negocios'
       },
       {
         id: 'tecnologia',
-        name: 'TecnologÃƒÂ­a',
-        icon: 'Ã°Å¸â€™Â»',
-        description: 'TecnologÃƒÂ­a y ciencia'
+        name: 'TecnologÁƒÂ­a',
+        icon: 'ðÅ¸â€™Â»',
+        description: 'TecnologÁƒÂ­a y ciencia'
       },
       {
         id: 'cultura',
         name: 'Cultura',
-        icon: 'Ã°Å¸Å½Â­',
+        icon: 'ðÅ¸Å½Â­',
         description: 'Arte y entretenimiento'
       }
     ];
@@ -2763,18 +2763,18 @@ app.get('/api/news/categories', auth, async (req, res) => {
   }
 });
 
-// Obtener noticias por categorÃƒÂ­a
+// Obtener noticias por categorÁƒÂ­a
 app.get('/api/news', auth, async (req, res) => {
   try {
     const { category, page = 1, limit = 20 } = req.query;
 
-    // Noticias simuladas (en producciÃƒÂ³n vendrÃƒÂ­an de una API real)
+    // Noticias simuladas (en producciÁƒÂ³n vendrÁƒÂ­an de una API real)
     const allNews = [
       {
         id: '1',
-        title: 'EGCHAT lanza nueva funcionalidad de mensajerÃ­a instantÃ¡nea',
+        title: 'EGCHAT lanza nueva funcionalidad de mensajería instantánea',
         category: 'tecnologia',
-        summary: 'La aplicaciÃƒÂ³n EGCHAT anuncia importantes mejoras...',
+        summary: 'La aplicaciÁƒÂ³n EGCHAT anuncia importantes mejoras...',
         content: '...',
         image_url: 'https://example.com/egchat-news.jpg',
         published_at: new Date().toISOString(),
@@ -2782,7 +2782,7 @@ app.get('/api/news', auth, async (req, res) => {
       },
       {
         id: '2',
-        title: 'EconomÃƒÂ­a de Guinea Ecuatorial muestra crecimiento',
+        title: 'EconomÁƒÂ­a de Guinea Ecuatorial muestra crecimiento',
         category: 'economia',
         summary: 'El Banco Central de Guinea Ecuatorial reporta...',
         content: '...',
@@ -2818,16 +2818,16 @@ app.get('/api/news/search', auth, async (req, res) => {
     const { q, category } = req.query;
 
     if (!q || q.length < 2) {
-      return res.status(400).json({ message: 'La bÃƒÂºsqueda debe tener al menos 2 caracteres' });
+      return res.status(400).json({ message: 'La bÁƒÂºsqueda debe tener al menos 2 caracteres' });
     }
 
-    // Noticias simuladas para bÃƒÂºsqueda
+    // Noticias simuladas para bÁƒÂºsqueda
     const searchResults = [
       {
         id: 'search1',
         title: `Resultados para "${q}" en EGCHAT`,
         category: category || 'todos',
-        summary: `Se encontraron artÃƒÂ­culos relacionados con ${q}...`,
+        summary: `Se encontraron artÁƒÂ­culos relacionados con ${q}...`,
         published_at: new Date().toISOString(),
         source: 'SearchEG'
       }
@@ -2887,9 +2887,9 @@ app.get('/api/news/favorites', auth, async (req, res) => {
   }
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // SEGUROS
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 
 const ASEGURADORAS = [
   { id: '1', name: 'COGE Seguros', products: ['Vida', 'Salud', 'Auto', 'Hogar'] },
@@ -2943,16 +2943,16 @@ app.post('/seguros/solicitudes/:solicitudId/documentos', auth, async (req, res) 
   res.status(201).json({ solicitudId, tipo: tipo || 'documento', status: 'uploaded', message: 'Documento recibido' });
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // NOTICIAS
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 const NOTICIAS = [
-  { id: '1', title: 'Presidente anuncia nuevas medidas econÃƒÂ³micas para 2026', source: 'Presidencia GE', category: 'PolÃƒÂ­tica', time: '14:30', isLive: true },
+  { id: '1', title: 'Presidente anuncia nuevas medidas econÁƒÂ³micas para 2026', source: 'Presidencia GE', category: 'PolÁƒÂ­tica', time: '14:30', isLive: true },
   { id: '2', title: 'CEMAC aprueba nuevo marco financiero regional', source: 'Noticias CEMAC', category: 'Finanzas', time: '13:45' },
-  { id: '3', title: 'Ministerio de Salud reporta avances en vacunaciÃƒÂ³n', source: 'Ministerio de InformaciÃƒÂ³n', category: 'Salud', time: '12:20' },
-  { id: '4', title: 'Nueva tecnologÃƒÂ­a 5G llega a Malabo', source: 'TVGE', category: 'TecnologÃƒÂ­a', time: '11:15' },
-  { id: '5', title: 'SelecciÃƒÂ³n nacional se prepara para eliminatorias', source: 'Radio Nacional', category: 'Deportes', time: '10:30' },
-  { id: '6', title: 'BEAC anuncia nuevas polÃƒÂ­ticas monetarias', source: 'BEAC', category: 'Finanzas', time: '09:00' },
+  { id: '3', title: 'Ministerio de Salud reporta avances en vacunaciÁƒÂ³n', source: 'Ministerio de InformaciÁƒÂ³n', category: 'Salud', time: '12:20' },
+  { id: '4', title: 'Nueva tecnologÁƒÂ­a 5G llega a Malabo', source: 'TVGE', category: 'TecnologÁƒÂ­a', time: '11:15' },
+  { id: '5', title: 'SelecciÁƒÂ³n nacional se prepara para eliminatorias', source: 'Radio Nacional', category: 'Deportes', time: '10:30' },
+  { id: '6', title: 'BEAC anuncia nuevas polÁƒÂ­ticas monetarias', source: 'BEAC', category: 'Finanzas', time: '09:00' },
 ];
 
 app.get('/api/noticias', auth, async (req, res) => {
@@ -2974,39 +2974,39 @@ app.post('/api/user/avatar', auth, async (req, res) => {
 });
 
 app.post('/lia/analyze', auth, async (_req, res) => {
-  res.json({ analysis: 'AnÃ¡lisis completado.' });
+  res.json({ analysis: 'Análisis completado.' });
 });
 
 app.post('/api/lia/analyze', auth, async (_req, res) => {
-  res.json({ analysis: 'AnÃ¡lisis completado.' });
+  res.json({ analysis: 'Análisis completado.' });
 });
 
 app.post('/lia/transcribe', auth, async (_req, res) => {
-  res.json({ text: 'TranscripciÃ³n completada.' });
+  res.json({ text: 'Transcripción completada.' });
 });
 
 app.post('/api/lia/transcribe', auth, async (_req, res) => {
-  res.json({ text: 'TranscripciÃ³n completada.' });
+  res.json({ text: 'Transcripción completada.' });
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // GRUPOS DE CHAT
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
-// AÃƒÂ±adir participante a grupo
+// ════════════════════════════════════════════════════════════════════
+// AÁƒÂ±adir participante a grupo
 app.post('/api/chats/:chatId/participants', auth, async (req, res) => {
   try {
     const { user_id } = req.body;
     await supabase.from('chat_participants').upsert({ chat_id: req.params.chatId, user_id });
-    res.json({ message: 'Participante aÃƒÂ±adido' });
+    res.json({ message: 'Participante aÁƒÂ±adido' });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // NOTIFICACIONES
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 app.get('/api/notifications', auth, async (req, res) => {
   try {
-    // Mensajes no leÃƒÂ­dos como notificaciones
+    // Mensajes no leÁƒÂ­dos como notificaciones
     const { data: parts } = await supabase.from('chat_participants').select('chat_id').eq('user_id', req.user.id);
     const chatIds = (parts || []).map(p => p.chat_id);
     if (!chatIds.length) return res.json([]);
@@ -3023,20 +3023,20 @@ app.get('/api/notifications', auth, async (req, res) => {
   } catch (e) { res.json([]); }
 });
 
-// Marcar mensajes como leÃƒÂ­dos
+// Marcar mensajes como leÁƒÂ­dos
 app.post('/api/chats/:chatId/read', auth, async (req, res) => {
   try {
     await supabase.from('messages')
       .update({ status: 'read' })
       .eq('chat_id', req.params.chatId)
       .neq('sender_id', req.user.id);
-    res.json({ message: 'Mensajes marcados como leÃƒÂ­dos' });
+    res.json({ message: 'Mensajes marcados como leÁƒÂ­dos' });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // CONTACTOS CON FOTO Y PERFIL
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // Perfil público de un usuario
 app.get('/api/users/:userId', auth, async (req, res) => {
   try {
@@ -3046,9 +3046,9 @@ app.get('/api/users/:userId', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 // START
-// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// ════════════════════════════════════════════════════════════════════
 const updateUserVersions = async () => {
   const isPlaceholderSupabase =
     !process.env.SUPABASE_URL ||
