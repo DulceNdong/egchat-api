@@ -3178,6 +3178,46 @@ const sendPushToUser = async (userId, payload) => {
 // PUSH DIAGNOSTICS
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Admin: verificar suscripciones por teléfono
+app.get('/api/push/check/:phone', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.query.key;
+  if (!key || key !== (process.env.ADMIN_RESET_KEY || JWT_SECRET)) {
+    return res.status(403).json({ message: 'No autorizado' });
+  }
+  try {
+    const phone = decodeURIComponent(req.params.phone);
+    const { data: user } = await supabase.from('users').select('id, full_name, phone').eq('phone', phone).single();
+    if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
+    const { data: subs } = await supabase.from('push_subscriptions').select('id, endpoint, updated_at').eq('user_id', user.id);
+    res.json({ user: { id: user.id, name: user.full_name, phone: user.phone }, subscriptions: (subs || []).length, details: (subs || []).map(s => ({ id: s.id, endpoint: s.endpoint.slice(0, 80) + '...', updated_at: s.updated_at })) });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Admin: enviar push de prueba por teléfono
+app.post('/api/push/send-test/:phone', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.query.key;
+  if (!key || key !== (process.env.ADMIN_RESET_KEY || JWT_SECRET)) {
+    return res.status(403).json({ message: 'No autorizado' });
+  }
+  try {
+    const phone = decodeURIComponent(req.params.phone);
+    const { data: user } = await supabase.from('users').select('id, full_name').eq('phone', phone).single();
+    if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
+    const result = await sendPushToUser(user.id, {
+      title: '🔔 EGChat — Prueba',
+      body: `Hola ${user.full_name}, las notificaciones funcionan!`,
+      icon: '/favicon.svg',
+      tag: 'test-push-' + Date.now(),
+      url: '/',
+    });
+    res.json({ message: 'Push enviado', userId: user.id, result });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // Ver cuántas suscripciones tiene el usuario actual
 app.get('/api/push/my-subscriptions', auth, async (req, res) => {
   try {
