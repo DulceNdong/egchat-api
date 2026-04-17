@@ -3175,6 +3175,40 @@ const sendPushToUser = async (userId, payload) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PUSH DIAGNOSTICS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Ver cuántas suscripciones tiene el usuario actual
+app.get('/api/push/my-subscriptions', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('push_subscriptions')
+      .select('id, endpoint, created_at, updated_at')
+      .eq('user_id', req.user.id);
+    if (error) return res.status(500).json({ message: error.message });
+    res.json({ count: (data || []).length, subscriptions: (data || []).map(s => ({ id: s.id, endpoint: s.endpoint.slice(0, 60) + '...', updated_at: s.updated_at })) });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Enviar push de prueba al usuario actual
+app.post('/api/push/test', auth, async (req, res) => {
+  try {
+    const result = await sendPushToUser(req.user.id, {
+      title: '🔔 EGChat — Prueba',
+      body: 'Las notificaciones funcionan correctamente',
+      icon: '/favicon.svg',
+      tag: 'test-push',
+      url: '/',
+    });
+    res.json({ message: 'Push enviado', result });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 if (require.main === module) {
   app.listen(PORT, () => {
