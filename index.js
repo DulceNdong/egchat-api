@@ -329,8 +329,10 @@ app.post('/api/auth/login', async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ message: 'Credenciales incorrectas' });
 
-    // Actualizar Ãºltimo acceso
-    await supabase.from('users').update({ last_login: new Date().toISOString() }).eq('id', user.id);
+    // Actualizar último acceso (ignorar si la columna no existe)
+    try {
+      await supabase.from('users').update({ last_login: new Date().toISOString() }).eq('id', user.id);
+    } catch {}
 
     const token = jwt.sign({ id: user.id, phone }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ token, user: { id: user.id, phone: user.phone, full_name: user.full_name, avatar_url: user.avatar_url, app_version: user.app_version || APP_VERSION } });
@@ -915,31 +917,55 @@ app.post('/api/contacts', auth, async (req, res) => {
     }
 
     // Agregar contacto
-    const { data: contact, error } = await supabase
-      .from('contacts')
-      .insert({
-        user_id: req.user.id,
-        user_id_min: req.user.id < targetId ? req.user.id : targetId,
-        user_id_max: req.user.id < targetId ? targetId : req.user.id,
-        contact_user_id: targetId,
-        nickname: nickname || targetUser.full_name
-      })
-      .select('*')
-      .single();
+    const insertData = {
+      user_id: req.user.id,
+      contact_user_id: targetId,
+      nickname: nickname || targetUser.full_name
+    };
+    // Añadir columnas opcionales solo si existen (evitar error si no están en el schema)
+    try {
+      const { data: contact, error } = await supabase
+        .from('contacts')
+        .insert(insertData)
+        .select('*')
+        .single();
 
-    if (error) throw error;
+      if (error) throw error;
 
-    res.json({
-      id: contact.id,
-      contact_user_id: contact.contact_user_id,
-      name: contact.nickname || targetUser.full_name,
-      phone: targetUser.phone,
-      avatar_url: targetUser.avatar_url || '',
-      is_blocked: contact.is_blocked,
-      is_favorite: contact.is_favorite,
-      created_at: contact.created_at,
-      user: targetUser
-    });
+      res.json({
+        id: contact.id,
+        contact_user_id: contact.contact_user_id,
+        name: contact.nickname || targetUser.full_name,
+        phone: targetUser.phone,
+        avatar_url: targetUser.avatar_url || '',
+        is_blocked: contact.is_blocked,
+        is_favorite: contact.is_favorite,
+        created_at: contact.created_at,
+        user: targetUser
+      });
+    } catch (insertErr) {
+      // Si falla por columnas extra, intentar sin ellas
+      if (insertErr.message?.includes('user_id_min') || insertErr.message?.includes('user_id_max')) {
+        const { data: contact, error } = await supabase
+          .from('contacts')
+          .insert({ user_id: req.user.id, contact_user_id: targetId, nickname: nickname || targetUser.full_name })
+          .select('*')
+          .single();
+        if (error) throw error;
+        return res.json({
+          id: contact.id,
+          contact_user_id: contact.contact_user_id,
+          name: contact.nickname || targetUser.full_name,
+          phone: targetUser.phone,
+          avatar_url: targetUser.avatar_url || '',
+          is_blocked: contact.is_blocked,
+          is_favorite: contact.is_favorite,
+          created_at: contact.created_at,
+          user: targetUser
+        });
+      }
+      throw insertErr;
+    }
   } catch (e) {
     console.error('Add contact error:', e);
     res.status(500).json({ message: e.message });
@@ -1104,7 +1130,7 @@ app.get('/api/contacts/search', auth, async (req, res) => {
     // Buscar usuarios por telÃ©fono o nombre
     const { data: users, error } = await supabase
       .from('users')
-      .select('id, phone, full_name, avatar_url, last_seen')
+      .select('id, phone, full_name, avatar_url')
       .or(`phone.ilike.%${q}%,full_name.ilike.%${q}%`)
       .neq('id', req.user.id)
       .limit(20);
@@ -1849,7 +1875,7 @@ app.post('/api/lia/chat', auth, async (req, res) => {
 // Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 app.get('/api/user/profile', auth, async (req, res) => {
   const { data: user } = await supabase
-    .from('users').select('id, phone, full_name, created_at, last_login').eq('id', req.user.id).single();
+    .from('users').select('id, phone, full_name, created_at, avatar_url').eq('id', req.user.id).single();
   if (!user) return res.status(404).json({ message: 'No encontrado' });
   res.json({ ...user, app_version: APP_VERSION });
 });
