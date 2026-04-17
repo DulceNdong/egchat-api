@@ -920,9 +920,10 @@ app.post('/api/contacts', auth, async (req, res) => {
     const insertData = {
       user_id: req.user.id,
       contact_user_id: targetId,
-      nickname: nickname || targetUser.full_name
+      nickname: nickname || targetUser.full_name,
+      user_id_min: req.user.id < targetId ? req.user.id : targetId,
+      user_id_max: req.user.id < targetId ? targetId : req.user.id,
     };
-    // Añadir columnas opcionales solo si existen (evitar error si no están en el schema)
     try {
       const { data: contact, error } = await supabase
         .from('contacts')
@@ -944,7 +945,7 @@ app.post('/api/contacts', auth, async (req, res) => {
         user: targetUser
       });
     } catch (insertErr) {
-      // Si falla por columnas extra, intentar sin ellas
+      // Si falla por columnas extra no existentes, intentar sin user_id_min/max
       if (insertErr.message?.includes('user_id_min') || insertErr.message?.includes('user_id_max')) {
         const { data: contact, error } = await supabase
           .from('contacts')
