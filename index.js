@@ -499,6 +499,22 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
       const targetUsers = (parts || []).map((p) => p.user_id);
       emitToUsers(targetUsers, { type: 'new_message', chatId, message });
       emitToUsers(targetUsers, { type: 'chat_updated', chatId, ts: Date.now() });
+
+      // Enviar Web Push a usuarios que no son el remitente
+      const otherUsers = targetUsers.filter(uid => String(uid) !== String(req.user.id));
+      // Obtener nombre del remitente
+      const { data: sender } = await supabase
+        .from('users').select('full_name').eq('id', req.user.id).single();
+      const senderName = sender?.full_name || 'Alguien';
+      const pushPayload = {
+        title: senderName,
+        body: message.type === 'text' ? (message.text || 'Nuevo mensaje') : '📎 Archivo adjunto',
+        icon: '/favicon.svg',
+        tag: `chat-${chatId}`,
+        url: '/',
+        chatId,
+      };
+      await Promise.allSettled(otherUsers.map(uid => sendPushToUser(uid, pushPayload)));
     } catch {}
 
     res.status(201).json(message);
@@ -3067,6 +3083,97 @@ app.get('/api/call/incoming/:userId', auth, (req, res) => {
   }
   res.json(incoming);
 });
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WEB PUSH — VAPID
+// ─────────────────────────────────────────────────────────────────────────────
+const webpush = require('web-push');
+
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || 'BNeDJFYqIX59vgqEKxWfrI263knyPGHafMEK_WrMPeYaIm8bn62vcOah7hDlgIek4R4utB82g-cT9CwAtGn0wUs';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || 'Ur3h0gh5W6F_dzQNhkXCwtkEV1sMGpo568ZB1Bglpt8';
+
+webpush.setVapidDetails(
+  'mailto:admin@egchat.app',
+  VAPID_PUBLIC_KEY,
+  VAPID_PRIVATE_KEY
+);
+
+// Guardar suscripción push del usuario
+app.post('/api/push/subscribe', auth, async (req, res) => {
+  try {
+    const { subscription } = req.body;
+    if (!subscription || !subscription.endpoint) {
+      return res.status(400).json({ message: 'Suscripción inválida' });
+    }
+    // Guardar en Supabase (tabla push_subscriptions)
+    await supabase.from('push_subscriptions').upsert({
+      user_id: req.user.id,
+      endpoint: subscription.endpoint,
+      p256dh: subscription.keys?.p256dh || '',
+      auth: subscription.keys?.auth || '',
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'user_id,endpoint' });
+
+    res.json({ message: 'Suscripción guardada' });
+  } catch (e) {
+    console.error('Push subscribe error:', e.message);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Eliminar suscripción push
+app.post('/api/push/unsubscribe', auth, async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    await supabase.from('push_subscriptions')
+      .delete()
+      .eq('user_id', req.user.id)
+      .eq('endpoint', endpoint || '');
+    res.json({ message: 'Suscripción eliminada' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Obtener clave pública VAPID
+app.get('/api/push/vapid-public-key', (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+// Función interna para enviar push a un usuario
+const sendPushToUser = async (userId, payload) => {
+  try {
+    const { data: subs } = await supabase
+      .from('push_subscriptions')
+      .select('endpoint, p256dh, auth')
+      .eq('user_id', userId);
+
+    if (!subs || subs.length === 0) return;
+
+    const payloadStr = JSON.stringify(payload);
+    const results = await Promise.allSettled(
+      subs.map(sub =>
+        webpush.sendNotification(
+          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+          payloadStr
+        ).catch(async err => {
+          // Si el endpoint ya no es válido (410 Gone), eliminarlo
+          if (err.statusCode === 410 || err.statusCode === 404) {
+            await supabase.from('push_subscriptions')
+              .delete()
+              .eq('endpoint', sub.endpoint);
+          }
+          throw err;
+        })
+      )
+    );
+    return results;
+  } catch (e) {
+    console.error('sendPushToUser error:', e.message);
+  }
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 if (require.main === module) {
