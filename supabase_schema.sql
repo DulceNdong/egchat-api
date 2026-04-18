@@ -77,3 +77,18 @@ INSERT INTO recharge_codes (code, amount, expires_at) VALUES
   ('ABCD-EFGH-IJKL-MNOP', 10000, NOW() + INTERVAL '1 year'),
   ('TEST-CODE-2026-EGCH', 25000, NOW() + INTERVAL '1 year')
 ON CONFLICT (code) DO NOTHING;
+
+-- Tabla de estados/stories
+CREATE TABLE IF NOT EXISTS stories (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+  media JSONB NOT NULL,
+  type TEXT DEFAULT 'text',
+  views INTEGER DEFAULT 0,
+  reactions JSONB DEFAULT '[]',
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_stories_user_id ON stories(user_id);
+CREATE INDEX IF NOT EXISTS idx_stories_expires_at ON stories(expires_at);
