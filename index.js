@@ -3047,6 +3047,65 @@ app.get('/api/users/:userId', auth, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
+// STORIES / ESTADOS
+// ════════════════════════════════════════════════════════════════════
+
+app.get('/api/stories', auth, async (req, res) => {
+  try {
+    const { data: mine } = await supabase.from('stories').select('*').eq('user_id', req.user.id).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false });
+    const { data: contacts } = await supabase.from('contacts').select('contact_user_id').eq('user_id', req.user.id).eq('is_blocked', false);
+    const contactIds = (contacts || []).map(c => c.contact_user_id);
+    let contactStories = [];
+    if (contactIds.length > 0) {
+      const { data } = await supabase.from('stories').select('*, users(id, full_name, avatar_url)').in('user_id', contactIds).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false });
+      contactStories = data || [];
+    }
+    res.json({ mine: mine || [], contacts: contactStories });
+  } catch (e) { res.json({ mine: [], contacts: [] }); }
+});
+
+app.post('/api/stories', auth, async (req, res) => {
+  try {
+    const { media, type = 'text' } = req.body;
+    if (!media) return res.status(400).json({ message: 'media requerido' });
+    const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+    const { data: story, error } = await supabase.from('stories').insert({ user_id: req.user.id, media: JSON.stringify(media), type, views: 0, expires_at: expiresAt, created_at: new Date().toISOString() }).select().single();
+    if (error) throw error;
+    res.status(201).json(story);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.delete('/api/stories/:storyId', auth, async (req, res) => {
+  try {
+    const { error } = await supabase.from('stories').delete().eq('id', req.params.storyId).eq('user_id', req.user.id);
+    if (error) throw error;
+    res.json({ message: 'Story eliminada' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.post('/api/stories/:storyId/view', auth, async (req, res) => {
+  try {
+    const { data: s } = await supabase.from('stories').select('views').eq('id', req.params.storyId).single();
+    if (s) await supabase.from('stories').update({ views: (s.views || 0) + 1 }).eq('id', req.params.storyId);
+    res.json({ ok: true });
+  } catch (e) { res.json({ ok: false }); }
+});
+
+app.post('/api/stories/:storyId/react', auth, async (req, res) => {
+  try {
+    const { emoji } = req.body;
+    if (!emoji) return res.status(400).json({ message: 'emoji requerido' });
+    const { data: story } = await supabase.from('stories').select('reactions').eq('id', req.params.storyId).single();
+    if (!story) return res.status(404).json({ message: 'Story no encontrada' });
+    const reactions = story.reactions || [];
+    const existing = reactions.find(r => r.emoji === emoji);
+    const updated = existing ? reactions.map(r => r.emoji === emoji ? { ...r, count: r.count + 1 } : r) : [...reactions, { emoji, count: 1 }];
+    await supabase.from('stories').update({ reactions: updated }).eq('id', req.params.storyId);
+    res.json({ reactions: updated });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════════
 // START
 // ════════════════════════════════════════════════════════════════════
 const updateUserVersions = async () => {
