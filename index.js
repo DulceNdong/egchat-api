@@ -3050,6 +3050,30 @@ app.get('/api/users/:userId', auth, async (req, res) => {
 // STORIES / ESTADOS
 // ════════════════════════════════════════════════════════════════════
 
+// Auto-crear tabla stories si no existe al primer uso
+const ensureStoriesTable = async () => {
+  try {
+    const { error } = await supabase.from('stories').select('id').limit(1);
+    if (error && error.message && error.message.includes('does not exist')) {
+      await supabase.rpc('exec_sql', {
+        sql: `CREATE TABLE IF NOT EXISTS stories (
+          id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+          user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+          media JSONB NOT NULL,
+          type TEXT DEFAULT 'text',
+          views INTEGER DEFAULT 0,
+          reactions JSONB DEFAULT '[]',
+          expires_at TIMESTAMPTZ NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_stories_user_id ON stories(user_id);
+        CREATE INDEX IF NOT EXISTS idx_stories_expires_at ON stories(expires_at);`
+      }).catch(() => {});
+    }
+  } catch {}
+};
+ensureStoriesTable();
+
 app.get('/api/stories', auth, async (req, res) => {
   try {
     const { data: mine } = await supabase.from('stories').select('*').eq('user_id', req.user.id).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false });
