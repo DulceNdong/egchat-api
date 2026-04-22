@@ -3207,7 +3207,14 @@ app.get('/api/call/:callId', auth, (req, res) => {
 
 // Terminar llamada
 app.delete('/api/call/:callId', auth, (req, res) => {
-  signalingStore.delete(req.params.callId);
+  const session = signalingStore.get(req.params.callId);
+  if (session) {
+    // Marcar como terminada en lugar de borrar, para que el otro lado lo detecte
+    session.ended = true;
+    session.endedAt = Date.now();
+    // Borrar después de 10 segundos para dar tiempo al otro lado de detectarlo
+    setTimeout(() => signalingStore.delete(req.params.callId), 10000);
+  }
   res.json({ ok: true });
 });
 
