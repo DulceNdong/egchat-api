@@ -3160,74 +3160,111 @@ const updateUserVersions = async () => {
   }
 };
 
-// ─── WebRTC Signaling (in-memory, TTL 60s) ────────────────────────────────────
-const signalingStore = new Map(); // key: callId, value: { offer, answer, callerCandidates[], calleeCandidates[], ts }
-
-const cleanSignaling = () => {
-  const now = Date.now();
-  for (const [k, v] of signalingStore) { if (now - v.ts > 120000) signalingStore.delete(k); }
-};
-setInterval(cleanSignaling, 30000);
+// ─── WebRTC Signaling — persistido en Supabase ───────────────────────────────
 
 // Iniciar llamada — caller envía offer
-app.post('/api/call/offer', auth, (req, res) => {
+app.post('/api/call/offer', auth, async (req, res) => {
   const { callId, offer, targetUserId, type } = req.body;
   if (!callId || !offer) return res.status(400).json({ error: 'callId y offer requeridos' });
-  signalingStore.set(callId, { offer, answer: null, callerCandidates: [], calleeCandidates: [], type: type||'audio', callerId: req.user.id, targetUserId, ts: Date.now() });
-  res.json({ ok: true });
+  try {
+    await supabase.from('call_sessions').upsert({
+      call_id: callId,
+      offer: JSON.stringify(offer),
+      answer: null,
+      caller_candidates: '[]',
+      callee_candidates: '[]',
+      type: type || 'audio',
+      caller_id: req.user.id,
+      target_user_id: targetUserId,
+      ended: false,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'call_id' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Error guardando sesión' });
+  }
 });
 
 // Callee responde con answer
-app.post('/api/call/answer', auth, (req, res) => {
+app.post('/api/call/answer', auth, async (req, res) => {
   const { callId, answer } = req.body;
-  const session = signalingStore.get(callId);
-  if (!session) return res.status(404).json({ error: 'Llamada no encontrada' });
-  session.answer = answer;
-  session.ts = Date.now();
+  const { data } = await supabase.from('call_sessions').select('call_id').eq('call_id', callId).eq('ended', false).single();
+  if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
+  await supabase.from('call_sessions').update({ answer: JSON.stringify(answer), updated_at: new Date().toISOString() }).eq('call_id', callId);
   res.json({ ok: true });
 });
 
 // Enviar ICE candidate
-app.post('/api/call/ice', auth, (req, res) => {
-  const { callId, candidate, role } = req.body; // role: 'caller' | 'callee'
-  const session = signalingStore.get(callId);
-  if (!session) return res.status(404).json({ error: 'Llamada no encontrada' });
-  if (role === 'caller') session.callerCandidates.push(candidate);
-  else session.calleeCandidates.push(candidate);
-  session.ts = Date.now();
+app.post('/api/call/ice', auth, async (req, res) => {
+  const { callId, candidate, role } = req.body;
+  const { data } = await supabase.from('call_sessions').select('caller_candidates, callee_candidates').eq('call_id', callId).single();
+  if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
+  if (role === 'caller') {
+    const arr = JSON.parse(data.caller_candidates || '[]');
+    arr.push(candidate);
+    await supabase.from('call_sessions').update({ caller_candidates: JSON.stringify(arr), updated_at: new Date().toISOString() }).eq('call_id', callId);
+  } else {
+    const arr = JSON.parse(data.callee_candidates || '[]');
+    arr.push(candidate);
+    await supabase.from('call_sessions').update({ callee_candidates: JSON.stringify(arr), updated_at: new Date().toISOString() }).eq('call_id', callId);
+  }
   res.json({ ok: true });
 });
 
 // Polling — obtener estado de la llamada
-app.get('/api/call/:callId', auth, (req, res) => {
-  const session = signalingStore.get(req.params.callId);
-  if (!session) return res.status(404).json({ error: 'Llamada no encontrada' });
-  res.json(session);
+app.get('/api/call/:callId', auth, async (req, res) => {
+  const { data } = await supabase.from('call_sessions').select('*').eq('call_id', req.params.callId).single();
+  if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
+  res.json({
+    offer: JSON.parse(data.offer || 'null'),
+    answer: data.answer ? JSON.parse(data.answer) : null,
+    callerCandidates: JSON.parse(data.caller_candidates || '[]'),
+    calleeCandidates: JSON.parse(data.callee_candidates || '[]'),
+    type: data.type,
+    callerId: data.caller_id,
+    targetUserId: data.target_user_id,
+    ended: data.ended,
+  });
 });
 
 // Terminar llamada
-app.delete('/api/call/:callId', auth, (req, res) => {
-  const session = signalingStore.get(req.params.callId);
-  if (session) {
-    // Marcar como terminada en lugar de borrar, para que el otro lado lo detecte
-    session.ended = true;
-    session.endedAt = Date.now();
-    // Borrar después de 10 segundos para dar tiempo al otro lado de detectarlo
-    setTimeout(() => signalingStore.delete(req.params.callId), 10000);
-  }
+app.delete('/api/call/:callId', auth, async (req, res) => {
+  await supabase.from('call_sessions').update({ ended: true, updated_at: new Date().toISOString() }).eq('call_id', req.params.callId);
+  // Borrar después de 15 segundos
+  setTimeout(async () => {
+    await supabase.from('call_sessions').delete().eq('call_id', req.params.callId);
+  }, 15000);
   res.json({ ok: true });
 });
 
 // Notificar llamada entrante (el callee hace polling de esto)
-app.get('/api/call/incoming/:userId', auth, (req, res) => {
-  const incoming = [];
-  for (const [callId, s] of signalingStore) {
-    if (s.targetUserId === req.params.userId && !s.answer) {
-      incoming.push({ callId, callerId: s.callerId, type: s.type, offer: s.offer });
-    }
-  }
-  res.json(incoming);
+app.get('/api/call/incoming/:userId', auth, async (req, res) => {
+  const { data } = await supabase
+    .from('call_sessions')
+    .select('*')
+    .eq('target_user_id', req.params.userId)
+    .eq('ended', false)
+    .is('answer', null)
+    .order('created_at', { ascending: false })
+    .limit(5);
+  if (!data || data.length === 0) return res.json([]);
+  // Limpiar sesiones muy antiguas (más de 60 segundos)
+  const now = Date.now();
+  const valid = data.filter(s => now - new Date(s.created_at).getTime() < 60000);
+  res.json(valid.map(s => ({
+    callId: s.call_id,
+    callerId: s.caller_id,
+    type: s.type,
+    offer: JSON.parse(s.offer || 'null'),
+  })));
 });
+
+// Limpiar sesiones antiguas cada 5 minutos
+setInterval(async () => {
+  const cutoff = new Date(Date.now() - 120000).toISOString();
+  await supabase.from('call_sessions').delete().lt('created_at', cutoff);
+}, 300000);
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
