@@ -3433,12 +3433,29 @@ app.post('/api/push/test', auth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 if (require.main === module) {
-  app.listen(PORT, () => {
+  app.listen(PORT, async () => {
     console.log(`\n😎 EGCHAT API + Supabase en http://localhost:${PORT}`);
     console.log(`   Supabase: ${process.env.SUPABASE_URL ? '✅ Conectado' : '❌ Sin configurar'}`);
     console.log(`   Auth:   POST /api/auth/register | /api/auth/login`);
     console.log(`   Wallet: GET  /api/wallet/balance | POST /api/wallet/deposit`);
     console.log(`   Lia-25: POST /api/lia/chat\n`);
+    // Crear tabla call_sessions si no existe
+    try {
+      await supabase.rpc('exec_sql', { sql: `
+        CREATE TABLE IF NOT EXISTS call_sessions (
+          call_id VARCHAR(100) PRIMARY KEY,
+          offer TEXT, answer TEXT,
+          caller_candidates TEXT DEFAULT '[]',
+          callee_candidates TEXT DEFAULT '[]',
+          type VARCHAR(10) DEFAULT 'audio',
+          caller_id TEXT NOT NULL,
+          target_user_id TEXT NOT NULL,
+          ended BOOLEAN DEFAULT FALSE,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+      `}).catch(() => {});
+    } catch {}
   });
   updateUserVersions();
 }
