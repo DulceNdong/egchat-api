@@ -92,3 +92,20 @@ CREATE TABLE IF NOT EXISTS stories (
 
 CREATE INDEX IF NOT EXISTS idx_stories_user_id ON stories(user_id);
 CREATE INDEX IF NOT EXISTS idx_stories_expires_at ON stories(expires_at);
+
+-- Tabla de sesiones de llamadas WebRTC
+CREATE TABLE IF NOT EXISTS call_sessions (
+  call_id VARCHAR(100) PRIMARY KEY,
+  offer TEXT,
+  answer TEXT,
+  caller_candidates TEXT DEFAULT '[]',
+  callee_candidates TEXT DEFAULT '[]',
+  type VARCHAR(10) DEFAULT 'audio',
+  caller_id TEXT NOT NULL,
+  target_user_id TEXT NOT NULL,
+  ended BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_call_sessions_target ON call_sessions(target_user_id, ended);
+CREATE INDEX IF NOT EXISTS idx_call_sessions_created ON call_sessions(created_at);
