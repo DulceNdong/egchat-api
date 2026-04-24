@@ -3162,7 +3162,7 @@ const updateUserVersions = async () => {
 
 // ─── WebRTC Signaling — persistido en Supabase ───────────────────────────────
 
-// Iniciar llamada — caller envía offer
+// Iniciar llamada — caller envía offer + push al destinatario
 app.post('/api/call/offer', auth, async (req, res) => {
   const { callId, offer, targetUserId, type } = req.body;
   if (!callId || !offer) return res.status(400).json({ error: 'callId y offer requeridos' });
@@ -3180,6 +3180,33 @@ app.post('/api/call/offer', auth, async (req, res) => {
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }, { onConflict: 'call_id' });
+
+    // Enviar push de llamada entrante al destinatario
+    if (targetUserId) {
+      try {
+        const { data: caller } = await supabase
+          .from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
+        const callerName = caller?.full_name || 'Alguien';
+        const isVideo = (type || 'audio') === 'video';
+        await sendPushToUser(targetUserId, {
+          title: isVideo ? `📹 Videollamada de ${callerName}` : `📞 Llamada de ${callerName}`,
+          body: isVideo ? 'Toca para responder la videollamada' : 'Toca para responder la llamada',
+          icon: caller?.avatar_url || '/favicon.svg',
+          badge: '/favicon.svg',
+          tag: `call-${callId}`,
+          requireInteraction: true,
+          url: '/',
+          callId,
+          callerId: req.user.id,
+          callerName,
+          callType: type || 'audio',
+          notificationType: 'incoming_call',
+        });
+      } catch (pushErr) {
+        console.warn('Push call notification failed:', pushErr.message);
+      }
+    }
+
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'Error guardando sesión' });
