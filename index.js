@@ -465,7 +465,16 @@ app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
       .order('created_at', { ascending: false })
       .range(from, from + limit - 1);
 
-    res.json((messages || []).reverse());
+    // Filtrar mensajes que el usuario eliminó para sí mismo
+    const { data: deletions } = await supabase
+      .from('message_deletions')
+      .select('message_id')
+      .eq('user_id', req.user.id);
+
+    const deletedIds = new Set((deletions || []).map(d => d.message_id));
+    const filtered = (messages || []).filter(m => !deletedIds.has(m.id));
+
+    res.json(filtered.reverse());
   } catch (e) {
     console.error('Get messages error:', e.message);
     res.json([]);
@@ -791,7 +800,47 @@ app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
   }
 });
 
-// Eliminar mensaje
+// Eliminar mensaje para mí (solo oculta para el usuario actual)
+app.delete('/api/messages/:messageId/for-me', auth, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+
+    // Verificar que el mensaje existe
+    const { data: message, error: msgError } = await supabase
+      .from('messages')
+      .select('id, chat_id')
+      .eq('id', messageId)
+      .single();
+
+    if (msgError || !message) {
+      return res.status(404).json({ message: 'Mensaje no encontrado' });
+    }
+
+    // Verificar que el usuario pertenece al chat
+    const { data: part } = await supabase
+      .from('chat_participants')
+      .select('chat_id')
+      .eq('chat_id', message.chat_id)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (!part) return res.status(403).json({ message: 'Sin acceso a este chat' });
+
+    // Registrar la eliminación para este usuario (upsert para evitar duplicados)
+    const { error: delError } = await supabase
+      .from('message_deletions')
+      .upsert({ message_id: messageId, user_id: req.user.id }, { onConflict: 'message_id,user_id' });
+
+    if (delError) throw delError;
+
+    res.json({ message: 'Mensaje eliminado para ti' });
+  } catch (e) {
+    console.error('Delete message for me error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Eliminar mensaje para todos (solo el remitente puede hacerlo)
 app.delete('/api/messages/:messageId', auth, async (req, res) => {
   try {
     const { messageId } = req.params;
