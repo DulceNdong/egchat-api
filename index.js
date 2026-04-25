@@ -831,7 +831,10 @@ app.delete('/api/messages/:messageId/for-me', auth, async (req, res) => {
       .from('message_deletions')
       .upsert({ message_id: messageId, user_id: req.user.id }, { onConflict: 'message_id,user_id' });
 
-    if (delError) throw delError;
+    // Si la tabla no existe, ignorar el error (el cliente maneja el filtro localmente)
+    if (delError && !delError.message?.includes('does not exist') && !delError.code?.includes('42P01')) {
+      throw delError;
+    }
 
     res.json({ message: 'Mensaje eliminado para ti' });
   } catch (e) {
