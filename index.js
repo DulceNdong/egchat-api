@@ -3417,6 +3417,8 @@ app.get('/api/push/vapid-public-key', (req, res) => {
 // Función interna para enviar push a un usuario
 const sendPushToUser = async (userId, payload) => {
   try {
+    const isCall = payload.notificationType === 'incoming_call';
+
     // ── Web Push (navegador/PWA) ──────────────────────────────────────────
     const { data: subs } = await supabase
       .from('push_subscriptions')
@@ -3425,11 +3427,17 @@ const sendPushToUser = async (userId, payload) => {
 
     if (subs && subs.length > 0) {
       const payloadStr = JSON.stringify(payload);
+      // Para llamadas: urgency=high despierta el teléfono aunque esté hibernado
+      // TTL=0 en llamadas significa "entregar ahora o nunca" (no tiene sentido entregar una llamada vieja)
+      const pushOptions = isCall
+        ? { urgency: 'high', TTL: 120 }   // 120s — tiempo para desbloquear el teléfono
+        : { urgency: 'normal', TTL: 86400 };
       await Promise.allSettled(
         subs.map(sub =>
           webpush.sendNotification(
             { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
-            payloadStr
+            payloadStr,
+            pushOptions
           ).catch(async err => {
             if (err.statusCode === 410 || err.statusCode === 404) {
               await supabase.from('push_subscriptions').delete().eq('endpoint', sub.endpoint);
@@ -3447,17 +3455,17 @@ const sendPushToUser = async (userId, payload) => {
       .eq('user_id', userId);
 
     if (expoSubs && expoSubs.length > 0) {
-      const isCall = payload.notificationType === 'incoming_call';
       const expoMessages = expoSubs.map(sub => ({
         to: sub.token,
         title: payload.title || 'EGChat',
         body: payload.body || 'Nueva notificacion',
-        sound: 'notification.wav',
+        sound: isCall ? 'default' : 'notification.wav',
         badge: 1,
         channelId: isCall ? 'egchat-calls' : 'egchat-messages',
         priority: isCall ? 'high' : 'normal',
         data: payload,
-        ...(isCall ? { ttl: 30, expiration: Math.floor(Date.now() / 1000) + 30 } : {}),
+        // Llamadas: TTL de 120s para dar tiempo a desbloquear el teléfono
+        ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
       }));
 
       for (let i = 0; i < expoMessages.length; i += 100) {
