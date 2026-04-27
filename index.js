@@ -926,18 +926,22 @@ app.get('/api/contacts', auth, async (req, res) => {
 app.post('/api/contacts', auth, async (req, res) => {
   try {
     const { contact_user_id, nickname, phone } = req.body;
+    console.log('[ADD CONTACT] body:', { contact_user_id, phone, nickname, caller: req.user?.id });
     let targetId = contact_user_id && contact_user_id.trim() ? contact_user_id.trim() : null;
 
     if (!targetId && phone) {
       // Normalizar teléfono: buscar con y sin prefijo +
       const phoneNorm = phone.trim();
       const phoneAlt = phoneNorm.startsWith('+') ? phoneNorm.slice(1) : '+' + phoneNorm;
+      console.log('[ADD CONTACT] searching by phone:', phoneNorm, 'or', phoneAlt);
 
       const { data: targetUser, error: userError } = await supabase
         .from('users')
         .select('id, phone, full_name')
         .or(`phone.eq.${phoneNorm},phone.eq.${phoneAlt}`)
         .single();
+
+      console.log('[ADD CONTACT] phone search result:', targetUser, 'error:', userError?.message);
 
       if (userError || !targetUser) {
         return res.status(404).json({ message: 'Usuario no encontrado con ese número' });
@@ -950,12 +954,16 @@ app.post('/api/contacts', auth, async (req, res) => {
       return res.status(400).json({ message: 'ID de contacto o teléfono requerido' });
     }
 
+    console.log('[ADD CONTACT] targetId:', targetId);
+
     // Verificar que el usuario a agregar existe
     const { data: targetUser, error: userError } = await supabase
       .from('users')
       .select('id, phone, full_name')
       .eq('id', targetId)
       .single();
+
+    console.log('[ADD CONTACT] user by id:', targetUser?.id, 'error:', userError?.message);
 
     if (userError || !targetUser) {
       return res.status(404).json({ message: 'Usuario no encontrado' });
