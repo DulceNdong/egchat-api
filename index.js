@@ -3598,6 +3598,194 @@ app.post('/api/push/test', auth, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ════════════════════════════════════════════════════════════════════
+// STORIES / ESTADOS
+// ════════════════════════════════════════════════════════════════════
+
+// Crear tabla stories si no existe (auto-migrate)
+const ensureStoriesTable = async () => {
+  await supabase.rpc('exec_sql', { sql: `
+    CREATE TABLE IF NOT EXISTS stories (
+      id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+      media JSONB NOT NULL DEFAULT '[]',
+      views INTEGER DEFAULT 0,
+      reactions JSONB DEFAULT '[]',
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_stories_user_id ON stories(user_id);
+    CREATE INDEX IF NOT EXISTS idx_stories_expires_at ON stories(expires_at);
+    CREATE TABLE IF NOT EXISTS story_views (
+      id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+      story_id UUID REFERENCES stories(id) ON DELETE CASCADE NOT NULL,
+      viewer_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+      viewed_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(story_id, viewer_id)
+    );
+  `}).catch(() => {});
+};
+
+// GET /api/stories — obtener estados de mis contactos + el mío
+app.get('/api/stories', auth, async (req, res) => {
+  try {
+    await ensureStoriesTable();
+    const userId = req.user.id;
+    const now = new Date().toISOString();
+
+    // Obtener IDs de mis contactos
+    const { data: contacts } = await supabase
+      .from('contacts')
+      .select('contact_user_id, contact_id')
+      .or(`user_id.eq.${userId},contact_id.eq.${userId}`);
+
+    const contactIds = new Set([userId]);
+    (contacts || []).forEach(c => {
+      if (c.contact_user_id) contactIds.add(c.contact_user_id);
+      if (c.contact_id) contactIds.add(c.contact_id);
+    });
+
+    // Obtener stories activas (no expiradas) de mis contactos
+    const { data: stories, error } = await supabase
+      .from('stories')
+      .select('*, users!stories_user_id_fkey(id, full_name, avatar_url)')
+      .in('user_id', Array.from(contactIds))
+      .gt('expires_at', now)
+      .order('created_at', { ascending: false });
+
+    if (error) return res.status(500).json({ message: error.message });
+
+    // Obtener qué stories ya vio el usuario actual
+    const storyIds = (stories || []).map(s => s.id);
+    let viewedIds = new Set();
+    if (storyIds.length > 0) {
+      const { data: views } = await supabase
+        .from('story_views')
+        .select('story_id')
+        .eq('viewer_id', userId)
+        .in('story_id', storyIds);
+      (views || []).forEach(v => viewedIds.add(v.story_id));
+    }
+
+    const result = (stories || []).map(s => ({
+      id: s.id,
+      userId: s.user_id,
+      userName: s.users?.full_name || 'Usuario',
+      avatarUrl: s.users?.avatar_url || '',
+      media: s.media || [],
+      views: s.views || 0,
+      reactions: s.reactions || [],
+      seen: viewedIds.has(s.id),
+      publishedAt: new Date(s.created_at).getTime(),
+      expiresAt: new Date(s.expires_at).getTime(),
+      isMe: s.user_id === userId,
+    }));
+
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// POST /api/stories — publicar un nuevo estado
+app.post('/api/stories', auth, async (req, res) => {
+  try {
+    await ensureStoriesTable();
+    const userId = req.user.id;
+    const { media } = req.body; // array de StoryMedia
+    if (!media || !Array.isArray(media) || media.length === 0) {
+      return res.status(400).json({ message: 'media requerido' });
+    }
+
+    const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+
+    // Upsert: si ya tiene story activa hoy, añadir slides; si no, crear nueva
+    const { data: existing } = await supabase
+      .from('stories')
+      .select('id, media')
+      .eq('user_id', userId)
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    let story;
+    if (existing) {
+      const updatedMedia = [...(existing.media || []), ...media];
+      const { data, error } = await supabase
+        .from('stories')
+        .update({ media: updatedMedia, expires_at: expiresAt })
+        .eq('id', existing.id)
+        .select()
+        .single();
+      if (error) return res.status(500).json({ message: error.message });
+      story = data;
+    } else {
+      const { data, error } = await supabase
+        .from('stories')
+        .insert({ user_id: userId, media, expires_at: expiresAt })
+        .select()
+        .single();
+      if (error) return res.status(500).json({ message: error.message });
+      story = data;
+    }
+
+    res.json({ id: story.id, media: story.media, expiresAt: story.expires_at });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// DELETE /api/stories — eliminar todos mis estados
+app.delete('/api/stories', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    await supabase.from('stories').delete().eq('user_id', userId);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// DELETE /api/stories/:storyId/slide/:slideIdx — eliminar un slide específico
+app.delete('/api/stories/:storyId/slide/:slideIdx', auth, async (req, res) => {
+  try {
+    const { storyId, slideIdx } = req.params;
+    const idx = parseInt(slideIdx);
+    const { data: story } = await supabase
+      .from('stories')
+      .select('id, media, user_id')
+      .eq('id', storyId)
+      .single();
+    if (!story || story.user_id !== req.user.id) return res.status(403).json({ message: 'No autorizado' });
+    const newMedia = (story.media || []).filter((_, i) => i !== idx);
+    if (newMedia.length === 0) {
+      await supabase.from('stories').delete().eq('id', storyId);
+    } else {
+      await supabase.from('stories').update({ media: newMedia }).eq('id', storyId);
+    }
+    res.json({ ok: true, media: newMedia });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// POST /api/stories/:storyId/view — registrar vista
+app.post('/api/stories/:storyId/view', auth, async (req, res) => {
+  try {
+    await ensureStoriesTable();
+    const { storyId } = req.params;
+    const viewerId = req.user.id;
+    // Insertar vista (ignorar duplicados)
+    await supabase.from('story_views').upsert({ story_id: storyId, viewer_id: viewerId }, { onConflict: 'story_id,viewer_id' });
+    // Incrementar contador
+    await supabase.rpc('exec_sql', { sql: `UPDATE stories SET views = views + 1 WHERE id = '${storyId}' AND user_id != '${viewerId}'` }).catch(() => {});
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 if (require.main === module) {
   app.listen(PORT, async () => {
     console.log(`\n😎 EGCHAT API + Supabase en http://localhost:${PORT}`);
