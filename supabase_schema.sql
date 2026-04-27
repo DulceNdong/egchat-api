@@ -109,3 +109,16 @@ CREATE TABLE IF NOT EXISTS call_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_call_sessions_target ON call_sessions(target_user_id, ended);
 CREATE INDEX IF NOT EXISTS idx_call_sessions_created ON call_sessions(created_at);
+
+-- Tabla para "eliminar para mí" (mensajes ocultos por usuario)
+-- EJECUTAR ESTE SQL EN SUPABASE si los mensajes vuelven a aparecer al recargar
+CREATE TABLE IF NOT EXISTS message_deletions (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  deleted_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(message_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_deletions_user ON message_deletions(user_id);
+CREATE INDEX IF NOT EXISTS idx_message_deletions_message ON message_deletions(message_id);
