@@ -1188,22 +1188,21 @@ app.get('/api/contacts/favorites', auth, async (req, res) => {
 app.get('/api/contacts/search', auth, async (req, res) => {
   try {
     const { q } = req.query;
-    
-    if (!q || q.length < 2) {
-      return res.status(400).json({ message: 'La bÁƒÂºsqueda debe tener al menos 2 caracteres' });
-    }
 
-    // Buscar usuarios por teléfono o nombre
-    const { data: users, error } = await supabase
+    let query = supabase
       .from('users')
       .select('id, phone, full_name, avatar_url')
-      .or(`phone.ilike.%${q}%,full_name.ilike.%${q}%`)
       .neq('id', req.user.id)
-      .limit(20);
+      .limit(50);
 
+    // Si hay término de búsqueda, filtrar; si no, devolver todos
+    if (q && q.length >= 2) {
+      query = query.or(`phone.ilike.%${q}%,full_name.ilike.%${q}%`);
+    }
+
+    const { data: users, error } = await query;
     if (error) throw error;
-
-    res.json(users);
+    res.json(users || []);
   } catch (e) {
     console.error('Search contacts error:', e);
     res.status(500).json({ message: e.message });
