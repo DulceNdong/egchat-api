@@ -471,7 +471,7 @@ app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
       .select('message_id')
       .eq('user_id', req.user.id);
 
-    const deletedIds = new Set((deletions || []).map(d => d.message_id));
+    const deletedIds = new Set((deletions || []).map((d: any) => d.message_id));
     const filtered = (messages || []).filter(m => !deletedIds.has(m.id));
 
     res.json(filtered.reverse());
@@ -926,7 +926,7 @@ app.get('/api/contacts', auth, async (req, res) => {
 app.post('/api/contacts', auth, async (req, res) => {
   try {
     const { contact_user_id, nickname, phone } = req.body;
-    let targetId = contact_user_id;
+    let targetId = contact_user_id && contact_user_id.trim() ? contact_user_id.trim() : null;
 
     if (!targetId && phone) {
       const { data: targetUser, error: userError } = await supabase
