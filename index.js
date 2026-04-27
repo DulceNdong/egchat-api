@@ -471,7 +471,7 @@ app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
       .select('message_id')
       .eq('user_id', req.user.id);
 
-    const deletedIds = new Set((deletions || []).map((d: any) => d.message_id));
+    const deletedIds = new Set((deletions || []).map((d) => d.message_id));
     const filtered = (messages || []).filter(m => !deletedIds.has(m.id));
 
     res.json(filtered.reverse());
