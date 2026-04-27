@@ -3417,35 +3417,97 @@ app.get('/api/push/vapid-public-key', (req, res) => {
 // Función interna para enviar push a un usuario
 const sendPushToUser = async (userId, payload) => {
   try {
+    // ── Web Push (navegador/PWA) ──────────────────────────────────────────
     const { data: subs } = await supabase
       .from('push_subscriptions')
       .select('endpoint, p256dh, auth')
       .eq('user_id', userId);
 
-    if (!subs || subs.length === 0) return;
+    if (subs && subs.length > 0) {
+      const payloadStr = JSON.stringify(payload);
+      await Promise.allSettled(
+        subs.map(sub =>
+          webpush.sendNotification(
+            { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+            payloadStr
+          ).catch(async err => {
+            if (err.statusCode === 410 || err.statusCode === 404) {
+              await supabase.from('push_subscriptions').delete().eq('endpoint', sub.endpoint);
+            }
+            throw err;
+          })
+        )
+      );
+    }
 
-    const payloadStr = JSON.stringify(payload);
-    const results = await Promise.allSettled(
-      subs.map(sub =>
-        webpush.sendNotification(
-          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
-          payloadStr
-        ).catch(async err => {
-          // Si el endpoint ya no es válido (410 Gone), eliminarlo
-          if (err.statusCode === 410 || err.statusCode === 404) {
-            await supabase.from('push_subscriptions')
-              .delete()
-              .eq('endpoint', sub.endpoint);
+    // ── Expo Push (app movil nativa — funciona con telefono hibernado) ────
+    const { data: expoSubs } = await supabase
+      .from('expo_push_tokens')
+      .select('token')
+      .eq('user_id', userId);
+
+    if (expoSubs && expoSubs.length > 0) {
+      const isCall = payload.notificationType === 'incoming_call';
+      const expoMessages = expoSubs.map(sub => ({
+        to: sub.token,
+        title: payload.title || 'EGChat',
+        body: payload.body || 'Nueva notificacion',
+        sound: 'notification.wav',
+        badge: 1,
+        channelId: isCall ? 'egchat-calls' : 'egchat-messages',
+        priority: isCall ? 'high' : 'normal',
+        data: payload,
+        ...(isCall ? { ttl: 30, expiration: Math.floor(Date.now() / 1000) + 30 } : {}),
+      }));
+
+      for (let i = 0; i < expoMessages.length; i += 100) {
+        const batch = expoMessages.slice(i, i + 100);
+        try {
+          const expoRes = await fetch('https://exp.host/--/api/v2/push/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify(batch),
+          });
+          const result = await expoRes.json();
+          if (result.data) {
+            const invalid = result.data
+              .map((r, idx) => ({ r, token: batch[idx].to }))
+              .filter(({ r }) => r.status === 'error' && r.details?.error === 'DeviceNotRegistered');
+            if (invalid.length > 0) {
+              await Promise.allSettled(
+                invalid.map(({ token }) => supabase.from('expo_push_tokens').delete().eq('token', token))
+              );
+            }
           }
-          throw err;
-        })
-      )
-    );
-    return results;
+        } catch (expoErr) {
+          console.warn('Expo push error:', expoErr.message);
+        }
+      }
+    }
   } catch (e) {
     console.error('sendPushToUser error:', e.message);
   }
 };
+
+// ── Registrar token Expo Push (app movil nativa) ──────────────────────────
+app.post('/api/push/register-expo-token', auth, async (req, res) => {
+  try {
+    const { expoPushToken, platform } = req.body;
+    if (!expoPushToken || !expoPushToken.startsWith('ExponentPushToken[')) {
+      return res.status(400).json({ message: 'Token Expo invalido' });
+    }
+    await supabase.from('expo_push_tokens').upsert({
+      user_id: req.user.id,
+      token: expoPushToken,
+      platform: platform || 'android',
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'token' });
+    res.json({ message: 'Token registrado' });
+  } catch (e) {
+    console.error('Expo token register error:', e.message);
+    res.status(500).json({ message: e.message });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PUSH DIAGNOSTICS
