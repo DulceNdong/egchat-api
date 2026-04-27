@@ -3252,7 +3252,7 @@ app.post('/api/call/offer', auth, async (req, res) => {
           .from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
         const callerName = caller?.full_name || 'Alguien';
         const isVideo = (type || 'audio') === 'video';
-        await sendPushToUser(targetUserId, {
+        const callPushPayload = {
           title: isVideo ? `📹 Videollamada de ${callerName}` : `📞 Llamada de ${callerName}`,
           body: isVideo ? 'Toca para responder la videollamada' : 'Toca para responder la llamada',
           icon: caller?.avatar_url || '/favicon.svg',
@@ -3265,7 +3265,34 @@ app.post('/api/call/offer', auth, async (req, res) => {
           callerName,
           callType: type || 'audio',
           notificationType: 'incoming_call',
-        });
+        };
+
+        // Enviar push inmediatamente
+        await sendPushToUser(targetUserId, callPushPayload);
+
+        // Reenviar 2 veces más con delay para despertar teléfonos hibernados
+        // que no recibieron el primer push (Android Doze mode, iOS background restrictions)
+        setTimeout(async () => {
+          try {
+            // Verificar que la llamada sigue activa antes de reenviar
+            const { data: session } = await supabase
+              .from('call_sessions').select('ended, answer').eq('call_id', callId).single();
+            if (session && !session.ended && !session.answer) {
+              await sendPushToUser(targetUserId, callPushPayload);
+            }
+          } catch {}
+        }, 5000);
+
+        setTimeout(async () => {
+          try {
+            const { data: session } = await supabase
+              .from('call_sessions').select('ended, answer').eq('call_id', callId).single();
+            if (session && !session.ended && !session.answer) {
+              await sendPushToUser(targetUserId, callPushPayload);
+            }
+          } catch {}
+        }, 12000);
+
       } catch (pushErr) {
         console.warn('Push call notification failed:', pushErr.message);
       }
