@@ -929,14 +929,18 @@ app.post('/api/contacts', auth, async (req, res) => {
     let targetId = contact_user_id && contact_user_id.trim() ? contact_user_id.trim() : null;
 
     if (!targetId && phone) {
+      // Normalizar teléfono: buscar con y sin prefijo +
+      const phoneNorm = phone.trim();
+      const phoneAlt = phoneNorm.startsWith('+') ? phoneNorm.slice(1) : '+' + phoneNorm;
+
       const { data: targetUser, error: userError } = await supabase
         .from('users')
         .select('id, phone, full_name')
-        .eq('phone', phone)
+        .or(`phone.eq.${phoneNorm},phone.eq.${phoneAlt}`)
         .single();
 
       if (userError || !targetUser) {
-        return res.status(404).json({ message: 'Usuario no encontrado con ese nÁºmero' });
+        return res.status(404).json({ message: 'Usuario no encontrado con ese número' });
       }
 
       targetId = targetUser.id;
