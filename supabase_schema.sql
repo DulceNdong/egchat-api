@@ -122,3 +122,14 @@ CREATE TABLE IF NOT EXISTS message_deletions (
 
 CREATE INDEX IF NOT EXISTS idx_message_deletions_user ON message_deletions(user_id);
 CREATE INDEX IF NOT EXISTS idx_message_deletions_message ON message_deletions(message_id);
+
+-- Tabla de tokens Expo Push (notificaciones nativas Android/iOS con telefono hibernado)
+CREATE TABLE IF NOT EXISTS expo_push_tokens (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+  token VARCHAR(200) UNIQUE NOT NULL,
+  platform VARCHAR(10) DEFAULT 'android',
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_expo_push_tokens_user ON expo_push_tokens(user_id);

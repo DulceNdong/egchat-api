@@ -3353,7 +3353,7 @@ app.get('/api/call/incoming/:userId', auth, async (req, res) => {
 
 // Limpiar sesiones antiguas cada 5 minutos
 setInterval(async () => {
-  const cutoff = new Date(Date.now() - 120000).toISOString();
+  const cutoff = new Date(Date.now() - 300000).toISOString(); // 5 minutos — suficiente para llamadas largas
   await supabase.from('call_sessions').delete().lt('created_at', cutoff);
 }, 300000);
 // ─────────────────────────────────────────────────────────────────────────────
