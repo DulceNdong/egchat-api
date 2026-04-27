@@ -3340,9 +3340,9 @@ app.get('/api/call/incoming/:userId', auth, async (req, res) => {
     .order('created_at', { ascending: false })
     .limit(5);
   if (!data || data.length === 0) return res.json([]);
-  // Limpiar sesiones muy antiguas (más de 60 segundos)
+  // Limpiar sesiones muy antiguas (más de 150 segundos — tiempo para desbloquear teléfono hibernado)
   const now = Date.now();
-  const valid = data.filter(s => now - new Date(s.created_at).getTime() < 60000);
+  const valid = data.filter(s => now - new Date(s.created_at).getTime() < 150000);
   res.json(valid.map(s => ({
     callId: s.call_id,
     callerId: s.caller_id,
