@@ -4064,6 +4064,161 @@ async function scrapeGEPress() {
   return noticias.slice(0, 10);
 }
 
+// Extrae noticias de presidenciagobierno.gq
+async function scrapePresidencia() {
+  const noticias = [];
+  try {
+    const res = await fetch('https://www.presidenciagobierno.gq', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EGChatBot/1.0)' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return noticias;
+    const html = await res.text();
+    const linkRegex = /<a[^>]+href="(https?:\/\/(?:www\.)?presidenciagobierno\.gq\/[^"#?]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    const seen = new Set();
+    while ((m = linkRegex.exec(html)) !== null) {
+      const url = m[1];
+      const title = m[2].replace(/<[^>]+>/g, '').trim();
+      if (title.length > 15 && !seen.has(url) && !url.match(/\/(category|tag|page|author)\//)) {
+        seen.add(url);
+        noticias.push({ title, url, fuente: 'Presidencia GQ', dominio: 'presidenciagobierno.gq', color: '#1e3a5f', category: 'Presidencia' });
+      }
+    }
+  } catch (e) {
+    console.log('[Noticias] Error scraping Presidencia GQ:', e.message);
+  }
+  return noticias.slice(0, 10);
+}
+
+// Extrae noticias de lavicepress.com
+async function scrapeLaVicePress() {
+  const noticias = [];
+  try {
+    const res = await fetch('https://www.lavicepress.com', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EGChatBot/1.0)' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return noticias;
+    const html = await res.text();
+    const linkRegex = /<a[^>]+href="(https?:\/\/(?:www\.)?lavicepress\.com\/[^"#?]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    const seen = new Set();
+    while ((m = linkRegex.exec(html)) !== null) {
+      const url = m[1];
+      const title = m[2].replace(/<[^>]+>/g, '').trim();
+      if (title.length > 15 && !seen.has(url) && !url.match(/\/(category|tag|page|author)\//)) {
+        seen.add(url);
+        noticias.push({ title, url, fuente: 'La Vice Press', dominio: 'lavicepress.com', color: '#0d9488', category: 'Vicepresidencia' });
+      }
+    }
+  } catch (e) {
+    console.log('[Noticias] Error scraping LaVicePress:', e.message);
+  }
+  return noticias.slice(0, 10);
+}
+
+// ── Enviar push de noticia del gobierno a TODOS los usuarios suscritos ────────
+async function sendGovNewsPush(noticia) {
+  try {
+    const { data: subs } = await supabase
+      .from('push_subscriptions')
+      .select('endpoint, p256dh, auth');
+
+    if (!subs || subs.length === 0) return;
+
+    const payload = JSON.stringify({
+      title: `🏛️ ${noticia.fuente}`,
+      body: noticia.title,
+      notificationType: 'government_news',
+      url: '/?view=estados&espacio=e1',
+      tag: `gov-news-${noticia.id || Date.now()}`,
+      icon: '/favicon.svg',
+      badge: '/favicon.svg',
+      newsUrl: noticia.url,
+      newsSource: noticia.fuente,
+    });
+
+    let sent = 0;
+    await Promise.allSettled(
+      subs.map(sub =>
+        webpush.sendNotification(
+          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+          payload,
+          { urgency: 'normal', TTL: 3600 }
+        ).then(() => { sent++; }).catch(async err => {
+          if (err.statusCode === 410 || err.statusCode === 404) {
+            await supabase.from('push_subscriptions').delete().eq('endpoint', sub.endpoint);
+          }
+        })
+      )
+    );
+    console.log(`[GovNews] Push enviado a ${sent}/${subs.length} suscriptores: "${noticia.title.substring(0, 50)}..."`);
+  } catch (e) {
+    console.error('[GovNews] Error enviando push:', e.message);
+  }
+}
+
+// ── Scheduler: revisar noticias nuevas cada 10 minutos y notificar ────────────
+const govNewsSeenUrls = new Set();
+let govNewsSchedulerStarted = false;
+
+async function checkAndNotifyNewGovNews() {
+  try {
+    const [primatura, gepress, presidencia, lavice] = await Promise.allSettled([
+      scrapePrimatura(),
+      scrapeGEPress(),
+      scrapePresidencia(),
+      scrapeLaVicePress(),
+    ]);
+
+    const all = [
+      ...(primatura.status === 'fulfilled' ? primatura.value : []),
+      ...(gepress.status === 'fulfilled' ? gepress.value : []),
+      ...(presidencia.status === 'fulfilled' ? presidencia.value : []),
+      ...(lavice.status === 'fulfilled' ? lavice.value : []),
+    ];
+
+    // Primera ejecución: solo registrar URLs conocidas sin notificar
+    if (govNewsSeenUrls.size === 0) {
+      all.forEach(n => govNewsSeenUrls.add(n.url));
+      console.log(`[GovNews] Scheduler iniciado. ${all.length} noticias registradas como conocidas.`);
+      // Actualizar cache
+      noticiasCache.data = all.map((n, i) => ({ id: `gov-${Date.now()}-${i}`, ...n, scrapedAt: Date.now() }));
+      noticiasCache.timestamp = Date.now();
+      return;
+    }
+
+    // Detectar noticias nuevas
+    const nuevas = all.filter(n => !govNewsSeenUrls.has(n.url));
+    nuevas.forEach(n => govNewsSeenUrls.add(n.url));
+
+    if (nuevas.length > 0) {
+      console.log(`[GovNews] ${nuevas.length} noticias nuevas detectadas!`);
+      // Actualizar cache con todas las noticias
+      noticiasCache.data = all.map((n, i) => ({ id: `gov-${Date.now()}-${i}`, ...n, scrapedAt: Date.now() }));
+      noticiasCache.timestamp = Date.now();
+      // Enviar push solo para las primeras 3 noticias nuevas (evitar spam)
+      for (const noticia of nuevas.slice(0, 3)) {
+        await sendGovNewsPush({ ...noticia, id: `gov-${Date.now()}` });
+        await new Promise(r => setTimeout(r, 1500)); // pausa entre notificaciones
+      }
+    }
+  } catch (e) {
+    console.error('[GovNews] Error en scheduler:', e.message);
+  }
+}
+
+function startGovNewsScheduler() {
+  if (govNewsSchedulerStarted) return;
+  govNewsSchedulerStarted = true;
+  console.log('[GovNews] Scheduler iniciado — revisando cada 10 minutos');
+  // Primera ejecución inmediata
+  checkAndNotifyNewGovNews();
+  // Luego cada 10 minutos
+  setInterval(checkAndNotifyNewGovNews, 10 * 60 * 1000);
+}
+
 // Noticias de respaldo curadas (cuando las fuentes no responden)
 const NOTICIAS_FALLBACK = [
   { title: 'El Ministerio de Sanidad presenta en Bata su Plan de Accion ante el Encargado de la Coordinacion Administrativa', url: 'https://primatura.gob.gq/el-ministerio-de-sanidad-presenta-en-bata-su-plan-de-accion/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Salud', publishedAt: '2025-10-08' },
