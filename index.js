@@ -3140,16 +3140,88 @@ ensureStoriesTable();
 
 app.get('/api/stories', auth, async (req, res) => {
   try {
-    const { data: mine } = await supabase.from('stories').select('*').eq('user_id', req.user.id).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false });
-    const { data: contacts } = await supabase.from('contacts').select('contact_user_id').eq('user_id', req.user.id).eq('is_blocked', false);
-    const contactIds = (contacts || []).map(c => c.contact_user_id);
+    const userId = req.user.id;
+    const now = new Date().toISOString();
+
+    // 1. Mis propios estados
+    const { data: mine } = await supabase
+      .from('stories')
+      .select('*, users!stories_user_id_fkey(id, full_name, avatar_url)')
+      .eq('user_id', userId)
+      .gt('expires_at', now)
+      .order('created_at', { ascending: false });
+
+    // 2. IDs de contactos (tabla contacts)
+    const { data: contacts } = await supabase
+      .from('contacts')
+      .select('contact_user_id, contact_id')
+      .or(`user_id.eq.${userId},contact_id.eq.${userId}`)
+      .eq('is_blocked', false);
+
+    const contactIds = new Set();
+    (contacts || []).forEach(c => {
+      if (c.contact_user_id && c.contact_user_id !== userId) contactIds.add(c.contact_user_id);
+      if (c.contact_id && c.contact_id !== userId) contactIds.add(c.contact_id);
+    });
+
+    // 3. También incluir usuarios con quienes tengo chats activos
+    const { data: chatParts } = await supabase
+      .from('chat_participants')
+      .select('chat_id')
+      .eq('user_id', userId);
+
+    if (chatParts && chatParts.length > 0) {
+      const chatIds = chatParts.map(c => c.chat_id);
+      const { data: otherParts } = await supabase
+        .from('chat_participants')
+        .select('user_id')
+        .in('chat_id', chatIds)
+        .neq('user_id', userId);
+      (otherParts || []).forEach(p => contactIds.add(p.user_id));
+    }
+
+    // 4. Estados de contactos
     let contactStories = [];
-    if (contactIds.length > 0) {
-      const { data } = await supabase.from('stories').select('*, users(id, full_name, avatar_url)').in('user_id', contactIds).gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false });
+    if (contactIds.size > 0) {
+      const { data } = await supabase
+        .from('stories')
+        .select('*, users!stories_user_id_fkey(id, full_name, avatar_url)')
+        .in('user_id', Array.from(contactIds))
+        .gt('expires_at', now)
+        .order('created_at', { ascending: false });
       contactStories = data || [];
     }
-    res.json({ mine: mine || [], contacts: contactStories });
-  } catch (e) { res.json({ mine: [], contacts: [] }); }
+
+    // 5. Formatear respuesta uniforme
+    const format = (s, isMe) => {
+      const user = s.users || {};
+      const name = user.full_name || 'Usuario';
+      const initials = name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
+      let media = s.media;
+      if (typeof media === 'string') { try { media = JSON.parse(media); } catch { media = []; } }
+      return {
+        id: s.id,
+        userId: s.user_id,
+        userName: name,
+        avatar: initials,
+        avatarUrl: user.avatar_url || '',
+        media: Array.isArray(media) ? media : [],
+        views: s.views || 0,
+        reactions: s.reactions || [],
+        seen: false,
+        publishedAt: new Date(s.created_at).getTime(),
+        expiresAt: new Date(s.expires_at).getTime(),
+        isMe,
+      };
+    };
+
+    const result = [
+      ...(mine || []).map(s => format(s, true)),
+      ...contactStories.map(s => format(s, false)),
+    ];
+
+    res.json(result);
+  } catch (e) { res.json([]); }
 });
 
 app.post('/api/stories', auth, async (req, res) => {
