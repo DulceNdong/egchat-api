@@ -316,6 +316,17 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
+app.post('/api/auth/check-phone', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.json({ exists: false });
+    const { data } = await supabase.from('users').select('id').eq('phone', phone).maybeSingle();
+    res.json({ exists: !!data });
+  } catch {
+    res.json({ exists: false }); // En caso de error, dejar continuar
+  }
+});
+
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { phone, password } = req.body;
