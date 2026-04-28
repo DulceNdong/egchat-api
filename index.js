@@ -4284,7 +4284,8 @@ if (require.main === module) {
     console.log(`\n😎 EGCHAT API + Supabase en http://localhost:${PORT}`);
     console.log(`   Supabase: ${process.env.SUPABASE_URL ? '✅ Conectado' : '❌ Sin configurar'}`);
     // Iniciar scheduler de noticias del gobierno
-    startGovNewsScheduler();    console.log(`   Auth:   POST /api/auth/register | /api/auth/login`);
+    startGovNewsScheduler();
+    console.log(`   Auth:   POST /api/auth/register | /api/auth/login`);
     console.log(`   Wallet: GET  /api/wallet/balance | POST /api/wallet/deposit`);
     console.log(`   Lia-25: POST /api/lia/chat\n`);
     // Crear tabla call_sessions si no existe
