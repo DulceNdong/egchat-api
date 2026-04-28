@@ -4241,15 +4241,19 @@ app.get('/api/noticias/gobierno', async (req, res) => {
       return res.json({ noticias: noticiasCache.data, fromCache: true, updatedAt: noticiasCache.timestamp });
     }
 
-    // Intentar scraping en paralelo
-    const [primatura, gepress] = await Promise.allSettled([
+    // Intentar scraping en paralelo de todas las fuentes
+    const [primatura, gepress, presidencia, lavice] = await Promise.allSettled([
       scrapePrimatura(),
       scrapeGEPress(),
+      scrapePresidencia(),
+      scrapeLaVicePress(),
     ]);
 
     const scraped = [
       ...(primatura.status === 'fulfilled' ? primatura.value : []),
       ...(gepress.status === 'fulfilled' ? gepress.value : []),
+      ...(presidencia.status === 'fulfilled' ? presidencia.value : []),
+      ...(lavice.status === 'fulfilled' ? lavice.value : []),
     ];
 
     // Si el scraping devuelve resultados, usarlos; si no, usar fallback
@@ -4277,7 +4281,8 @@ if (require.main === module) {
   app.listen(PORT, async () => {
     console.log(`\n😎 EGCHAT API + Supabase en http://localhost:${PORT}`);
     console.log(`   Supabase: ${process.env.SUPABASE_URL ? '✅ Conectado' : '❌ Sin configurar'}`);
-    console.log(`   Auth:   POST /api/auth/register | /api/auth/login`);
+    // Iniciar scheduler de noticias del gobierno
+    startGovNewsScheduler();    console.log(`   Auth:   POST /api/auth/register | /api/auth/login`);
     console.log(`   Wallet: GET  /api/wallet/balance | POST /api/wallet/deposit`);
     console.log(`   Lia-25: POST /api/lia/chat\n`);
     // Crear tabla call_sessions si no existe
