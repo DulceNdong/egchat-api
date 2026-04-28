@@ -3146,7 +3146,7 @@ app.get('/api/stories', auth, async (req, res) => {
     // 1. Mis propios estados
     const { data: mine } = await supabase
       .from('stories')
-      .select('*, users!stories_user_id_fkey(id, full_name, avatar_url)')
+      .select('*')
       .eq('user_id', userId)
       .gt('expires_at', now)
       .order('created_at', { ascending: false });
@@ -3185,25 +3185,35 @@ app.get('/api/stories', auth, async (req, res) => {
     if (contactIds.size > 0) {
       const { data } = await supabase
         .from('stories')
-        .select('*, users!stories_user_id_fkey(id, full_name, avatar_url)')
+        .select('*')
         .in('user_id', Array.from(contactIds))
         .gt('expires_at', now)
         .order('created_at', { ascending: false });
       contactStories = data || [];
     }
 
-    // 5. Formatear respuesta uniforme
+    // 5. Obtener datos de usuarios para todos los stories
+    const allStories = [...(mine || []), ...contactStories];
+    const allUserIds = [...new Set(allStories.map(s => s.user_id))];
+    let usersMap = {};
+    if (allUserIds.length > 0) {
+      const { data: usersData } = await supabase
+        .from('users')
+        .select('id, full_name, avatar_url')
+        .in('id', allUserIds);
+      (usersData || []).forEach(u => { usersMap[u.id] = u; });
+    }
+
+    // 6. Formatear respuesta
     const format = (s, isMe) => {
-      const user = s.users || {};
+      const user = usersMap[s.user_id] || {};
       const name = user.full_name || 'Usuario';
-      const initials = name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
       let media = s.media;
       if (typeof media === 'string') { try { media = JSON.parse(media); } catch { media = []; } }
       return {
         id: s.id,
         userId: s.user_id,
         userName: name,
-        avatar: initials,
         avatarUrl: user.avatar_url || '',
         media: Array.isArray(media) ? media : [],
         views: s.views || 0,
@@ -3215,12 +3225,10 @@ app.get('/api/stories', auth, async (req, res) => {
       };
     };
 
-    const result = [
+    res.json([
       ...(mine || []).map(s => format(s, true)),
       ...contactStories.map(s => format(s, false)),
-    ];
-
-    res.json(result);
+    ]);
   } catch (e) { res.json([]); }
 });
 
