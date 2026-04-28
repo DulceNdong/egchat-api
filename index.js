@@ -3988,7 +3988,9 @@ const NOTICIAS_TTL = 5 * 60 * 1000; // 5 minutos
 // Fuentes oficiales del Gobierno de Guinea Ecuatorial
 const FUENTES_OFICIALES = [
   { nombre: 'Presidencia del Gobierno', url: 'https://primatura.gob.gq/noticias/', dominio: 'primatura.gob.gq', color: '#1e3a5f' },
-  { nombre: 'Gobierno GE', url: 'https://www.guineaecuatorialpress.com/', dominio: 'guineaecuatorialpress.com', color: '#0369a1' },
+  { nombre: 'Guinea Ecuatorial Press', url: 'https://www.guineaecuatorialpress.com/', dominio: 'guineaecuatorialpress.com', color: '#0369a1' },
+  { nombre: 'Presidencia GQ', url: 'https://www.presidenciagobierno.gq', dominio: 'presidenciagobierno.gq', color: '#1e3a5f' },
+  { nombre: 'La Vice Press', url: 'https://www.lavicepress.com', dominio: 'lavicepress.com', color: '#0d9488' },
 ];
 
 // Extrae noticias de primatura.gob.gq parseando el HTML
