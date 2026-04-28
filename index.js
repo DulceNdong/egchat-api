@@ -3229,9 +3229,41 @@ app.post('/api/stories', auth, async (req, res) => {
     const { media, type = 'text' } = req.body;
     if (!media) return res.status(400).json({ message: 'media requerido' });
     const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
-    const { data: story, error } = await supabase.from('stories').insert({ user_id: req.user.id, media: JSON.stringify(media), type, views: 0, expires_at: expiresAt, created_at: new Date().toISOString() }).select().single();
-    if (error) throw error;
-    res.status(201).json(story);
+    const newSlides = Array.isArray(media) ? media : [media];
+
+    // Upsert: añadir a story activa existente o crear nueva
+    const { data: existing } = await supabase
+      .from('stories')
+      .select('id, media')
+      .eq('user_id', req.user.id)
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    let story;
+    if (existing) {
+      let currentMedia = existing.media;
+      if (typeof currentMedia === 'string') { try { currentMedia = JSON.parse(currentMedia); } catch { currentMedia = []; } }
+      const updatedMedia = [...(Array.isArray(currentMedia) ? currentMedia : []), ...newSlides];
+      const { data, error } = await supabase
+        .from('stories')
+        .update({ media: updatedMedia, expires_at: expiresAt })
+        .eq('id', existing.id)
+        .select()
+        .single();
+      if (error) throw error;
+      story = data;
+    } else {
+      const { data, error } = await supabase
+        .from('stories')
+        .insert({ user_id: req.user.id, media: newSlides, type, views: 0, expires_at: expiresAt })
+        .select()
+        .single();
+      if (error) throw error;
+      story = data;
+    }
+    res.status(201).json({ id: story.id, media: story.media, expiresAt: story.expires_at });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
