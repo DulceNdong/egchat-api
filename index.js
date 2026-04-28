@@ -3249,7 +3249,7 @@ app.get('/api/spaces/:id/posts', auth, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.id;
-    const page = parseInt(req.query.page as string) || 1;
+    const page = parseInt(req.query.page) || 1;
     const limit = 20;
     const offset = (page - 1) * limit;
 
