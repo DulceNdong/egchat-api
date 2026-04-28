@@ -3111,6 +3111,275 @@ app.get('/api/users/:userId', auth, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
+// ESPACIO DULCE — Canales y Comunidades
+// ════════════════════════════════════════════════════════════════════
+
+// Auto-crear tablas de espacios
+const ensureSpacesTable = async () => {
+  try {
+    await supabase.rpc('exec_sql', { sql: `
+      CREATE TABLE IF NOT EXISTS spaces (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        description TEXT,
+        type VARCHAR(20) DEFAULT 'publico' CHECK (type IN ('publico','comunidad')),
+        cover TEXT,
+        emoji VARCHAR(10) DEFAULT '📢',
+        owner_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        followers_count INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS space_follows (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        space_id UUID REFERENCES spaces(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(space_id, user_id)
+      );
+      CREATE TABLE IF NOT EXISTS space_posts (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        space_id UUID REFERENCES spaces(id) ON DELETE CASCADE,
+        author_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        image_url TEXT,
+        likes_count INTEGER DEFAULT 0,
+        comments_count INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS space_post_likes (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        post_id UUID REFERENCES space_posts(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(post_id, user_id)
+      );
+      CREATE TABLE IF NOT EXISTS space_post_comments (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        post_id UUID REFERENCES space_posts(id) ON DELETE CASCADE,
+        author_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_spaces_type ON spaces(type);
+      CREATE INDEX IF NOT EXISTS idx_space_follows_user ON space_follows(user_id);
+      CREATE INDEX IF NOT EXISTS idx_space_posts_space ON space_posts(space_id);
+      CREATE INDEX IF NOT EXISTS idx_space_posts_created ON space_posts(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_space_comments_post ON space_post_comments(post_id);
+    `}).catch(() => {});
+  } catch {}
+};
+ensureSpacesTable();
+
+// Seed espacios por defecto si no existen
+const seedDefaultSpaces = async () => {
+  try {
+    const { data } = await supabase.from('spaces').select('id').limit(1);
+    if (data && data.length > 0) return; // ya existen
+    const defaults = [
+      { name: 'Gobierno GE', description: 'Noticias y comunicados oficiales del Gobierno de Guinea Ecuatorial', type: 'publico', cover: 'linear-gradient(135deg,#1e3a5f,#0369a1)', emoji: '🏛️', followers_count: 48200 },
+      { name: 'Musica GQ', description: 'Lo mejor de la musica de Guinea Ecuatorial y Africa Central', type: 'comunidad', cover: 'linear-gradient(135deg,#7c3aed,#db2777)', emoji: '🎵', followers_count: 12800 },
+      { name: 'Mercado Malabo', description: 'Compra, vende e intercambia en Guinea Ecuatorial', type: 'comunidad', cover: 'linear-gradient(135deg,#059669,#0d9488)', emoji: '🛒', followers_count: 31500 },
+      { name: 'Deportes GQ', description: 'Futbol, baloncesto y todos los deportes de Guinea Ecuatorial', type: 'publico', cover: 'linear-gradient(135deg,#dc2626,#f59e0b)', emoji: '⚽', followers_count: 22100 },
+      { name: 'Tecnologia GE', description: 'Innovacion, startups y tecnologia en Guinea Ecuatorial', type: 'comunidad', cover: 'linear-gradient(135deg,#1e40af,#7c3aed)', emoji: '💻', followers_count: 8900 },
+    ];
+    await supabase.from('spaces').insert(defaults);
+  } catch {}
+};
+setTimeout(seedDefaultSpaces, 3000);
+
+// GET /api/spaces — listar todos los espacios con estado de seguimiento del usuario
+app.get('/api/spaces', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { data: spaces, error } = await supabase
+      .from('spaces')
+      .select('*')
+      .order('followers_count', { ascending: false });
+    if (error) return res.json([]);
+
+    // Qué espacios sigue el usuario
+    const { data: follows } = await supabase
+      .from('space_follows')
+      .select('space_id')
+      .eq('user_id', userId);
+    const followedIds = new Set((follows || []).map(f => f.space_id));
+
+    res.json((spaces || []).map(s => ({ ...s, following: followedIds.has(s.id) })));
+  } catch (e) { res.json([]); }
+});
+
+// POST /api/spaces — crear espacio
+app.post('/api/spaces', auth, async (req, res) => {
+  try {
+    const { name, description, type, cover, emoji } = req.body;
+    if (!name) return res.status(400).json({ message: 'nombre requerido' });
+    const { data, error } = await supabase
+      .from('spaces')
+      .insert({ name, description, type: type || 'publico', cover, emoji: emoji || '📢', owner_id: req.user.id, followers_count: 1 })
+      .select().single();
+    if (error) throw error;
+    // Auto-seguir al creador
+    await supabase.from('space_follows').insert({ space_id: data.id, user_id: req.user.id }).catch(() => {});
+    res.status(201).json({ ...data, following: true });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/spaces/:id/follow — seguir/dejar de seguir
+app.post('/api/spaces/:id/follow', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const { data: existing } = await supabase
+      .from('space_follows').select('id').eq('space_id', id).eq('user_id', userId).single();
+    if (existing) {
+      await supabase.from('space_follows').delete().eq('space_id', id).eq('user_id', userId);
+      await supabase.from('spaces').update({ followers_count: supabase.rpc ? undefined : 0 }).eq('id', id);
+      await supabase.rpc('exec_sql', { sql: `UPDATE spaces SET followers_count = GREATEST(0, followers_count - 1) WHERE id = '${id}'` }).catch(() => {});
+      res.json({ following: false });
+    } else {
+      await supabase.from('space_follows').insert({ space_id: id, user_id: userId });
+      await supabase.rpc('exec_sql', { sql: `UPDATE spaces SET followers_count = followers_count + 1 WHERE id = '${id}'` }).catch(() => {});
+      res.json({ following: true });
+    }
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// GET /api/spaces/:id/posts — posts de un espacio
+app.get('/api/spaces/:id/posts', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = 20;
+    const offset = (page - 1) * limit;
+
+    const { data: posts } = await supabase
+      .from('space_posts')
+      .select('*')
+      .eq('space_id', id)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (!posts || posts.length === 0) return res.json([]);
+
+    // Datos de autores
+    const authorIds = [...new Set(posts.map(p => p.author_id))];
+    const { data: authors } = await supabase.from('users').select('id, full_name, avatar_url').in('id', authorIds);
+    const authorsMap = {};
+    (authors || []).forEach(a => { authorsMap[a.id] = a; });
+
+    // Likes del usuario actual
+    const postIds = posts.map(p => p.id);
+    const { data: myLikes } = await supabase.from('space_post_likes').select('post_id').eq('user_id', userId).in('post_id', postIds);
+    const likedSet = new Set((myLikes || []).map(l => l.post_id));
+
+    const now = Date.now();
+    res.json(posts.map(p => {
+      const author = authorsMap[p.author_id] || {};
+      const diff = now - new Date(p.created_at).getTime();
+      const timeStr = diff < 60000 ? 'ahora' : diff < 3600000 ? `${Math.floor(diff/60000)}m` : diff < 86400000 ? `${Math.floor(diff/3600000)}h` : `${Math.floor(diff/86400000)}d`;
+      return {
+        id: p.id,
+        author: author.full_name || 'Usuario',
+        avatar: (author.full_name || 'U').split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase(),
+        avatarUrl: author.avatar_url || '',
+        color: '#00c8a0',
+        text: p.text,
+        imageUrl: p.image_url || null,
+        time: timeStr,
+        likes: p.likes_count || 0,
+        comments: p.comments_count || 0,
+        liked: likedSet.has(p.id),
+      };
+    }));
+  } catch (e) { res.json([]); }
+});
+
+// POST /api/spaces/:id/posts — publicar en un espacio
+app.post('/api/spaces/:id/posts', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { text, image_url } = req.body;
+    if (!text?.trim()) return res.status(400).json({ message: 'texto requerido' });
+    const { data, error } = await supabase
+      .from('space_posts')
+      .insert({ space_id: id, author_id: req.user.id, text: text.trim(), image_url: image_url || null })
+      .select().single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/spaces/posts/:postId/like — dar/quitar like
+app.post('/api/spaces/posts/:postId/like', auth, async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const userId = req.user.id;
+    const { data: existing } = await supabase.from('space_post_likes').select('id').eq('post_id', postId).eq('user_id', userId).single();
+    if (existing) {
+      await supabase.from('space_post_likes').delete().eq('post_id', postId).eq('user_id', userId);
+      await supabase.rpc('exec_sql', { sql: `UPDATE space_posts SET likes_count = GREATEST(0, likes_count - 1) WHERE id = '${postId}'` }).catch(() => {});
+      res.json({ liked: false });
+    } else {
+      await supabase.from('space_post_likes').insert({ post_id: postId, user_id: userId });
+      await supabase.rpc('exec_sql', { sql: `UPDATE space_posts SET likes_count = likes_count + 1 WHERE id = '${postId}'` }).catch(() => {});
+      res.json({ liked: true });
+    }
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// GET /api/spaces/posts/:postId/comments — comentarios de un post
+app.get('/api/spaces/posts/:postId/comments', auth, async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const { data: comments } = await supabase
+      .from('space_post_comments')
+      .select('*')
+      .eq('post_id', postId)
+      .order('created_at', { ascending: true });
+    if (!comments || comments.length === 0) return res.json([]);
+    const authorIds = [...new Set(comments.map(c => c.author_id))];
+    const { data: authors } = await supabase.from('users').select('id, full_name, avatar_url').in('id', authorIds);
+    const authorsMap = {};
+    (authors || []).forEach(a => { authorsMap[a.id] = a; });
+    const now = Date.now();
+    res.json(comments.map(c => {
+      const author = authorsMap[c.author_id] || {};
+      const diff = now - new Date(c.created_at).getTime();
+      const timeStr = diff < 60000 ? 'ahora' : diff < 3600000 ? `${Math.floor(diff/60000)}m` : `${Math.floor(diff/3600000)}h`;
+      return { id: c.id, author: author.full_name || 'Usuario', avatar: (author.full_name||'U').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase(), avatarUrl: author.avatar_url||'', text: c.text, time: timeStr };
+    }));
+  } catch (e) { res.json([]); }
+});
+
+// POST /api/spaces/posts/:postId/comments — comentar
+app.post('/api/spaces/posts/:postId/comments', auth, async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const { text } = req.body;
+    if (!text?.trim()) return res.status(400).json({ message: 'texto requerido' });
+    const { data, error } = await supabase
+      .from('space_post_comments')
+      .insert({ post_id: postId, author_id: req.user.id, text: text.trim() })
+      .select().single();
+    if (error) throw error;
+    await supabase.rpc('exec_sql', { sql: `UPDATE space_posts SET comments_count = comments_count + 1 WHERE id = '${postId}'` }).catch(() => {});
+    const { data: author } = await supabase.from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
+    res.status(201).json({ id: data.id, author: author?.full_name || 'Usuario', avatar: (author?.full_name||'U').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase(), avatarUrl: author?.avatar_url||'', text: data.text, time: 'ahora' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// DELETE /api/spaces/posts/:postId — eliminar post (solo autor o admin del espacio)
+app.delete('/api/spaces/posts/:postId', auth, async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const { error } = await supabase.from('space_posts').delete().eq('id', postId).eq('author_id', req.user.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════════
 // STORIES / ESTADOS
 // ════════════════════════════════════════════════════════════════════
 
