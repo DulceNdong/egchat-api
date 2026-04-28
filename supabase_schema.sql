@@ -71,6 +71,34 @@ CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_a
 CREATE INDEX IF NOT EXISTS idx_lia_conversations_user_id ON lia_conversations(user_id);
 CREATE INDEX IF NOT EXISTS idx_contacts_user_id ON contacts(user_id);
 
+-- Tabla de noticias del gobierno
+CREATE TABLE IF NOT EXISTS government_news (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  title TEXT NOT NULL,
+  url TEXT UNIQUE NOT NULL,
+  source VARCHAR(100) NOT NULL,
+  color VARCHAR(20) DEFAULT '#0369a1',
+  category VARCHAR(50),
+  scraped_at TIMESTAMPTZ DEFAULT NOW(),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Tabla de suscripciones push
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  subscription JSONB NOT NULL,
+  active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indices
+CREATE INDEX IF NOT EXISTS idx_government_news_scraped_at ON government_news(scraped_at DESC);
+CREATE INDEX IF NOT EXISTS idx_government_news_source ON government_news(source);
+CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user_id ON push_subscriptions(user_id);
+CREATE INDEX IF NOT EXISTS idx_push_subscriptions_active ON push_subscriptions(active);
+
 -- Codigos de recarga de prueba
 INSERT INTO recharge_codes (code, amount, expires_at) VALUES
   ('1234-5678-9012-3456', 5000,  NOW() + INTERVAL '1 year'),
