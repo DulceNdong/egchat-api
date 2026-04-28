@@ -368,6 +368,93 @@ app.put('/api/auth/profile', auth, async (req, res) => {
 
 app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'Sesión cerrada' }));
 
+// ── Recuperación de contraseña ────────────────────────────────────────────────
+// Almacén temporal en memoria: { phone -> { code, expiresAt } }
+const resetCodes = new Map();
+
+app.post('/api/auth/send-verification', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ message: 'Teléfono requerido' });
+
+    // Verificar que el usuario existe
+    const { data: user } = await supabase.from('users').select('id').eq('phone', phone).maybeSingle();
+    if (!user) return res.status(404).json({ message: 'No existe ninguna cuenta con ese número' });
+
+    // Generar código de 6 dígitos
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    resetCodes.set(phone, { code, expiresAt: Date.now() + 10 * 60 * 1000 }); // 10 min
+
+    // Intentar enviar SMS via Twilio si está configurado
+    try {
+      const accountSid = process.env.TWILIO_ACCOUNT_SID;
+      const authToken  = process.env.TWILIO_AUTH_TOKEN;
+      const fromPhone  = process.env.TWILIO_PHONE;
+      if (accountSid && authToken && fromPhone) {
+        const twilio = require('twilio')(accountSid, authToken);
+        await twilio.messages.create({
+          body: `Tu código de recuperación EGCHAT es: ${code}. Válido 10 minutos.`,
+          from: fromPhone,
+          to: phone,
+        });
+      }
+    } catch (smsErr) {
+      console.warn('SMS no enviado (Twilio no configurado):', smsErr.message);
+    }
+
+    console.log(`[RESET] Código para ${phone}: ${code}`);
+    res.json({ sent: true, message: 'Código enviado' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.post('/api/auth/verify-code', async (req, res) => {
+  try {
+    const { phone, code } = req.body;
+    if (!phone || !code) return res.status(400).json({ message: 'Teléfono y código requeridos' });
+
+    const entry = resetCodes.get(phone);
+    if (!entry) return res.status(400).json({ verified: false, message: 'No hay código activo para este número' });
+    if (Date.now() > entry.expiresAt) {
+      resetCodes.delete(phone);
+      return res.status(400).json({ verified: false, message: 'El código ha expirado. Solicita uno nuevo.' });
+    }
+    if (entry.code !== String(code)) return res.status(400).json({ verified: false, message: 'Código incorrecto' });
+
+    res.json({ verified: true });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { phone, code, newPassword } = req.body;
+    if (!phone || !code || !newPassword) return res.status(400).json({ message: 'Faltan datos' });
+    if (newPassword.length < 6) return res.status(400).json({ message: 'La contraseña debe tener al menos 6 caracteres' });
+
+    // Verificar código
+    const entry = resetCodes.get(phone);
+    if (!entry) return res.status(400).json({ message: 'Código no válido o expirado' });
+    if (Date.now() > entry.expiresAt) {
+      resetCodes.delete(phone);
+      return res.status(400).json({ message: 'El código ha expirado. Solicita uno nuevo.' });
+    }
+    if (entry.code !== String(code)) return res.status(400).json({ message: 'Código incorrecto' });
+
+    // Actualizar contraseña
+    const hash = await bcrypt.hash(newPassword, 10);
+    const { error } = await supabase.from('users').update({ password_hash: hash }).eq('phone', phone);
+    if (error) throw error;
+
+    resetCodes.delete(phone); // invalidar código usado
+    res.json({ success: true, message: 'Contraseña actualizada correctamente' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // ════════════════════════════════════════════════════════════════════
 // CONTACTOS
 // ════════════════════════════════════════════════════════════════════
