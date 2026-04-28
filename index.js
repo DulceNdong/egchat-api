@@ -4228,9 +4228,11 @@ const NOTICIAS_FALLBACK = [
   { title: 'Guinea Ecuatorial anuncia oficialmente el cambio de capital de Malabo a Ciudad de la Paz', url: 'https://primatura.gob.gq/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Gobierno', publishedAt: '2026-01-03' },
   { title: 'El Papa Leon XIV visita Guinea Ecuatorial en la ultima etapa de su gira africana', url: 'https://primatura.gob.gq/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Internacional', publishedAt: '2026-04-21' },
   { title: 'Turquia amplia estrategia portuaria en Africa: Alport asume los puertos de Malabo y Bata', url: 'https://primatura.gob.gq/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Economia', publishedAt: '2026-04-20' },
-  { title: 'TGS desarrollara datos sismicos actualizados para Guinea Ecuatorial', url: 'https://primatura.gob.gq/', fuente: 'Guinea Ecuatorial Press', dominio: 'guineaecuatorialpress.com', color: '#0369a1', category: 'Energia', publishedAt: '2026-04-18' },
+  { title: 'TGS desarrollara datos sismicos actualizados para Guinea Ecuatorial', url: 'https://www.guineaecuatorialpress.com/', fuente: 'Guinea Ecuatorial Press', dominio: 'guineaecuatorialpress.com', color: '#0369a1', category: 'Energia', publishedAt: '2026-04-18' },
   { title: 'Nuevo programa de becas universitarias 2026: plazo de solicitud hasta el 30 de abril', url: 'https://primatura.gob.gq/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Educacion', publishedAt: '2026-04-10' },
   { title: 'Plan Nacional de Empleo Juvenil 2026: 10.000 puestos de trabajo para jovenes guineanos', url: 'https://primatura.gob.gq/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Empleo', publishedAt: '2026-03-20' },
+  { title: 'Vicepresidencia lanza programa de digitalizacion de servicios publicos en Guinea Ecuatorial', url: 'https://www.lavicepress.com/', fuente: 'La Vice Press', dominio: 'lavicepress.com', color: '#0d9488', category: 'Tecnologia', publishedAt: '2026-04-15' },
+  { title: 'Presidencia del Gobierno aprueba nuevo plan de infraestructuras para Bata y Malabo', url: 'https://www.presidenciagobierno.gq/', fuente: 'Presidencia GQ', dominio: 'presidenciagobierno.gq', color: '#1e3a5f', category: 'Infraestructura', publishedAt: '2026-04-12' },
 ];
 
 app.get('/api/noticias/gobierno', async (req, res) => {
