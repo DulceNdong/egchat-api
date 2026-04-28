@@ -3552,6 +3552,32 @@ app.delete('/api/stories/:storyId', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
+// PATCH /api/stories/:storyId/slide/:idx — editar contenido de un slide
+app.patch('/api/stories/:storyId/slide/:idx', auth, async (req, res) => {
+  try {
+    const { storyId, idx } = req.params;
+    const slideIdx = parseInt(idx);
+    const { content, bg, emoji, music } = req.body;
+    const { data: story, error: fetchErr } = await supabase
+      .from('stories').select('media').eq('id', storyId).eq('user_id', req.user.id).single();
+    if (fetchErr || !story) return res.status(404).json({ message: 'Story no encontrada' });
+    let media = story.media;
+    if (typeof media === 'string') { try { media = JSON.parse(media); } catch { media = []; } }
+    if (!Array.isArray(media) || slideIdx < 0 || slideIdx >= media.length)
+      return res.status(400).json({ message: 'Slide no existe' });
+    const updated = media.map((s, i) => i === slideIdx ? {
+      ...s,
+      ...(content !== undefined ? { content } : {}),
+      ...(bg !== undefined ? { bg } : {}),
+      ...(emoji !== undefined ? { emoji } : {}),
+      ...(music !== undefined ? { music } : {}),
+    } : s);
+    const { error: updateErr } = await supabase.from('stories').update({ media: updated }).eq('id', storyId);
+    if (updateErr) throw updateErr;
+    res.json({ ok: true, media: updated });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
 app.post('/api/stories/:storyId/view', auth, async (req, res) => {
   try {
     const { data: s } = await supabase.from('stories').select('views').eq('id', req.params.storyId).single();
