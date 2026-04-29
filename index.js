@@ -3175,18 +3175,6 @@ app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
 
-    // Verificar que el usuario tiene acceso al chat
-    const { data: myParticipant } = await supabase
-      .from('chat_participants')
-      .select('*')
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.id)
-      .single();
-
-    if (!myParticipant) {
-      return res.status(403).json({ message: 'No tienes acceso a este chat' });
-    }
-
     // Obtener todos los participantes con su información de usuario
     const { data: participants, error } = await supabase
       .from('chat_participants')
