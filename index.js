@@ -780,8 +780,6 @@ app.post('/api/chats/group', auth, async (req, res) => {
     const participantRows = participant_ids.map(uid => ({
       chat_id: chat.id,
       user_id: uid,
-      role: uid === req.user.id ? 'admin' : 'member',
-      joined_at: new Date().toISOString(),
     }));
     await supabase.from('chat_participants').insert(participantRows);
 
