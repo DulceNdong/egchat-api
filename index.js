@@ -3154,13 +3154,132 @@ app.post('/api/lia/transcribe', auth, async (_req, res) => {
 // ════════════════════════════════════════════════════════════════════
 // GRUPOS DE CHAT
 // ════════════════════════════════════════════════════════════════════
-// AÁƒÂ±adir participante a grupo
+// Añadir participante a grupo
 app.post('/api/chats/:chatId/participants', auth, async (req, res) => {
   try {
     const { user_id } = req.body;
     await supabase.from('chat_participants').upsert({ chat_id: req.params.chatId, user_id });
-    res.json({ message: 'Participante aÁƒÂ±adido' });
+    res.json({ message: 'Participante añadido' });
   } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// Obtener lista de participantes de un grupo con información completa
+app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    // Verificar que el usuario tiene acceso al chat
+    const { data: myParticipant } = await supabase
+      .from('chat_participants')
+      .select('*')
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (!myParticipant) {
+      return res.status(403).json({ message: 'No tienes acceso a este chat' });
+    }
+
+    // Obtener todos los participantes con su información de usuario
+    const { data: participants, error } = await supabase
+      .from('chat_participants')
+      .select('role, joined_at, user_id')
+      .eq('chat_id', chatId)
+      .is('left_at', null);
+
+    if (error) throw error;
+
+    // Obtener info de usuarios
+    const userIds = participants.map(p => p.user_id);
+    const { data: users, error: usersError } = await supabase
+      .from('users')
+      .select('id, phone, full_name, avatar_url, online_status, last_seen')
+      .in('id', userIds);
+
+    if (usersError) throw usersError;
+
+    const usersMap = {};
+    (users || []).forEach(u => { usersMap[u.id] = u; });
+
+    const formattedParticipants = participants.map(p => {
+      const u = usersMap[p.user_id] || {};
+      return {
+        id: p.user_id,
+        user_id: p.user_id,
+        phone: u.phone,
+        full_name: u.full_name,
+        avatar_url: u.avatar_url,
+        online_status: u.online_status,
+        last_seen: u.last_seen,
+        role: p.role,
+        joined_at: p.joined_at
+      };
+    });
+
+    res.json(formattedParticipants);
+  } catch (e) {
+    console.error('Get participants error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Guardar fondo de chat personalizado (individual por usuario, no afecta a otros)
+app.post('/api/chats/:chatId/wallpaper', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { wallpaper_type, wallpaper_value, wallpaper_settings } = req.body;
+
+    const { data, error } = await supabase
+      .from('chat_participants')
+      .upsert({
+        chat_id: chatId,
+        user_id: req.user.id,
+        wallpaper_type: wallpaper_type || 'default',
+        wallpaper_value: wallpaper_value || null,
+        wallpaper_settings: wallpaper_settings || null
+      }, { onConflict: 'chat_id,user_id' })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      message: 'Fondo guardado correctamente',
+      wallpaper: {
+        wallpaper_type: data.wallpaper_type,
+        wallpaper_value: data.wallpaper_value,
+        wallpaper_settings: data.wallpaper_settings
+      }
+    });
+  } catch (e) {
+    console.error('Save wallpaper error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Obtener fondo de chat del usuario actual (solo el suyo, no el de otros)
+app.get('/api/chats/:chatId/wallpaper', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    const { data, error } = await supabase
+      .from('chat_participants')
+      .select('wallpaper_type, wallpaper_value, wallpaper_settings')
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (error && error.code !== 'PGRST116') throw error;
+
+    if (!data) {
+      return res.json({ wallpaper_type: 'default', wallpaper_value: null, wallpaper_settings: null });
+    }
+
+    res.json(data);
+  } catch (e) {
+    console.error('Get wallpaper error:', e);
+    res.status(500).json({ message: e.message });
+  }
 });
 
 // ════════════════════════════════════════════════════════════════════
