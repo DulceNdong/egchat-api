@@ -3190,11 +3190,11 @@ app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
     // Obtener todos los participantes con su información de usuario
     const { data: participants, error } = await supabase
       .from('chat_participants')
-      .select('role, joined_at, user_id')
-      .eq('chat_id', chatId)
-      .is('left_at', null);
+      .select('user_id')
+      .eq('chat_id', chatId);
 
     if (error) throw error;
+    if (!participants || participants.length === 0) return res.json([]);
 
     // Obtener info de usuarios
     const userIds = participants.map(p => p.user_id);
