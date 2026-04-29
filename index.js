@@ -3218,7 +3218,7 @@ app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
         avatar_url: u.avatar_url,
         online_status: u.online_status,
         last_seen: u.last_seen,
-        role: p.role,
+        role: p.user_id === req.user.id ? 'admin' : 'member',
         joined_at: p.joined_at
       };
     });
