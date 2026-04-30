@@ -1,5 +1,8 @@
-// dotenv solo en local (en Render las vars vienen del dashboard)
-try { require('dotenv').config(); } catch(e) {}
+﻿// Cargar variables de entorno (solo en local, en Render vienen del dashboard)
+try { 
+  const dotenv = require('dotenv');
+  dotenv.config();
+} catch(e) {}
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -8,10 +11,21 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || 'egchat_secret_2026';
-const packageInfo = require('./package.json');
-const APP_VERSION = process.env.APP_VERSION || packageInfo.version || '2.5.0';
+const JWT_SECRET = process.env.JWT_SECRET || 'EGchat2025!xK9mP3nQ7rL2vW8tY4uJ6hF1bN5cA0dE_prod_secret';
+const JWT_SECRET_FALLBACK = 'EGchat2025!xK9mP3nQ7rL2vW8tY4uJ6hF1bN5cA0dE_prod_secret';
+console.log('JWT_SECRET source:', process.env.JWT_SECRET ? 'environment' : 'fallback');
+
+// Verificar token con múltiples secrets para compatibilidad
+const verifyToken = (token) => {
+  const secrets = [JWT_SECRET, JWT_SECRET_FALLBACK].filter((s, i, arr) => arr.indexOf(s) === i);
+  for (const secret of secrets) {
+    try { return jwt.verify(token, secret); } catch {}
+  }
+  throw new Error('Token inválido o expirado');
+};
+const APP_VERSION = '2.5.0';
 const chatStreams = new Map();
+const dependencyCache = { timestamp: 0, result: null };
 
 // --- Supabase ---------------------------------------------------------
 const supabase = createClient(
@@ -19,15 +33,48 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY || ''
 );
 
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'https://egchat-app.vercel.app,https://egchat-v2.vercel.app,http://localhost:5173,http://localhost:3001,http://localhost:3000,http://127.0.0.1:3001')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Permitir sin origin (Electron file://, apps móviles, Postman)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // Permitir cualquier localhost en desarrollo
+    if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true);
+    // Permitir cualquier subdominio de vercel.app (egchat-v2, egchat-app, etc.)
+    if (/^https:\/\/egchat.*\.vercel\.app$/.test(origin)) return callback(null, true);
+    return callback(new Error('CORS policy: origin not allowed'));
+  },
+  credentials: true,
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // Handle preflight for all routes
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // --- Middleware auth --------------------------------------------------
+const parseBearerToken = (header) => {
+  if (typeof header !== 'string') return '';
+  const match = header.match(/^\s*Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : '';
+};
+
 const auth = (req, res, next) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
+  // Intentar obtener token de múltiples fuentes
+  const authHeader = parseBearerToken(req.headers.authorization);
+  const xAuthToken = req.headers['x-auth-token'] || '';
+  const queryToken = typeof req.query._t === 'string' ? req.query._t : '';
+  const token = authHeader || xAuthToken || queryToken;
   if (!token) return res.status(401).json({ message: 'Token requerido' });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    req.user = verifyToken(token);
     next();
   } catch {
     res.status(401).json({ message: 'Token inválido o expirado' });
@@ -36,11 +83,13 @@ const auth = (req, res, next) => {
 
 const authFromQuery = (req, res, next) => {
   const tokenFromQuery = typeof req.query.token === 'string' ? req.query.token : '';
-  const tokenFromHeader = req.headers.authorization?.replace('Bearer ', '') || '';
-  const token = tokenFromQuery || tokenFromHeader;
+  const tokenFromHeader = parseBearerToken(req.headers.authorization);
+  const xAuthToken = req.headers['x-auth-token'] || '';
+  const queryT = typeof req.query._t === 'string' ? req.query._t : '';
+  const token = tokenFromQuery || tokenFromHeader || xAuthToken || queryT;
   if (!token) return res.status(401).json({ message: 'Token requerido' });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    req.user = verifyToken(token);
     next();
   } catch {
     res.status(401).json({ message: 'Token inválido o expirado' });
@@ -64,17 +113,14 @@ const emitToUsers = (userIds, payload) => {
   uniq.forEach((id) => emitToUser(id, payload));
 };
 
-const adminResetKey = process.env.ADMIN_RESET_KEY;
-if (!adminResetKey) {
-  throw new Error('ADMIN_RESET_KEY environment variable is required');
-}
+const adminResetKey = process.env.ADMIN_RESET_KEY || JWT_SECRET;
 const ADMIN_RESET_MARKER = '00000000-0000-0000-0000-000000000000';
 const resetTable = async (table, column = 'id') => {
   try {
     const query = supabase.from(table).delete();
     const { error } = (column === 'id')
       ? await query.neq('id', ADMIN_RESET_MARKER)
-      : await query;
+      : await query.not(column, 'is', null);
     if (error) return { table, ok: false, error: error.message };
     return { table, ok: true };
   } catch (e) {
@@ -92,28 +138,83 @@ const checkTable = async (table) => {
   }
 };
 
-const registerAdminRoutes = require('./adminRoutes');
-registerAdminRoutes(app, supabase, adminResetKey, APP_VERSION, resetTable);
+// --- ADMIN ROUTES (inline) -------------------------------------------
+app.post('/api/admin/reset-all', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.body?.adminKey;
+  if (!key || key !== adminResetKey) return res.status(403).json({ message: 'No autorizado' });
+  const results = [];
+  results.push(await resetTable('message_reads', 'read_at'));
+  results.push(await resetTable('messages', 'created_at'));
+  results.push(await resetTable('chat_participants', 'joined_at'));
+  results.push(await resetTable('chats', 'created_at'));
+  results.push(await resetTable('contacts', 'created_at'));
+  results.push(await resetTable('transactions', 'created_at'));
+  results.push(await resetTable('recharge_codes', 'created_at'));
+  results.push(await resetTable('user_news_favorites', 'created_at'));
+  results.push(await resetTable('insurance_claims', 'created_at'));
+  results.push(await resetTable('insurance_policies', 'created_at'));
+  results.push(await resetTable('lia_conversations', 'created_at'));
+  results.push(await resetTable('wallets', 'created_at'));
+  results.push(await resetTable('notifications', 'created_at'));
+  results.push(await resetTable('users', 'created_at'));
+  return res.json({ message: 'Reset ejecutado', ok_tables: results.filter(r=>r.ok).map(r=>r.table), failed: results.filter(r=>!r.ok) });
+});
+
+app.post('/api/admin/users/update-version', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.body?.adminKey;
+  if (!key || key !== adminResetKey) return res.status(403).json({ message: 'No autorizado' });
+  const version = typeof req.body?.version === 'string' ? req.body.version : APP_VERSION;
+  try {
+    const { error } = await supabase.from('users').update({ app_version: version });
+    if (error) return res.status(500).json({ message: 'No se pudo actualizar', detail: error.message });
+    return res.json({ message: 'Versiones actualizadas', version });
+  } catch (e) {
+    return res.status(500).json({ message: 'Error interno', detail: e.message });
+  }
+});
+
+// Reset contraseña por admin
+app.post('/api/admin/reset-password', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.body?.adminKey;
+  if (!key || key !== adminResetKey) return res.status(403).json({ message: 'No autorizado' });
+  const { phone, newPassword } = req.body;
+  if (!phone || !newPassword) return res.status(400).json({ message: 'phone y newPassword requeridos' });
+  const hashed = await bcrypt.hash(newPassword, 10);
+  const { data, error } = await supabase.from('users').update({ password_hash: hashed }).eq('phone', phone).select('id, phone, full_name').single();
+  if (error || !data) return res.status(404).json({ message: 'Usuario no encontrado', error: error?.message });
+  res.json({ message: 'Contrasena reseteada', user: data });
+});
 
 // --- ROOT -------------------------------------------------------------
 app.get('/', (req, res) => res.json({
   message: 'EGCHAT API funcionando!',
-  version: '2.5.0',
+  version: APP_VERSION,
   database: 'Supabase',
   status: 'active'
 }));
 
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
+app.get('/jwt-debug', (req, res) => res.json({
+  jwt_secret_source: process.env.JWT_SECRET ? 'environment' : 'fallback',
+  jwt_secret_first10: JWT_SECRET.substring(0, 10),
+  jwt_secret_length: JWT_SECRET.length,
+}));
+
 app.get('/debug', (req, res) => res.json({
-  supabase_url: process.env.SUPABASE_URL ? '✅ set' : '❌ missing',
-  supabase_key: process.env.SUPABASE_SERVICE_KEY ? '✅ set' : '❌ missing',
-  jwt_secret: process.env.JWT_SECRET ? '✅ set' : '❌ missing',
+  supabase_url: process.env.SUPABASE_URL ? 'âœ… set' : 'âŒ missing',
+  supabase_key: process.env.SUPABASE_SERVICE_KEY ? 'âœ… set' : 'âŒ missing',
+  jwt_secret: process.env.JWT_SECRET ? 'âœ… set' : 'âŒ missing',
   node_env: process.env.NODE_ENV || 'not set',
   port: PORT
 }));
 
 app.get('/api/system/dependencies', async (_req, res) => {
+  const now = Date.now();
+  if (dependencyCache.result && now - dependencyCache.timestamp < 60000) {
+    return res.json(dependencyCache.result);
+  }
+
   const required = [
     'users',
     'wallets',
@@ -136,13 +237,17 @@ app.get('/api/system/dependencies', async (_req, res) => {
   ];
   const checks = await Promise.all(required.map(checkTable));
   const missing = checks.filter((c) => !c.ok);
-  res.json({
+  const payload = {
     ok: missing.length === 0,
     required_tables: required.length,
     ready_tables: checks.filter((c) => c.ok).length,
     missing,
     hint: missing.length ? 'Ejecuta egchat-api/full_dependencies.sql en Supabase SQL Editor.' : 'Backend listo y sincronizado.'
-  });
+  };
+
+  dependencyCache.timestamp = now;
+  dependencyCache.result = payload;
+  res.json(payload);
 });
 
 // Stream SSE para mensajería en tiempo real
@@ -177,12 +282,14 @@ app.get('/api/chat/stream', authFromQuery, (req, res) => {
 });
 
 // AUTH
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { phone, password, full_name, avatar_url } = req.body;
-    if (!phone || !password || !full_name || !avatar_url)
-      return res.status(400).json({ message: 'phone, password, full_name y avatar_url son requeridos' });
+    if (!phone || !password || !full_name)
+      return res.status(400).json({ message: 'phone, password y full_name son requeridos' });
+
+    const profileAvatar = avatar_url || null;
 
     // Verificar si ya existe
     const { data: existing } = await supabase
@@ -192,7 +299,7 @@ app.post('/api/auth/register', async (req, res) => {
     const hashed = await bcrypt.hash(password, 10);
     const { data: user, error } = await supabase
       .from('users')
-      .insert({ phone, full_name, password_hash: hashed, avatar_url })
+      .insert({ phone, full_name, password_hash: hashed, avatar_url: profileAvatar })
       .select('id, phone, full_name, avatar_url')
       .single();
 
@@ -202,10 +309,21 @@ app.post('/api/auth/register', async (req, res) => {
     await supabase.from('wallets').insert({ user_id: user.id, balance: 5000, currency: 'XAF' });
 
     const token = jwt.sign({ id: user.id, phone }, JWT_SECRET, { expiresIn: '30d' });
-    res.status(201).json({ token, user });
+    res.status(201).json({ token, user: { ...user, app_version: APP_VERSION } });
   } catch (e) {
     console.error('Register error:', e);
     res.status(500).json({ message: e.message });
+  }
+});
+
+app.post('/api/auth/check-phone', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.json({ exists: false });
+    const { data } = await supabase.from('users').select('id').eq('phone', phone).maybeSingle();
+    res.json({ exists: !!data });
+  } catch {
+    res.json({ exists: false }); // En caso de error, dejar continuar
   }
 });
 
@@ -223,11 +341,13 @@ app.post('/api/auth/login', async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ message: 'Credenciales incorrectas' });
 
-    // Actualizar último acceso
-    await supabase.from('users').update({ last_login: new Date().toISOString() }).eq('id', user.id);
+    // Actualizar último acceso (ignorar si la columna no existe)
+    try {
+      await supabase.from('users').update({ last_login: new Date().toISOString() }).eq('id', user.id);
+    } catch {}
 
     const token = jwt.sign({ id: user.id, phone }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token, user: { id: user.id, phone: user.phone, full_name: user.full_name, avatar_url: user.avatar_url } });
+    res.json({ token, user: { id: user.id, phone: user.phone, full_name: user.full_name, avatar_url: user.avatar_url, app_version: user.app_version || APP_VERSION } });
   } catch (e) {
     console.error('Login error:', e);
     res.status(500).json({ message: e.message });
@@ -238,7 +358,7 @@ app.get('/api/auth/me', auth, async (req, res) => {
   const { data: user } = await supabase
     .from('users').select('id, phone, full_name, avatar_url, created_at').eq('id', req.user.id).single();
   if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
-  res.json(user);
+  res.json({ ...user, app_version: APP_VERSION });
 });
 
 app.put('/api/auth/profile', auth, async (req, res) => {
@@ -259,72 +379,98 @@ app.put('/api/auth/profile', auth, async (req, res) => {
 
 app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'Sesión cerrada' }));
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ── Recuperación de contraseña ────────────────────────────────────────────────
+// Almacén temporal en memoria: { phone -> { code, expiresAt } }
+const resetCodes = new Map();
+
+app.post('/api/auth/send-verification', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ message: 'Teléfono requerido' });
+
+    // Verificar que el usuario existe
+    const { data: user } = await supabase.from('users').select('id').eq('phone', phone).maybeSingle();
+    if (!user) return res.status(404).json({ message: 'No existe ninguna cuenta con ese número' });
+
+    // Generar código de 6 dígitos
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    resetCodes.set(phone, { code, expiresAt: Date.now() + 10 * 60 * 1000 }); // 10 min
+
+    // Intentar enviar SMS via Twilio si está configurado
+    try {
+      const accountSid = process.env.TWILIO_ACCOUNT_SID;
+      const authToken  = process.env.TWILIO_AUTH_TOKEN;
+      const fromPhone  = process.env.TWILIO_PHONE;
+      if (accountSid && authToken && fromPhone) {
+        const twilio = require('twilio')(accountSid, authToken);
+        await twilio.messages.create({
+          body: `Tu código de recuperación EGCHAT es: ${code}. Válido 10 minutos.`,
+          from: fromPhone,
+          to: phone,
+        });
+      }
+    } catch (smsErr) {
+      console.warn('SMS no enviado (Twilio no configurado):', smsErr.message);
+    }
+
+    console.log(`[RESET] Código para ${phone}: ${code}`);
+    res.json({ sent: true, message: 'Código enviado' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.post('/api/auth/verify-code', async (req, res) => {
+  try {
+    const { phone, code } = req.body;
+    if (!phone || !code) return res.status(400).json({ message: 'Teléfono y código requeridos' });
+
+    const entry = resetCodes.get(phone);
+    if (!entry) return res.status(400).json({ verified: false, message: 'No hay código activo para este número' });
+    if (Date.now() > entry.expiresAt) {
+      resetCodes.delete(phone);
+      return res.status(400).json({ verified: false, message: 'El código ha expirado. Solicita uno nuevo.' });
+    }
+    if (entry.code !== String(code)) return res.status(400).json({ verified: false, message: 'Código incorrecto' });
+
+    res.json({ verified: true });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { phone, code, newPassword } = req.body;
+    if (!phone || !code || !newPassword) return res.status(400).json({ message: 'Faltan datos' });
+    if (newPassword.length < 6) return res.status(400).json({ message: 'La contraseña debe tener al menos 6 caracteres' });
+
+    // Verificar código
+    const entry = resetCodes.get(phone);
+    if (!entry) return res.status(400).json({ message: 'Código no válido o expirado' });
+    if (Date.now() > entry.expiresAt) {
+      resetCodes.delete(phone);
+      return res.status(400).json({ message: 'El código ha expirado. Solicita uno nuevo.' });
+    }
+    if (entry.code !== String(code)) return res.status(400).json({ message: 'Código incorrecto' });
+
+    // Actualizar contraseña
+    const hash = await bcrypt.hash(newPassword, 10);
+    const { error } = await supabase.from('users').update({ password_hash: hash }).eq('phone', phone);
+    if (error) throw error;
+
+    resetCodes.delete(phone); // invalidar código usado
+    res.json({ success: true, message: 'Contraseña actualizada correctamente' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
 // CONTACTOS
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-app.get('/api/contacts', auth, async (req, res) => {
-  try {
-    const { data: contacts } = await supabase
-      .from('contacts')
-      .select('id, contact_user_id, name, phone, is_blocked, created_at, users(id, phone, full_name, avatar_url)')
-      .eq('user_id', req.user.id)
-      .order('created_at', { ascending: false });
-    res.json(contacts || []);
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.post('/api/contacts', auth, async (req, res) => {
-  try {
-    const { contact_user_id, name, phone } = req.body;
-    // Verificar que no sea el mismo usuario
-    if (contact_user_id === req.user.id) return res.status(400).json({ message: 'No puedes agregarte a ti mismo como contacto' });
-    
-    const { data: contact, error } = await supabase
-      .from('contacts')
-      .insert({ user_id: req.user.id, contact_user_id, name: name || '', phone })
-      .select('id, contact_user_id, name, phone, created_at')
-      .single();
-    if (error) throw error;
-    res.status(201).json(contact);
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.delete('/api/contacts/:contactId', auth, async (req, res) => {
-  try {
-    const { error } = await supabase
-      .from('contacts')
-      .delete()
-      .eq('id', req.params.contactId)
-      .eq('user_id', req.user.id);
-    if (error) throw error;
-    res.json({ message: 'Contacto eliminado' });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.post('/api/contacts/:contactId/block', auth, async (req, res) => {
-  try {
-    const { data: contact, error } = await supabase
-      .from('contacts')
-      .update({ is_blocked: true })
-      .eq('id', req.params.contactId)
-      .eq('user_id', req.user.id)
-      .select('id, is_blocked')
-      .single();
-    if (error) throw error;
-    res.json(contact);
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
+// ════════════════════════════════════════════════════════════════════
 // ========================================================================
-// CHAT / MENSAJERÍA COMPLETA
+// CHAT / MENSAJERÁA COMPLETA
 // ========================================================================
 
 // Obtener todos los chats del usuario
@@ -353,29 +499,36 @@ app.get('/api/chats', auth, async (req, res) => {
 
     if (!chats) return res.json([]);
 
-    // Para cada chat, obtener participantes y Ãºltimo mensaje
-    const result = await Promise.all(chats.map(async (chat) => {
-      const { data: parts } = await supabase
-        .from('chat_participants')
-        .select('user_id, users(id, phone, full_name)')
-        .eq('chat_id', chat.id);
-
-      const { data: lastMsgs } = await supabase
-        .from('messages')
-        .select('id, text, type, created_at, sender_id')
-        .eq('chat_id', chat.id)
+    const [{ data: participants }, { data: messages }] = await Promise.all([
+      supabase.from('chat_participants')
+        .select('chat_id, user_id, users(id, phone, full_name, avatar_url)')
+        .in('chat_id', chatIds),
+      supabase.from('messages')
+        .select('id, text, type, created_at, sender_id, chat_id')
+        .in('chat_id', chatIds)
         .order('created_at', { ascending: false })
-        .limit(1);
+    ]);
 
-      return {
-        id: chat.id,
-        type: chat.type || 'private',
-        name: chat.name,
-        participants: parts || [],
-        last_message: lastMsgs?.[0] || null,
-        updated_at: chat.updated_at,
-        unread_count: 0
-      };
+    const participantsByChat = (participants || []).reduce((acc, part) => {
+      const chatId = part.chat_id;
+      if (!acc[chatId]) acc[chatId] = [];
+      acc[chatId].push(part);
+      return acc;
+    }, {});
+
+    const lastMessageByChat = (messages || []).reduce((acc, message) => {
+      if (!acc[message.chat_id]) acc[message.chat_id] = message;
+      return acc;
+    }, {});
+
+    const result = chats.map(chat => ({
+      id: chat.id,
+      type: chat.type || 'private',
+      name: chat.name,
+      participants: participantsByChat[chat.id] || [],
+      last_message: lastMessageByChat[chat.id] || null,
+      updated_at: chat.updated_at,
+      unread_count: 0
     }));
 
     res.json(result);
@@ -385,7 +538,7 @@ app.get('/api/chats', auth, async (req, res) => {
   }
 });
 
-// Obtener mensajes de un chat especÃ­fico
+// Obtener mensajes de un chat especÁƒÂ­fico
 app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
@@ -410,7 +563,16 @@ app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
       .order('created_at', { ascending: false })
       .range(from, from + limit - 1);
 
-    res.json((messages || []).reverse());
+    // Filtrar mensajes que el usuario eliminó para sí mismo
+    const { data: deletions } = await supabase
+      .from('message_deletions')
+      .select('message_id')
+      .eq('user_id', req.user.id);
+
+    const deletedIds = new Set((deletions || []).map((d) => d.message_id));
+    const filtered = (messages || []).filter(m => !deletedIds.has(m.id));
+
+    res.json(filtered.reverse());
   } catch (e) {
     console.error('Get messages error:', e.message);
     res.json([]);
@@ -447,6 +609,22 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
       const targetUsers = (parts || []).map((p) => p.user_id);
       emitToUsers(targetUsers, { type: 'new_message', chatId, message });
       emitToUsers(targetUsers, { type: 'chat_updated', chatId, ts: Date.now() });
+
+      // Enviar Web Push a usuarios que no son el remitente
+      const otherUsers = targetUsers.filter(uid => String(uid) !== String(req.user.id));
+      // Obtener nombre del remitente
+      const { data: sender } = await supabase
+        .from('users').select('full_name').eq('id', req.user.id).single();
+      const senderName = sender?.full_name || 'Alguien';
+      const pushPayload = {
+        title: senderName,
+        body: message.type === 'text' ? (message.text || 'Nuevo mensaje') : '📎 Archivo adjunto',
+        icon: '/favicon.svg',
+        tag: `chat-${chatId}`,
+        url: '/',
+        chatId,
+      };
+      await Promise.allSettled(otherUsers.map(uid => sendPushToUser(uid, pushPayload)));
     } catch {}
 
     res.status(201).json(message);
@@ -457,7 +635,7 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
 });
 
 // Crear chat privado
-// Crear chat privado â€” usa chat_participants
+// Crear chat privado ââ‚¬â€ usa chat_participants
 app.post('/api/chats/private', auth, async (req, res) => {
   try {
     const { participant_id, phone } = req.body;
@@ -471,7 +649,7 @@ app.post('/api/chats/private', auth, async (req, res) => {
         .single();
 
       if (userError || !found) {
-        return res.status(404).json({ message: 'Usuario no encontrado con ese número' });
+        return res.status(404).json({ message: 'Usuario no encontrado con ese nÁºmero' });
       }
 
       targetId = found.id;
@@ -598,6 +776,13 @@ app.post('/api/chats/group', auth, async (req, res) => {
 
     if (createError) throw createError;
 
+    // Insertar participantes en chat_participants para que aparezca en getChats
+    const participantRows = participant_ids.map(uid => ({
+      chat_id: chat.id,
+      user_id: uid,
+    }));
+    await supabase.from('chat_participants').insert(participantRows);
+
     // Formatear respuesta
     const formattedChat = {
       ...chat,
@@ -609,6 +794,111 @@ app.post('/api/chats/group', auth, async (req, res) => {
     res.status(201).json(formattedChat);
   } catch (e) {
     console.error('Create group chat error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// Actualizar nombre y/o avatar de un grupo
+// ════════════════════════════════════════════════════════════════════
+app.put('/api/chats/:chatId', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { name, avatar_url } = req.body;
+
+    // Verificar que el usuario es participante del chat
+    const { data: part } = await supabase
+      .from('chat_participants')
+      .select('id')
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (!part) return res.status(403).json({ message: 'No tienes acceso a este chat' });
+
+    // Verificar que es un grupo
+    const { data: chat } = await supabase
+      .from('chats')
+      .select('id, type, created_by')
+      .eq('id', chatId)
+      .single();
+
+    if (!chat) return res.status(404).json({ message: 'Chat no encontrado' });
+    if (chat.type !== 'group') return res.status(400).json({ message: 'Solo se pueden editar grupos' });
+
+    // Construir objeto de actualización
+    const updates = { updated_at: new Date().toISOString() };
+    if (name !== undefined && name !== null && name.trim() !== '') {
+      updates.name = name.trim();
+    }
+    if (avatar_url !== undefined && avatar_url !== null) {
+      updates.avatar_url = avatar_url;
+    }
+
+    const { data: updated, error } = await supabase
+      .from('chats')
+      .update(updates)
+      .eq('id', chatId)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({ message: 'Grupo actualizado', chat: updated });
+  } catch (e) {
+    console.error('Update group error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// Obtener participantes de un grupo
+// ════════════════════════════════════════════════════════════════════
+app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    const { data: myPart } = await supabase
+      .from('chat_participants')
+      .select('id')
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (!myPart) return res.status(403).json({ message: 'No tienes acceso a este chat' });
+
+    const { data: chat } = await supabase
+      .from('chats')
+      .select('created_by')
+      .eq('id', chatId)
+      .single();
+
+    const creatorId = chat?.created_by?.toString();
+
+    const { data: parts } = await supabase
+      .from('chat_participants')
+      .select('user_id, users:user_id(id, full_name, phone, avatar_url)')
+      .eq('chat_id', chatId);
+
+    if (!parts) return res.json([]);
+
+    const members = parts.map(p => {
+      const u = p.users || {};
+      const uid = p.user_id?.toString();
+      return {
+        id: uid,
+        user_id: uid,
+        full_name: u.full_name || '',
+        phone: u.phone || '',
+        avatar_url: u.avatar_url || '',
+        online_status: false,
+        role: uid === creatorId ? 'admin' : 'member',
+      };
+    });
+
+    res.json(members);
+  } catch (e) {
+    console.error('Get participants error:', e);
     res.status(500).json({ message: e.message });
   }
 });
@@ -645,25 +935,25 @@ app.post('/api/chats/:chatId/read', auth, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Resetear contador de no leÃ­dos
+    // Resetear contador de no leÁƒÂ­dos
     await supabase
       .from('chat_participants')
       .update({ unread_count: 0 })
       .eq('chat_id', chatId)
       .eq('user_id', req.user.id);
 
-    res.json({ message: 'Mensajes marcados como leÃ­dos' });
+    res.json({ message: 'Mensajes marcados como leÁƒÂ­dos' });
   } catch (e) {
     console.error('Mark as read error:', e);
     res.status(500).json({ message: e.message });
   }
 });
 
-// Subir archivo de chat
+// Subir archivo de chat — acepta multipart/form-data (Android/iOS) y raw buffer (web)
 app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
-    
+
     // Verificar acceso al chat
     const { data: part } = await supabase
       .from('chat_participants')
@@ -672,19 +962,76 @@ app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
       .eq('user_id', req.user.id)
       .single();
 
-    if (!part) {
-      return res.status(403).json({ message: 'No tienes acceso a este chat' });
+    if (!part) return res.status(403).json({ message: 'No tienes acceso a este chat' });
+
+    const rawContentType = req.headers['content-type'] || '';
+    let buffer, fileContentType, fileName;
+
+    if (rawContentType.includes('multipart/form-data')) {
+      // Parsear multipart/form-data (enviado por Android/iOS con FormData)
+      const busboy = require('busboy');
+      const bb = busboy({ headers: req.headers });
+      const fileData = await new Promise((resolve, reject) => {
+        let fileBuffer = null, fileMime = 'application/octet-stream', fileOrigName = `file_${Date.now()}`;
+        bb.on('file', (fieldname, file, info) => {
+          const { filename, mimeType } = info;
+          fileOrigName = filename || fileOrigName;
+          fileMime = mimeType || fileMime;
+          const chunks = [];
+          file.on('data', d => chunks.push(d));
+          file.on('end', () => { fileBuffer = Buffer.concat(chunks); });
+        });
+        bb.on('close', () => resolve({ buffer: fileBuffer, mime: fileMime, name: fileOrigName }));
+        bb.on('error', reject);
+        req.pipe(bb);
+      });
+      buffer = fileData.buffer;
+      fileContentType = fileData.mime;
+      fileName = fileData.name;
+    } else {
+      // Raw buffer (enviado por web con ArrayBuffer)
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      buffer = Buffer.concat(chunks);
+      fileContentType = rawContentType.split(';')[0].trim() || 'application/octet-stream';
+      fileName = req.headers['x-file-name']
+        ? decodeURIComponent(req.headers['x-file-name'])
+        : `file_${Date.now()}`;
     }
 
-    // Aquí iría la lógica de subida de archivos a un servicio como AWS S3
-    // Por ahora, simulamos la subida
-    const fileUrl = `https://storage.egchat-gq.com/chats/${chatId}/${Date.now()}.jpg`;
-    
+    if (!buffer || buffer.length === 0) {
+      return res.status(400).json({ message: 'Archivo vacío o no recibido' });
+    }
+
+    const ext = fileName.split('.').pop()?.toLowerCase() || 'bin';
+    const storagePath = `chats/${chatId}/${Date.now()}_${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+
+    // Subir a Supabase Storage (bucket: chat-files)
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('chat-files')
+      .upload(storagePath, buffer, {
+        contentType: fileContentType,
+        upsert: false,
+      });
+
+    if (uploadError) {
+      console.error('Supabase storage upload error:', uploadError.message);
+      return res.status(500).json({ message: 'Error al subir archivo: ' + uploadError.message });
+    }
+
+    // Obtener URL pública
+    const { data: urlData } = supabase.storage
+      .from('chat-files')
+      .getPublicUrl(storagePath);
+
+    const publicUrl = urlData?.publicUrl || '';
+
     res.json({
-      file_url: fileUrl,
-      file_type: 'image',
-      file_size: 1024000, // 1MB
-      thumbnail_url: `${fileUrl}?thumbnail=true`
+      file_url: publicUrl,
+      file_name: fileName,
+      file_type: fileContentType,
+      file_size: buffer.length,
+      file_ext: ext,
     });
   } catch (e) {
     console.error('Upload file error:', e);
@@ -692,7 +1039,50 @@ app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
   }
 });
 
-// Eliminar mensaje
+// Eliminar mensaje para mí (solo oculta para el usuario actual)
+app.delete('/api/messages/:messageId/for-me', auth, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+
+    // Verificar que el mensaje existe
+    const { data: message, error: msgError } = await supabase
+      .from('messages')
+      .select('id, chat_id')
+      .eq('id', messageId)
+      .single();
+
+    if (msgError || !message) {
+      return res.status(404).json({ message: 'Mensaje no encontrado' });
+    }
+
+    // Verificar que el usuario pertenece al chat
+    const { data: part } = await supabase
+      .from('chat_participants')
+      .select('chat_id')
+      .eq('chat_id', message.chat_id)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (!part) return res.status(403).json({ message: 'Sin acceso a este chat' });
+
+    // Registrar la eliminación para este usuario (upsert para evitar duplicados)
+    const { error: delError } = await supabase
+      .from('message_deletions')
+      .upsert({ message_id: messageId, user_id: req.user.id }, { onConflict: 'message_id,user_id' });
+
+    // Si la tabla no existe, ignorar el error (el cliente maneja el filtro localmente)
+    if (delError && !delError.message?.includes('does not exist') && !delError.code?.includes('42P01')) {
+      throw delError;
+    }
+
+    res.json({ message: 'Mensaje eliminado para ti' });
+  } catch (e) {
+    console.error('Delete message for me error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Eliminar mensaje para todos (solo el remitente puede hacerlo)
 app.delete('/api/messages/:messageId', auth, async (req, res) => {
   try {
     const { messageId } = req.params;
@@ -727,35 +1117,41 @@ app.delete('/api/messages/:messageId', auth, async (req, res) => {
   }
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// CONTACTOS - GESTIÃ“N COMPLETA
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
+// CONTACTOS - GESTIÁƒâ€œN COMPLETA
+// ════════════════════════════════════════════════════════════════════
 
 // Obtener todos los contactos del usuario
 app.get('/api/contacts', auth, async (req, res) => {
   try {
     const { data: contacts, error } = await supabase
       .from('contacts')
-      .select(`
-        *,
-        contact_user:users!contact_user_id_fkey(
-          id, phone, full_name, avatar_url, last_seen, status
-        )
-      `)
+      .select('*')
       .eq('user_id', req.user.id)
       .order('created_at', { ascending: false });
 
     if (error) throw error;
+    if (!contacts || contacts.length === 0) return res.json([]);
 
-    // Formatear contactos
+    // Obtener datos de usuarios por separado
+    const userIds = contacts.map(c => c.contact_user_id).filter(Boolean);
+    const { data: users } = await supabase
+      .from('users')
+      .select('id, phone, full_name, avatar_url')
+      .in('id', userIds);
+
+    const usersMap = (users || []).reduce((acc, u) => { acc[u.id] = u; return acc; }, {});
+
     const formattedContacts = contacts.map(contact => ({
       id: contact.id,
       contact_user_id: contact.contact_user_id,
-      nickname: contact.nickname,
+      name: contact.nickname || usersMap[contact.contact_user_id]?.full_name || 'Sin nombre',
+      phone: usersMap[contact.contact_user_id]?.phone || '',
+      avatar_url: usersMap[contact.contact_user_id]?.avatar_url || '',
       is_blocked: contact.is_blocked,
       is_favorite: contact.is_favorite,
       created_at: contact.created_at,
-      user: contact.contact_user
+      user: usersMap[contact.contact_user_id] || null
     }));
 
     res.json(formattedContacts);
@@ -769,14 +1165,22 @@ app.get('/api/contacts', auth, async (req, res) => {
 app.post('/api/contacts', auth, async (req, res) => {
   try {
     const { contact_user_id, nickname, phone } = req.body;
-    let targetId = contact_user_id;
+    console.log('[ADD CONTACT] body:', { contact_user_id, phone, nickname, caller: req.user?.id });
+    let targetId = contact_user_id && contact_user_id.trim() ? contact_user_id.trim() : null;
 
     if (!targetId && phone) {
+      // Normalizar teléfono: buscar con y sin prefijo +
+      const phoneNorm = phone.trim();
+      const phoneAlt = phoneNorm.startsWith('+') ? phoneNorm.slice(1) : '+' + phoneNorm;
+      console.log('[ADD CONTACT] searching by phone:', phoneNorm, 'or', phoneAlt);
+
       const { data: targetUser, error: userError } = await supabase
         .from('users')
         .select('id, phone, full_name')
-        .eq('phone', phone)
+        .or(`phone.eq.${phoneNorm},phone.eq.${phoneAlt}`)
         .single();
+
+      console.log('[ADD CONTACT] phone search result:', targetUser, 'error:', userError?.message);
 
       if (userError || !targetUser) {
         return res.status(404).json({ message: 'Usuario no encontrado con ese número' });
@@ -789,12 +1193,16 @@ app.post('/api/contacts', auth, async (req, res) => {
       return res.status(400).json({ message: 'ID de contacto o teléfono requerido' });
     }
 
+    console.log('[ADD CONTACT] targetId:', targetId);
+
     // Verificar que el usuario a agregar existe
     const { data: targetUser, error: userError } = await supabase
       .from('users')
       .select('id, phone, full_name')
       .eq('id', targetId)
       .single();
+
+    console.log('[ADD CONTACT] user by id:', targetUser?.id, 'error:', userError?.message);
 
     if (userError || !targetUser) {
       return res.status(404).json({ message: 'Usuario no encontrado' });
@@ -813,32 +1221,56 @@ app.post('/api/contacts', auth, async (req, res) => {
     }
 
     // Agregar contacto
-    const { data: contact, error } = await supabase
-      .from('contacts')
-      .insert({
-        user_id: req.user.id,
-        contact_user_id: targetId,
-        nickname: nickname || targetUser.full_name
-      })
-      .select(`
-        *,
-        contact_user:users!contact_user_id_fkey(
-          id, phone, full_name, avatar_url, last_seen, status
-        )
-      `)
-      .single();
+    const insertData = {
+      user_id: req.user.id,
+      contact_user_id: targetId,
+      nickname: nickname || targetUser.full_name,
+      user_id_min: req.user.id < targetId ? req.user.id : targetId,
+      user_id_max: req.user.id < targetId ? targetId : req.user.id,
+    };
+    try {
+      const { data: contact, error } = await supabase
+        .from('contacts')
+        .insert(insertData)
+        .select('*')
+        .single();
 
-    if (error) throw error;
+      if (error) throw error;
 
-    res.json({
-      id: contact.id,
-      contact_user_id: contact.contact_user_id,
-      nickname: contact.nickname,
-      is_blocked: contact.is_blocked,
-      is_favorite: contact.is_favorite,
-      created_at: contact.created_at,
-      user: contact.contact_user
-    });
+      res.json({
+        id: contact.id,
+        contact_user_id: contact.contact_user_id,
+        name: contact.nickname || targetUser.full_name,
+        phone: targetUser.phone,
+        avatar_url: targetUser.avatar_url || '',
+        is_blocked: contact.is_blocked,
+        is_favorite: contact.is_favorite,
+        created_at: contact.created_at,
+        user: targetUser
+      });
+    } catch (insertErr) {
+      // Si falla por columnas extra no existentes, intentar sin user_id_min/max
+      if (insertErr.message?.includes('user_id_min') || insertErr.message?.includes('user_id_max')) {
+        const { data: contact, error } = await supabase
+          .from('contacts')
+          .insert({ user_id: req.user.id, contact_user_id: targetId, nickname: nickname || targetUser.full_name })
+          .select('*')
+          .single();
+        if (error) throw error;
+        return res.json({
+          id: contact.id,
+          contact_user_id: contact.contact_user_id,
+          name: contact.nickname || targetUser.full_name,
+          phone: targetUser.phone,
+          avatar_url: targetUser.avatar_url || '',
+          is_blocked: contact.is_blocked,
+          is_favorite: contact.is_favorite,
+          created_at: contact.created_at,
+          user: targetUser
+        });
+      }
+      throw insertErr;
+    }
   } catch (e) {
     console.error('Add contact error:', e);
     res.status(500).json({ message: e.message });
@@ -940,35 +1372,85 @@ app.post('/api/contacts/:contactId/favorite', auth, async (req, res) => {
   }
 });
 
+// Desmarcar contacto como favorito
+app.delete('/api/contacts/:contactId/favorite', auth, async (req, res) => {
+  try {
+    const { contactId } = req.params;
+    const { data: contact, error } = await supabase
+      .from('contacts')
+      .update({ is_favorite: false })
+      .eq('id', contactId)
+      .eq('user_id', req.user.id)
+      .select()
+      .single();
+    if (error) throw error;
+    if (!contact) return res.status(404).json({ message: 'Contacto no encontrado' });
+    res.json({ message: 'Contacto desmarcado como favorito', contact });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Listar solo contactos favoritos
+app.get('/api/contacts/favorites', auth, async (req, res) => {
+  try {
+    const { data: contacts, error } = await supabase
+      .from('contacts')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .eq('is_favorite', true);
+    if (error) throw error;
+    if (!contacts || contacts.length === 0) return res.json([]);
+
+    const userIds = contacts.map(c => c.contact_user_id).filter(Boolean);
+    const { data: users } = await supabase
+      .from('users')
+      .select('id, phone, full_name, avatar_url')
+      .in('id', userIds);
+    const usersMap = (users || []).reduce((acc, u) => { acc[u.id] = u; return acc; }, {});
+
+    res.json(contacts.map(c => ({
+      id: c.id,
+      name: c.nickname || usersMap[c.contact_user_id]?.full_name || 'Sin nombre',
+      phone: usersMap[c.contact_user_id]?.phone || '',
+      avatar_url: usersMap[c.contact_user_id]?.avatar_url || '',
+      is_favorite: true,
+      contact_user_id: c.contact_user_id,
+      user: usersMap[c.contact_user_id] || null
+    })));
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // Obtener contactos para chat
 app.get('/api/contacts/search', auth, async (req, res) => {
   try {
     const { q } = req.query;
-    
-    if (!q || q.length < 2) {
-      return res.status(400).json({ message: 'La bÃºsqueda debe tener al menos 2 caracteres' });
+
+    let query = supabase
+      .from('users')
+      .select('id, phone, full_name, avatar_url')
+      .neq('id', req.user.id)
+      .limit(50);
+
+    // Si hay término de búsqueda, filtrar; si no, devolver todos
+    if (q && q.length >= 2) {
+      query = query.or(`phone.ilike.%${q}%,full_name.ilike.%${q}%`);
     }
 
-    // Buscar usuarios por teléfono o nombre
-    const { data: users, error } = await supabase
-      .from('users')
-      .select('id, phone, full_name, avatar_url, last_seen')
-      .or(`phone.ilike.%${q}%,full_name.ilike.%${q}%`)
-      .neq('id', req.user.id)
-      .limit(20);
-
+    const { data: users, error } = await query;
     if (error) throw error;
-
-    res.json(users);
+    res.json(users || []);
   } catch (e) {
     console.error('Search contacts error:', e);
     res.status(500).json({ message: e.message });
   }
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 // WALLET
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 app.get('/api/wallet/balance', auth, async (req, res) => {
   let { data: wallet } = await supabase
     .from('wallets').select('balance, currency').eq('user_id', req.user.id).single();
@@ -997,7 +1479,7 @@ app.get('/api/wallet/transactions', auth, async (req, res) => {
 
 app.post('/api/wallet/deposit', auth, async (req, res) => {
   const { amount, method, reference } = req.body;
-  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe invÃ¡lido' });
+  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe invÁƒÂ¡lido' });
 
   const { data: wallet } = await supabase
     .from('wallets').select('balance').eq('user_id', req.user.id).single();
@@ -1018,7 +1500,7 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
   const { data: wallet } = await supabase
     .from('wallets').select('balance').eq('user_id', req.user.id).single();
 
-  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe invÃ¡lido' });
+  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe invÁƒÂ¡lido' });
   if (!wallet || amount > wallet.balance) return res.status(400).json({ message: 'Saldo insuficiente' });
 
   const newBalance = wallet.balance - amount;
@@ -1044,7 +1526,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
 
   const { data: tx } = await supabase.from('transactions').insert({
     user_id: req.user.id, type: 'transfer_sent', amount, method: 'EGCHAT',
-    reference: `A: ${to} Â· ${concept || ''}`, status: 'completed'
+    reference: `A: ${to} Á‚Â· ${concept || ''}`, status: 'completed'
   }).select().single();
 
   res.json({ balance: newBalance, transaction: tx });
@@ -1053,16 +1535,16 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
 app.post('/api/wallet/recharge-code', auth, async (req, res) => {
   const { code } = req.body;
   if (!code || code.replace(/-/g, '').length !== 16)
-    return res.status(400).json({ message: 'CÃ³digo invÃ¡lido' });
+    return res.status(400).json({ message: 'CÁƒÂ³digo invÁƒÂ¡lido' });
 
-  // Verificar si el cÃ³digo ya fue usado
+  // Verificar si el cÁƒÂ³digo ya fue usado
   const { data: usedCode } = await supabase
     .from('recharge_codes').select('*').eq('code', code).single();
 
-  if (!usedCode) return res.status(400).json({ message: 'CÃ³digo no vÃ¡lido' });
-  if (usedCode.used || usedCode.is_used) return res.status(400).json({ message: 'CÃ³digo ya utilizado' });
+  if (!usedCode) return res.status(400).json({ message: 'CÁƒÂ³digo no vÁƒÂ¡lido' });
+  if (usedCode.used || usedCode.is_used) return res.status(400).json({ message: 'CÁƒÂ³digo ya utilizado' });
   if (usedCode.expires_at && new Date(usedCode.expires_at) < new Date())
-    return res.status(400).json({ message: 'CÃ³digo expirado' });
+    return res.status(400).json({ message: 'CÁƒÂ³digo expirado' });
 
   const amount = usedCode?.amount || 5000;
 
@@ -1076,11 +1558,11 @@ app.post('/api/wallet/recharge-code', auth, async (req, res) => {
   await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
 
   await supabase.from('transactions').insert({
-    user_id: req.user.id, type: 'deposit', amount, method: 'CÃ³digo de recarga',
+    user_id: req.user.id, type: 'deposit', amount, method: 'CÁƒÂ³digo de recarga',
     reference: code, status: 'completed'
   });
 
-  res.json({ balance: newBalance, amount, message: `${amount.toLocaleString()} XAF aÃ±adidos` });
+  res.json({ balance: newBalance, amount, message: `${amount.toLocaleString()} XAF aÁƒÂ±adidos` });
 });
 
 const WALLET_LIMITS = {
@@ -1109,22 +1591,26 @@ const getWalletSafe = async (userId) => {
   return wallet;
 };
 
-const sumTodayByType = async (userId, typePrefix) => {
+const sumTodayByType = async (userId) => {
   const { data } = await supabase
     .from('transactions')
-    .select('amount')
+    .select('type, amount')
     .eq('user_id', userId)
     .gte('created_at', startOfTodayIso())
-    .like('type', `${typePrefix}%`);
-  return (data || []).reduce((s, t) => s + Number(t.amount || 0), 0);
+    .in('type', ['deposit', 'withdraw', 'transfer']);
+
+  const totals = { deposit: 0, withdraw: 0, transfer: 0 };
+  (data || []).forEach((tx) => {
+    const type = String(tx.type || '').toLowerCase();
+    if (type in totals) {
+      totals[type] += Number(tx.amount || 0);
+    }
+  });
+  return totals;
 };
 
 app.get('/api/wallet/limits', auth, async (req, res) => {
-  const today = {
-    deposit: await sumTodayByType(req.user.id, 'deposit'),
-    withdraw: await sumTodayByType(req.user.id, 'withdraw'),
-    transfer: await sumTodayByType(req.user.id, 'transfer')
-  };
+  const today = await sumTodayByType(req.user.id);
   res.json({
     limits: WALLET_LIMITS,
     used_today: today,
@@ -1648,9 +2134,9 @@ app.get('/api/cemac/transfers', auth, async (req, res) => {
   }
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 // LIA-25
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 app.post('/api/lia/chat', auth, async (req, res) => {
   const { message } = req.body;
   const lower = message.toLowerCase();
@@ -1660,27 +2146,27 @@ app.post('/api/lia/chat', auth, async (req, res) => {
 
   let reply = '';
   if (lower.includes('saldo') || lower.includes('balance'))
-    reply = `Tu saldo actual es **${balance.toLocaleString()} XAF**. Â¿Deseas recargar o retirar?`;
+    reply = `Tu saldo actual es **${balance.toLocaleString()} XAF**. Á‚Â¿Deseas recargar o retirar?`;
   else if (lower.includes('hola') || lower.includes('buenos'))
-    reply = 'Â¡Hola! Soy Lia-25, tu asistente inteligente de EGCHAT. Â¿En quÃ© puedo ayudarte hoy?';
+    reply = 'Á‚Â¡Hola! Soy Lia-25, tu asistente inteligente de EGCHAT. Á‚Â¿En quÁƒÂ© puedo ayudarte hoy?';
   else if (lower.includes('taxi'))
-    reply = 'Puedo ayudarte a pedir un taxi. Ve a la secciÃ³n MiTaxi desde el menÃº principal.';
+    reply = 'Puedo ayudarte a pedir un taxi. Ve a la secciÁƒÂ³n MiTaxi desde el menÁƒÂº principal.';
   else if (lower.includes('salud') || lower.includes('hospital'))
-    reply = 'En la secciÃ³n Salud encontrarÃ¡s hospitales, farmacias y puedes pedir citas mÃ©dicas.';
+    reply = 'En la secciÁƒÂ³n Salud encontrarÁƒÂ¡s hospitales, farmacias y puedes pedir citas mÁƒÂ©dicas.';
   else if (lower.includes('supermercado') || lower.includes('compra'))
-    reply = 'Puedes hacer compras en lÃ­nea desde la secciÃ³n Supermercados. Tenemos tiendas en Malabo y Bata.';
+    reply = 'Puedes hacer compras en lÁƒÂ­nea desde la secciÁƒÂ³n Supermercados. Tenemos tiendas en Malabo y Bata.';
   else if (lower.includes('transferir') || lower.includes('enviar dinero'))
-    reply = 'Para enviar dinero, ve a Mi Monedero â†’ Enviar, o dime el nÃºmero y el importe.';
+    reply = 'Para enviar dinero, ve a Mi Monedero ââ€ â€™ Enviar, o dime el nÁƒÂºmero y el importe.';
   else if (lower.includes('seguro'))
-    reply = 'Puedes contratar seguros de salud, vehÃ­culo, vida y hogar en la secciÃ³n Seguros.';
+    reply = 'Puedes contratar seguros de salud, vehÁƒÂ­culo, vida y hogar en la secciÁƒÂ³n Seguros.';
   else if (lower.includes('noticias'))
-    reply = 'Las Ãºltimas noticias de Guinea Ecuatorial y del mundo estÃ¡n en la secciÃ³n Noticias.';
+    reply = 'Las ÁƒÂºltimas noticias de Guinea Ecuatorial y del mundo estÁƒÂ¡n en la secciÁƒÂ³n Noticias.';
   else if (lower.includes('gracias'))
-    reply = 'Â¡De nada! Estoy aquÃ­ para ayudarte. Â¿Hay algo mÃ¡s?';
+    reply = 'Á‚Â¡De nada! Estoy aquÁƒÂ­ para ayudarte. Á‚Â¿Hay algo mÁƒÂ¡s?';
   else
     reply = `Entendido: "${message}". Puedo ayudarte con saldo, transferencias, taxi, salud, supermercados, seguros y noticias.`;
 
-  // Guardar conversaciÃ³n en Supabase
+  // Guardar conversaciÁƒÂ³n en Supabase
   await supabase.from('lia_conversations').insert({
     user_id: req.user.id, message, reply
   }).catch(() => {});
@@ -1688,14 +2174,14 @@ app.post('/api/lia/chat', auth, async (req, res) => {
   res.json({ reply, timestamp: new Date().toISOString() });
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 // USER
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 app.get('/api/user/profile', auth, async (req, res) => {
   const { data: user } = await supabase
-    .from('users').select('id, phone, full_name, created_at, last_login').eq('id', req.user.id).single();
+    .from('users').select('id, phone, full_name, created_at, avatar_url').eq('id', req.user.id).single();
   if (!user) return res.status(404).json({ message: 'No encontrado' });
-  res.json(user);
+  res.json({ ...user, app_version: APP_VERSION });
 });
 
 app.put('/api/user/profile', auth, async (req, res) => {
@@ -1706,57 +2192,36 @@ app.put('/api/user/profile', auth, async (req, res) => {
   if (city) updates.city = city;
   const { data: user } = await supabase
     .from('users').update(updates).eq('id', req.user.id).select('id, phone, full_name, avatar_url').single();
-  res.json(user);
+  res.json({ ...user, app_version: APP_VERSION });
 });
 
 app.post('/api/user/change-password', auth, async (req, res) => {
   const { oldPassword, newPassword } = req.body;
   const { data: user } = await supabase.from('users').select('password_hash').eq('id', req.user.id).single();
   const ok = await bcrypt.compare(oldPassword, user.password_hash);
-  if (!ok) return res.status(401).json({ message: 'ContraseÃ±a actual incorrecta' });
+  if (!ok) return res.status(401).json({ message: 'Contraseña actual incorrecta' });
   const hashed = await bcrypt.hash(newPassword, 10);
   await supabase.from('users').update({ password_hash: hashed }).eq('id', req.user.id);
-  res.json({ message: 'ContraseÃ±a actualizada' });
+  res.json({ message: 'Contraseña actualizada' });
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Reset de contraseña por admin (protegido con ADMIN_RESET_KEY)
+app.post('/api/admin/reset-password', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.body?.adminKey;
+  if (!key || key !== adminResetKey) return res.status(403).json({ message: 'No autorizado' });
+  const { phone, newPassword } = req.body;
+  if (!phone || !newPassword) return res.status(400).json({ message: 'phone y newPassword requeridos' });
+  const hashed = await bcrypt.hash(newPassword, 10);
+  const { data, error } = await supabase.from('users').update({ password_hash: hashed }).eq('phone', phone).select('id, phone, full_name').single();
+  if (error || !data) return res.status(404).json({ message: 'Usuario no encontrado', error: error?.message });
+  res.json({ message: 'Contraseña reseteada', user: data });
+});
+
+
+// ════════════════════════════════════════════════════════════════════
 // CONTACTOS
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-app.get('/api/contacts', auth, async (req, res) => {
-  const { data } = await supabase.from('contacts')
-    .select('*, contact:contact_id(id, phone, full_name, avatar_url)')
-    .eq('user_id', req.user.id);
-  res.json(data || []);
-});
-
-app.post('/api/contacts', auth, async (req, res) => {
-  const { phone, name } = req.body;
-  const { data: found } = await supabase.from('users').select('id, phone, full_name').eq('phone', phone).single();
-  if (!found) return res.status(404).json({ message: 'Usuario no encontrado' });
-  const { data } = await supabase.from('contacts')
-    .upsert({ user_id: req.user.id, contact_id: found.id, nickname: name || found.full_name })
-    .select().single();
-  res.json(data);
-});
-
-app.delete('/api/contacts/:id', auth, async (req, res) => {
-  await supabase.from('contacts').delete().eq('user_id', req.user.id).eq('contact_id', req.params.id);
-  res.json({ message: 'Contacto eliminado' });
-});
-
-app.put('/api/contacts/:id/block', auth, async (req, res) => {
-  await supabase.from('contacts').upsert({ user_id: req.user.id, contact_id: req.params.id, is_blocked: true });
-  res.json({ message: 'Contacto bloqueado' });
-});
-
-app.put('/api/contacts/:id/unblock', auth, async (req, res) => {
-  await supabase.from('contacts').update({ is_blocked: false }).eq('user_id', req.user.id).eq('contact_id', req.params.id);
-  res.json({ message: 'Contacto desbloqueado' });
-});
-
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// SERVICIOS PÃšBLICOS (simulados con datos reales de GE)
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// SERVICIOS PÁƒÅ¡BLICOS (simulados con datos reales de GE)
+// ════════════════════════════════════════════════════════════════════
 const sandboxStatus = ['pending', 'processing', 'completed', 'failed'];
 const safeRef = (prefix) => `${prefix}-${Date.now()}-${Math.floor(Math.random() * 9999)}`;
 const toNum = (v) => Number(v || 0);
@@ -1874,30 +2339,29 @@ app.get('/api/servicios/orders', auth, async (req, res) => {
   res.json(data || []);
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 // SUPERMERCADOS
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 const SUPERMERCADOS = [
   { id: '1', name: 'Supermarket Malabo', city: 'Malabo', address: 'Calle de la Independencia', phone: '+240 222 001', open: true },
   { id: '2', name: 'Tienda Bata Centro', city: 'Bata', address: 'Av. Hassan II', phone: '+240 333 001', open: true },
   { id: '3', name: 'Mercado Mongomo', city: 'Mongomo', address: 'Plaza Central', phone: '+240 444 001', open: false },
 ];
 const PRODUCTOS = [
-  { id: '1', name: 'Arroz 5kg', price: 3500, category: 'AlimentaciÃ³n', stock: 50 },
-  { id: '2', name: 'Aceite 1L', price: 1200, category: 'AlimentaciÃ³n', stock: 30 },
+  { id: '1', name: 'Arroz 5kg', price: 3500, category: 'AlimentaciÁƒÂ³n', stock: 50 },
+  { id: '2', name: 'Aceite 1L', price: 1200, category: 'AlimentaciÁƒÂ³n', stock: 30 },
   { id: '3', name: 'Agua 6x1.5L', price: 2000, category: 'Bebidas', stock: 100 },
-  { id: '4', name: 'Leche 1L', price: 800, category: 'LÃ¡cteos', stock: 20 },
-  { id: '5', name: 'Pan de molde', price: 600, category: 'PanaderÃ­a', stock: 15 },
+  { id: '4', name: 'Leche 1L', price: 800, category: 'LÁƒÂ¡cteos', stock: 20 },
+  { id: '5', name: 'Pan de molde', price: 600, category: 'PanaderÁƒÂ­a', stock: 15 },
 ];
 
-app.get(['/api/supermarkets', '/supermarkets'], auth, async (req, res) => {
+app.get('/api/supermarkets', auth, async (req, res) => {
   const { city } = req.query;
-  const cityValue = typeof city === 'string' ? city.toLowerCase() : String(city).toLowerCase();
-  const result = city ? SUPERMERCADOS.filter(s => s.city.toLowerCase() === cityValue) : SUPERMERCADOS;
+  const result = city ? SUPERMERCADOS.filter(s => s.city.toLowerCase() === city.toLowerCase()) : SUPERMERCADOS;
   res.json(result);
 });
 
-app.get(['/api/supermarkets/:smId/products', '/supermarkets/:smId/products'], auth, async (req, res) => {
+app.get('/api/supermarkets/:smId/products', auth, async (req, res) => {
   const { cat } = req.query;
   const result = cat ? PRODUCTOS.filter(p => p.category === cat) : PRODUCTOS;
   res.json(result);
@@ -1944,43 +2408,28 @@ app.get('/api/supermarkets/orders/:id', auth, async (req, res) => {
   if (!data) return res.status(404).json({ message: 'Pedido no encontrado' });
   res.json(data);
 });
-app.get('/supermarkets/orders/:id', auth, async (req, res) => {
-  const { data } = await supabase
-    .from('service_orders')
-    .select('*')
-    .eq('user_id', req.user.id)
-    .eq('order_ref', req.params.id)
-    .maybeSingle();
-  if (!data) return res.status(404).json({ message: 'Pedido no encontrado' });
-  res.json(data);
-});
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 // SALUD
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 const HOSPITALES = [
-  { id: '1', name: 'Hospital General de Malabo', city: 'Malabo', phone: '+240 222 100', emergency: true, specialties: ['Urgencias', 'CirugÃ­a', 'PediatrÃ­a'] },
-  { id: '2', name: 'ClÃ­nica Santa Isabel', city: 'Malabo', phone: '+240 222 200', emergency: false, specialties: ['Medicina General', 'GinecologÃ­a'] },
-  { id: '3', name: 'Hospital Regional de Bata', city: 'Bata', phone: '+240 333 100', emergency: true, specialties: ['Urgencias', 'TraumatologÃ­a'] },
+  { id: '1', name: 'Hospital General de Malabo', city: 'Malabo', phone: '+240 222 100', emergency: true, specialties: ['Urgencias', 'CirugÁƒÂ­a', 'PediatrÁƒÂ­a'] },
+  { id: '2', name: 'ClÁƒÂ­nica Santa Isabel', city: 'Malabo', phone: '+240 222 200', emergency: false, specialties: ['Medicina General', 'GinecologÁƒÂ­a'] },
+  { id: '3', name: 'Hospital Regional de Bata', city: 'Bata', phone: '+240 333 100', emergency: true, specialties: ['Urgencias', 'TraumatologÁƒÂ­a'] },
 ];
 const FARMACIAS = [
   { id: '1', name: 'Farmacia Central Malabo', city: 'Malabo', phone: '+240 222 300', open24h: true },
   { id: '2', name: 'Farmacia Bata Norte', city: 'Bata', phone: '+240 333 300', open24h: false },
 ];
 
-app.get(['/api/salud/hospitales', '/salud/hospitales'], auth, async (req, res) => {
+app.get('/api/salud/hospitales', auth, async (req, res) => {
   const { city } = req.query;
-  const cityValue = typeof city === 'string' ? city.toLowerCase() : String(city).toLowerCase();
-  res.json(city ? HOSPITALES.filter(h => h.city.toLowerCase() === cityValue) : HOSPITALES);
+  res.json(city ? HOSPITALES.filter(h => h.city.toLowerCase() === city.toLowerCase()) : HOSPITALES);
 });
 
-app.get(['/api/salud/farmacias', '/salud/farmacias'], auth, async (req, res) => {
+app.get('/api/salud/farmacias', auth, async (req, res) => {
   const { city } = req.query;
   res.json(city ? FARMACIAS.filter(f => f.city.toLowerCase() === city.toLowerCase()) : FARMACIAS);
-});
-app.get('/salud/farmacias', auth, async (req, res) => {
-  const { city } = req.query;
-  res.json(city ? FARMACIAS.filter(f => f.city.toLowerCase() === String(city).toLowerCase()) : FARMACIAS);
 });
 
 app.post('/api/salud/citas', auth, async (req, res) => {
@@ -1992,7 +2441,7 @@ app.post('/api/salud/citas', auth, async (req, res) => {
   res.json(response);
 });
 
-app.get(['/api/salud/medicamentos', '/salud/medicamentos'], auth, async (req, res) => {
+app.get('/api/salud/medicamentos', auth, async (req, res) => {
   const { q } = req.query;
   const meds = [
     { id: '1', name: 'Paracetamol 500mg', price: 500, stock: true },
@@ -2000,8 +2449,7 @@ app.get(['/api/salud/medicamentos', '/salud/medicamentos'], auth, async (req, re
     { id: '3', name: 'Amoxicilina 500mg', price: 1500, stock: false },
     { id: '4', name: 'Omeprazol 20mg', price: 1200, stock: true },
   ];
-  const queryText = typeof q === 'string' ? q.toLowerCase() : String(q).toLowerCase();
-  const result = q ? meds.filter(m => m.name.toLowerCase().includes(queryText)) : meds;
+  const result = q ? meds.filter(m => m.name.toLowerCase().includes(q.toLowerCase())) : meds;
   res.json(result);
 });
 
@@ -2023,9 +2471,9 @@ app.post('/api/salud/medicamentos/pedido', auth, async (req, res) => {
   res.json({ orderId, status: 'confirmed', total, eta: '20-30 min', message: 'Pedido de medicamentos confirmado' });
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 // TAXI
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 app.post('/api/taxi/request', auth, async (req, res) => {
   try {
     const { origin, dest, type } = req.body;
@@ -2314,9 +2762,9 @@ app.post('/taxi/:rideId/rate', auth, async (req, res) => {
   return app._router.handle(req, res, () => {});
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// SEGUROS - COTIZACIONES, PÃ“LIZAS, RECLAMACIONES
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
+// SEGUROS - COTIZACIONES, PÁƒâ€œLIZAS, RECLAMACIONES
+// ════════════════════════════════════════════════════════════════════
 
 // Obtener tipos de seguros disponibles
 app.get('/api/insurance/types', auth, async (req, res) => {
@@ -2325,23 +2773,23 @@ app.get('/api/insurance/types', auth, async (req, res) => {
       {
         id: 'salud',
         name: 'Seguro de Salud',
-        icon: 'ðŸ¥',
-        description: 'Cobertura mÃ©dica completa',
-        coverage: ['consultas', 'urgencias', 'hospitalizaciÃ³n', 'medicamentos'],
+        icon: 'ðÅ¸ÂÂ¥',
+        description: 'Cobertura mÁƒÂ©dica completa',
+        coverage: ['consultas', 'urgencias', 'hospitalizaciÁƒÂ³n', 'medicamentos'],
         starting_price: 5000
       },
       {
         id: 'vehiculo',
-        name: 'Seguro de VehÃ­culo',
-        icon: 'ðŸš—',
-        description: 'ProtecciÃ³n para tu vehÃ­culo',
-        coverage: ['colisiÃ³n', 'robo', 'daÃ±os', 'responsabilidad civil'],
+        name: 'Seguro de VehÁƒÂ­culo',
+        icon: 'ðÅ¸Å¡â€”',
+        description: 'ProtecciÁƒÂ³n para tu vehÁƒÂ­culo',
+        coverage: ['colisiÁƒÂ³n', 'robo', 'daÁƒÂ±os', 'responsabilidad civil'],
         starting_price: 8000
       },
       {
         id: 'vida',
         name: 'Seguro de Vida',
-        icon: 'ðŸ›¡ï¸',
+        icon: 'ðÅ¸â€ºÂ¡Á¯Â¸Â',
         description: 'Seguridad para tu familia',
         coverage: ['fallecimiento', 'invalidez', 'enfermedades graves'],
         starting_price: 3000
@@ -2349,9 +2797,9 @@ app.get('/api/insurance/types', auth, async (req, res) => {
       {
         id: 'hogar',
         name: 'Seguro de Hogar',
-        icon: 'ðŸ ',
-        description: 'ProtecciÃ³n para tu vivienda',
-        coverage: ['incendio', 'robo', 'daÃ±os estructurales', 'responsabilidad civil'],
+        icon: 'ðÅ¸ÂÂ ',
+        description: 'ProtecciÁƒÂ³n para tu vivienda',
+        coverage: ['incendio', 'robo', 'daÁƒÂ±os estructurales', 'responsabilidad civil'],
         starting_price: 4000
       }
     ];
@@ -2363,13 +2811,13 @@ app.get('/api/insurance/types', auth, async (req, res) => {
   }
 });
 
-// Obtener cotizaciÃ³n de seguro
+// Obtener cotizaciÁƒÂ³n de seguro
 app.post('/api/insurance/quote', auth, async (req, res) => {
   try {
     const { insurance_type, coverage_amount, duration_months } = req.body;
 
     if (!insurance_type || !coverage_amount || !duration_months) {
-      return res.status(400).json({ message: 'Datos incompletos para cotizaciÃ³n' });
+      return res.status(400).json({ message: 'Datos incompletos para cotizaciÁƒÂ³n' });
     }
 
     // Calcular prima mensual (ejemplo simple)
@@ -2429,7 +2877,7 @@ app.post('/api/insurance/contract', auth, async (req, res) => {
       return res.status(400).json({ message: 'Saldo insuficiente para contratar seguro' });
     }
 
-    // Crear pÃ³liza
+    // Crear pÁƒÂ³liza
     const { data: policy } = await supabase
       .from('insurance_policies')
       .insert({
@@ -2453,7 +2901,7 @@ app.post('/api/insurance/contract', auth, async (req, res) => {
       .update({ balance: newBalance })
       .eq('user_id', req.user.id);
 
-    // Registrar transacciÃ³n
+    // Registrar transacciÁƒÂ³n
     await supabase
       .from('transactions')
       .insert({
@@ -2481,7 +2929,7 @@ app.post('/api/insurance/contract', auth, async (req, res) => {
   }
 });
 
-// Obtener pÃ³lizas del usuario
+// Obtener pÁƒÂ³lizas del usuario
 app.get('/api/insurance/policies', auth, async (req, res) => {
   try {
     const { data: policies } = await supabase
@@ -2497,16 +2945,16 @@ app.get('/api/insurance/policies', auth, async (req, res) => {
   }
 });
 
-// Presentar reclamaciÃ³n
+// Presentar reclamaciÁƒÂ³n
 app.post('/api/insurance/claim', auth, async (req, res) => {
   try {
     const { policy_id, claim_type, description, amount } = req.body;
 
     if (!policy_id || !claim_type || !description) {
-      return res.status(400).json({ message: 'Datos incompletos para reclamaciÃ³n' });
+      return res.status(400).json({ message: 'Datos incompletos para reclamaciÁƒÂ³n' });
     }
 
-    // Verificar que la pÃ³liza pertenece al usuario
+    // Verificar que la pÁƒÂ³liza pertenece al usuario
     const { data: policy } = await supabase
       .from('insurance_policies')
       .select('id, user_id, status')
@@ -2514,14 +2962,14 @@ app.post('/api/insurance/claim', auth, async (req, res) => {
       .single();
 
     if (!policy || policy.user_id !== req.user.id) {
-      return res.status(404).json({ message: 'PÃ³liza no encontrada' });
+      return res.status(404).json({ message: 'PÁƒÂ³liza no encontrada' });
     }
 
     if (policy.status !== 'active') {
-      return res.status(400).json({ message: 'La pÃ³liza no estÃ¡ activa' });
+      return res.status(400).json({ message: 'La pÁƒÂ³liza no estÁƒÂ¡ activa' });
     }
 
-    // Crear reclamaciÃ³n
+    // Crear reclamaciÁƒÂ³n
     const { data: claim } = await supabase
       .from('insurance_claims')
       .insert({
@@ -2537,7 +2985,7 @@ app.post('/api/insurance/claim', auth, async (req, res) => {
       .single();
 
     res.json({
-      message: 'ReclamaciÃ³n presentada exitosamente',
+      message: 'ReclamaciÁƒÂ³n presentada exitosamente',
       claim
     });
   } catch (e) {
@@ -2565,48 +3013,48 @@ app.get('/api/insurance/claims', auth, async (req, res) => {
   }
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// NOTICIAS - CATEGORÃAS, FEEDS, BÃšSQUEDA, PERSONALIZACIÃ“N
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
+// NOTICIAS - CATEGORÁƒÂAS, FEEDS, BÁƒÅ¡SQUEDA, PERSONALIZACIÁƒâ€œN
+// ════════════════════════════════════════════════════════════════════
 
-// Obtener categorÃ­as de noticias
+// Obtener categorÁƒÂ­as de noticias
 app.get('/api/news/categories', auth, async (req, res) => {
   try {
     const categories = [
       {
         id: 'nacional',
         name: 'Nacional',
-        icon: 'ðŸ‡¬ðŸ‡¶',
+        icon: 'ðÅ¸â€¡Â¬ðÅ¸â€¡Â¶',
         description: 'Noticias de Guinea Ecuatorial'
       },
       {
         id: 'internacional',
         name: 'Internacional',
-        icon: 'ðŸŒ',
+        icon: 'ðÅ¸Å’Â',
         description: 'Noticias del mundo'
       },
       {
         id: 'deportes',
         name: 'Deportes',
-        icon: 'âš½',
-        description: 'FÃºtbol y otros deportes'
+        icon: 'âÅ¡Â½',
+        description: 'FÁƒÂºtbol y otros deportes'
       },
       {
         id: 'economia',
-        name: 'EconomÃ­a',
-        icon: 'ðŸ’°',
+        name: 'EconomÁƒÂ­a',
+        icon: 'ðÅ¸â€™Â°',
         description: 'Finanzas y negocios'
       },
       {
         id: 'tecnologia',
-        name: 'TecnologÃ­a',
-        icon: 'ðŸ’»',
-        description: 'TecnologÃ­a y ciencia'
+        name: 'TecnologÁƒÂ­a',
+        icon: 'ðÅ¸â€™Â»',
+        description: 'TecnologÁƒÂ­a y ciencia'
       },
       {
         id: 'cultura',
         name: 'Cultura',
-        icon: 'ðŸŽ­',
+        icon: 'ðÅ¸Å½Â­',
         description: 'Arte y entretenimiento'
       }
     ];
@@ -2618,18 +3066,18 @@ app.get('/api/news/categories', auth, async (req, res) => {
   }
 });
 
-// Obtener noticias por categorÃ­a
+// Obtener noticias por categorÁƒÂ­a
 app.get('/api/news', auth, async (req, res) => {
   try {
     const { category, page = 1, limit = 20 } = req.query;
 
-    // Noticias simuladas (en producciÃ³n vendrÃ­an de una API real)
+    // Noticias simuladas (en producciÁƒÂ³n vendrÁƒÂ­an de una API real)
     const allNews = [
       {
         id: '1',
         title: 'EGCHAT lanza nueva funcionalidad de mensajería instantánea',
         category: 'tecnologia',
-        summary: 'La aplicaciÃ³n EGCHAT anuncia importantes mejoras...',
+        summary: 'La aplicaciÁƒÂ³n EGCHAT anuncia importantes mejoras...',
         content: '...',
         image_url: 'https://example.com/egchat-news.jpg',
         published_at: new Date().toISOString(),
@@ -2637,7 +3085,7 @@ app.get('/api/news', auth, async (req, res) => {
       },
       {
         id: '2',
-        title: 'EconomÃ­a de Guinea Ecuatorial muestra crecimiento',
+        title: 'EconomÁƒÂ­a de Guinea Ecuatorial muestra crecimiento',
         category: 'economia',
         summary: 'El Banco Central de Guinea Ecuatorial reporta...',
         content: '...',
@@ -2673,16 +3121,16 @@ app.get('/api/news/search', auth, async (req, res) => {
     const { q, category } = req.query;
 
     if (!q || q.length < 2) {
-      return res.status(400).json({ message: 'La bÃºsqueda debe tener al menos 2 caracteres' });
+      return res.status(400).json({ message: 'La bÁƒÂºsqueda debe tener al menos 2 caracteres' });
     }
 
-    // Noticias simuladas para bÃºsqueda
+    // Noticias simuladas para bÁƒÂºsqueda
     const searchResults = [
       {
         id: 'search1',
         title: `Resultados para "${q}" en EGCHAT`,
         category: category || 'todos',
-        summary: `Se encontraron artÃ­culos relacionados con ${q}...`,
+        summary: `Se encontraron artÁƒÂ­culos relacionados con ${q}...`,
         published_at: new Date().toISOString(),
         source: 'SearchEG'
       }
@@ -2742,9 +3190,9 @@ app.get('/api/news/favorites', auth, async (req, res) => {
   }
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 // SEGUROS
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 
 const ASEGURADORAS = [
   { id: '1', name: 'COGE Seguros', products: ['Vida', 'Salud', 'Auto', 'Hogar'] },
@@ -2798,25 +3246,24 @@ app.post('/seguros/solicitudes/:solicitudId/documentos', auth, async (req, res) 
   res.status(201).json({ solicitudId, tipo: tipo || 'documento', status: 'uploaded', message: 'Documento recibido' });
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 // NOTICIAS
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 const NOTICIAS = [
-  { id: '1', title: 'Presidente anuncia nuevas medidas econÃ³micas para 2026', source: 'Presidencia GE', category: 'PolÃ­tica', time: '14:30', isLive: true },
+  { id: '1', title: 'Presidente anuncia nuevas medidas econÁƒÂ³micas para 2026', source: 'Presidencia GE', category: 'PolÁƒÂ­tica', time: '14:30', isLive: true },
   { id: '2', title: 'CEMAC aprueba nuevo marco financiero regional', source: 'Noticias CEMAC', category: 'Finanzas', time: '13:45' },
-  { id: '3', title: 'Ministerio de Salud reporta avances en vacunaciÃ³n', source: 'Ministerio de InformaciÃ³n', category: 'Salud', time: '12:20' },
-  { id: '4', title: 'Nueva tecnologÃ­a 5G llega a Malabo', source: 'TVGE', category: 'TecnologÃ­a', time: '11:15' },
-  { id: '5', title: 'SelecciÃ³n nacional se prepara para eliminatorias', source: 'Radio Nacional', category: 'Deportes', time: '10:30' },
-  { id: '6', title: 'BEAC anuncia nuevas polÃ­ticas monetarias', source: 'BEAC', category: 'Finanzas', time: '09:00' },
+  { id: '3', title: 'Ministerio de Salud reporta avances en vacunaciÁƒÂ³n', source: 'Ministerio de InformaciÁƒÂ³n', category: 'Salud', time: '12:20' },
+  { id: '4', title: 'Nueva tecnologÁƒÂ­a 5G llega a Malabo', source: 'TVGE', category: 'TecnologÁƒÂ­a', time: '11:15' },
+  { id: '5', title: 'SelecciÁƒÂ³n nacional se prepara para eliminatorias', source: 'Radio Nacional', category: 'Deportes', time: '10:30' },
+  { id: '6', title: 'BEAC anuncia nuevas polÁƒÂ­ticas monetarias', source: 'BEAC', category: 'Finanzas', time: '09:00' },
 ];
 
-app.get(['/api/noticias', '/noticias'], auth, async (req, res) => {
+app.get('/api/noticias', auth, async (req, res) => {
   const { cat } = req.query;
-  const category = typeof cat === 'string' ? cat.toLowerCase() : String(cat).toLowerCase();
-  res.json(cat ? NOTICIAS.filter(n => n.category.toLowerCase() === category) : NOTICIAS);
+  res.json(cat ? NOTICIAS.filter(n => n.category.toLowerCase() === cat.toLowerCase()) : NOTICIAS);
 });
 
-app.get(['/api/noticias/:id', '/noticias/:id'], auth, async (req, res) => {
+app.get('/api/noticias/:id', auth, async (req, res) => {
   const noticia = NOTICIAS.find(n => n.id === req.params.id);
   if (!noticia) return res.status(404).json({ message: 'Noticia no encontrada' });
   res.json({ ...noticia, content: `Contenido completo de: ${noticia.title}. Esta noticia fue publicada por ${noticia.source}.` });
@@ -2833,45 +3280,143 @@ app.post('/lia/analyze', auth, async (_req, res) => {
   res.json({ analysis: 'Análisis completado.' });
 });
 
+app.post('/api/lia/analyze', auth, async (_req, res) => {
+  res.json({ analysis: 'Análisis completado.' });
+});
+
 app.post('/lia/transcribe', auth, async (_req, res) => {
   res.json({ text: 'Transcripción completada.' });
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// GRUPOS DE CHAT
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-app.post('/api/chats/group', auth, async (req, res) => {
-  try {
-    const { name, participant_ids, avatar_url } = req.body;
-    if (!name || !participant_ids?.length) return res.status(400).json({ message: 'Nombre y participantes requeridos' });
-
-    const { data: chat, error } = await supabase.from('chats')
-      .insert({ type: 'group', name, avatar_url: avatar_url || null, created_by: req.user.id })
-      .select().single();
-    if (error) throw error;
-
-    const allIds = [...new Set([req.user.id, ...participant_ids])];
-    await supabase.from('chat_participants').insert(allIds.map(uid => ({ chat_id: chat.id, user_id: uid })));
-
-    res.json({ ...chat, participants: allIds });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+app.post('/api/lia/transcribe', auth, async (_req, res) => {
+  res.json({ text: 'Transcripción completada.' });
 });
 
-// AÃ±adir participante a grupo
+// ════════════════════════════════════════════════════════════════════
+// GRUPOS DE CHAT
+// ════════════════════════════════════════════════════════════════════
+// Añadir participante a grupo
 app.post('/api/chats/:chatId/participants', auth, async (req, res) => {
   try {
     const { user_id } = req.body;
     await supabase.from('chat_participants').upsert({ chat_id: req.params.chatId, user_id });
-    res.json({ message: 'Participante aÃ±adido' });
+    res.json({ message: 'Participante añadido' });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Obtener lista de participantes de un grupo con información completa
+app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    // Obtener todos los participantes con su información de usuario
+    const { data: participants, error } = await supabase
+      .from('chat_participants')
+      .select('user_id')
+      .eq('chat_id', chatId);
+
+    if (error) throw error;
+    if (!participants || participants.length === 0) return res.json([]);
+
+    // Obtener info de usuarios
+    const userIds = participants.map(p => p.user_id);
+    const { data: users, error: usersError } = await supabase
+      .from('users')
+      .select('id, phone, full_name, avatar_url, online_status, last_seen')
+      .in('id', userIds);
+
+    if (usersError) throw usersError;
+
+    const usersMap = {};
+    (users || []).forEach(u => { usersMap[u.id] = u; });
+
+    const formattedParticipants = participants.map(p => {
+      const u = usersMap[p.user_id] || {};
+      return {
+        id: p.user_id,
+        user_id: p.user_id,
+        phone: u.phone,
+        full_name: u.full_name,
+        avatar_url: u.avatar_url,
+        online_status: u.online_status,
+        last_seen: u.last_seen,
+        role: p.user_id === req.user.id ? 'admin' : 'member',
+        joined_at: p.joined_at
+      };
+    });
+
+    res.json(formattedParticipants);
+  } catch (e) {
+    console.error('Get participants error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Guardar fondo de chat personalizado (individual por usuario, no afecta a otros)
+app.post('/api/chats/:chatId/wallpaper', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { wallpaper_type, wallpaper_value, wallpaper_settings } = req.body;
+
+    const { data, error } = await supabase
+      .from('chat_participants')
+      .upsert({
+        chat_id: chatId,
+        user_id: req.user.id,
+        wallpaper_type: wallpaper_type || 'default',
+        wallpaper_value: wallpaper_value || null,
+        wallpaper_settings: wallpaper_settings || null
+      }, { onConflict: 'chat_id,user_id' })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      message: 'Fondo guardado correctamente',
+      wallpaper: {
+        wallpaper_type: data.wallpaper_type,
+        wallpaper_value: data.wallpaper_value,
+        wallpaper_settings: data.wallpaper_settings
+      }
+    });
+  } catch (e) {
+    console.error('Save wallpaper error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Obtener fondo de chat del usuario actual (solo el suyo, no el de otros)
+app.get('/api/chats/:chatId/wallpaper', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    const { data, error } = await supabase
+      .from('chat_participants')
+      .select('wallpaper_type, wallpaper_value, wallpaper_settings')
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (error && error.code !== 'PGRST116') throw error;
+
+    if (!data) {
+      return res.json({ wallpaper_type: 'default', wallpaper_value: null, wallpaper_settings: null });
+    }
+
+    res.json(data);
+  } catch (e) {
+    console.error('Get wallpaper error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
 // NOTIFICACIONES
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 app.get('/api/notifications', auth, async (req, res) => {
   try {
-    // Mensajes no leÃ­dos como notificaciones
+    // Mensajes no leÁƒÂ­dos como notificaciones
     const { data: parts } = await supabase.from('chat_participants').select('chat_id').eq('user_id', req.user.id);
     const chatIds = (parts || []).map(p => p.chat_id);
     if (!chatIds.length) return res.json([]);
@@ -2888,49 +3433,21 @@ app.get('/api/notifications', auth, async (req, res) => {
   } catch (e) { res.json([]); }
 });
 
-// Marcar mensajes como leÃ­dos
+// Marcar mensajes como leÁƒÂ­dos
 app.post('/api/chats/:chatId/read', auth, async (req, res) => {
   try {
     await supabase.from('messages')
       .update({ status: 'read' })
       .eq('chat_id', req.params.chatId)
       .neq('sender_id', req.user.id);
-    res.json({ message: 'Mensajes marcados como leÃ­dos' });
+    res.json({ message: 'Mensajes marcados como leÁƒÂ­dos' });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// ════════════════════════════════════════════════════════════════════
 // CONTACTOS CON FOTO Y PERFIL
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-app.get('/api/contacts', auth, async (req, res) => {
-  try {
-    const { data } = await supabase.from('contacts').select('*').eq('user_id', req.user.id);
-    if (!data || data.length === 0) return res.json([]);
-    // Obtener info de cada contacto
-    const contactIds = data.map(c => c.contact_id);
-    const { data: users } = await supabase.from('users').select('id, phone, full_name, avatar_url').in('id', contactIds);
-    const userMap = Object.fromEntries((users||[]).map(u => [u.id, u]));
-    res.json(data.map(c => ({
-      id: c.contact_id,
-      name: c.nickname || userMap[c.contact_id]?.full_name || 'Contacto',
-      phone: userMap[c.contact_id]?.phone || '',
-      avatar_url: userMap[c.contact_id]?.avatar_url || '',
-      addedDate: c.created_at,
-    })));
-  } catch (e) { res.json([]); }
-});
-
-app.post('/api/contacts', auth, async (req, res) => {
-  try {
-    const { phone, name } = req.body;
-    const { data: found } = await supabase.from('users').select('id, phone, full_name, avatar_url').eq('phone', phone).single();
-    if (!found) return res.status(404).json({ message: 'Usuario no encontrado' });
-    await supabase.from('contacts').upsert({ user_id: req.user.id, contact_id: found.id, nickname: name || found.full_name });
-    res.json({ id: found.id, name: found.full_name, phone: found.phone, avatar_url: found.avatar_url });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-// Perfil pÃºblico de un usuario
+// ════════════════════════════════════════════════════════════════════
+// Perfil público de un usuario
 app.get('/api/users/:userId', auth, async (req, res) => {
   try {
     const { data } = await supabase.from('users').select('id, phone, full_name, avatar_url, created_at').eq('id', req.params.userId).single();
@@ -2939,14 +3456,1232 @@ app.get('/api/users/:userId', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// START
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-app.listen(PORT, () => {
-  console.log(`\nðŸš€ EGCHAT API + Supabase en http://localhost:${PORT}`);
-  console.log(`   Supabase: ${process.env.SUPABASE_URL ? 'âœ… Conectado' : 'âš ï¸  Sin configurar'}`);
-  console.log(`   Auth:   POST /api/auth/register | /api/auth/login`);
-  console.log(`   Wallet: GET  /api/wallet/balance | POST /api/wallet/deposit`);
-  console.log(`   Lia-25: POST /api/lia/chat\n`);
+// ════════════════════════════════════════════════════════════════════
+// ESPACIO DULCE — Canales y Comunidades
+// ════════════════════════════════════════════════════════════════════
+
+// Auto-crear tablas de espacios
+const ensureSpacesTable = async () => {
+  try {
+    await supabase.rpc('exec_sql', { sql: `
+      CREATE TABLE IF NOT EXISTS spaces (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        description TEXT,
+        type VARCHAR(20) DEFAULT 'publico' CHECK (type IN ('publico','comunidad')),
+        cover TEXT,
+        emoji VARCHAR(10) DEFAULT '📢',
+        owner_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        followers_count INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS space_follows (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        space_id UUID REFERENCES spaces(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(space_id, user_id)
+      );
+      CREATE TABLE IF NOT EXISTS space_posts (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        space_id UUID REFERENCES spaces(id) ON DELETE CASCADE,
+        author_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        image_url TEXT,
+        likes_count INTEGER DEFAULT 0,
+        comments_count INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS space_post_likes (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        post_id UUID REFERENCES space_posts(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(post_id, user_id)
+      );
+      CREATE TABLE IF NOT EXISTS space_post_comments (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        post_id UUID REFERENCES space_posts(id) ON DELETE CASCADE,
+        author_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_spaces_type ON spaces(type);
+      CREATE INDEX IF NOT EXISTS idx_space_follows_user ON space_follows(user_id);
+      CREATE INDEX IF NOT EXISTS idx_space_posts_space ON space_posts(space_id);
+      CREATE INDEX IF NOT EXISTS idx_space_posts_created ON space_posts(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_space_comments_post ON space_post_comments(post_id);
+    `}).catch(() => {});
+  } catch {}
+};
+ensureSpacesTable();
+
+// Seed espacios por defecto si no existen
+const seedDefaultSpaces = async () => {
+  try {
+    const { data } = await supabase.from('spaces').select('id').limit(1);
+    if (data && data.length > 0) return; // ya existen
+    const defaults = [
+      { name: 'Gobierno GE', description: 'Noticias y comunicados oficiales del Gobierno de Guinea Ecuatorial', type: 'publico', cover: 'linear-gradient(135deg,#1e3a5f,#0369a1)', emoji: '🏛️', followers_count: 48200 },
+      { name: 'Musica GQ', description: 'Lo mejor de la musica de Guinea Ecuatorial y Africa Central', type: 'comunidad', cover: 'linear-gradient(135deg,#7c3aed,#db2777)', emoji: '🎵', followers_count: 12800 },
+      { name: 'Mercado Malabo', description: 'Compra, vende e intercambia en Guinea Ecuatorial', type: 'comunidad', cover: 'linear-gradient(135deg,#059669,#0d9488)', emoji: '🛒', followers_count: 31500 },
+      { name: 'Deportes GQ', description: 'Futbol, baloncesto y todos los deportes de Guinea Ecuatorial', type: 'publico', cover: 'linear-gradient(135deg,#dc2626,#f59e0b)', emoji: '⚽', followers_count: 22100 },
+      { name: 'Tecnologia GE', description: 'Innovacion, startups y tecnologia en Guinea Ecuatorial', type: 'comunidad', cover: 'linear-gradient(135deg,#1e40af,#7c3aed)', emoji: '💻', followers_count: 8900 },
+    ];
+    await supabase.from('spaces').insert(defaults);
+  } catch {}
+};
+setTimeout(seedDefaultSpaces, 3000);
+
+// GET /api/spaces — listar todos los espacios con estado de seguimiento del usuario
+app.get('/api/spaces', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { data: spaces, error } = await supabase
+      .from('spaces')
+      .select('*')
+      .order('followers_count', { ascending: false });
+    if (error) return res.json([]);
+
+    // Qué espacios sigue el usuario
+    const { data: follows } = await supabase
+      .from('space_follows')
+      .select('space_id')
+      .eq('user_id', userId);
+    const followedIds = new Set((follows || []).map(f => f.space_id));
+
+    res.json((spaces || []).map(s => ({ ...s, following: followedIds.has(s.id) })));
+  } catch (e) { res.json([]); }
 });
+
+// POST /api/spaces — crear espacio
+app.post('/api/spaces', auth, async (req, res) => {
+  try {
+    const { name, description, type, cover, emoji } = req.body;
+    if (!name) return res.status(400).json({ message: 'nombre requerido' });
+    const { data, error } = await supabase
+      .from('spaces')
+      .insert({ name, description, type: type || 'publico', cover, emoji: emoji || '📢', owner_id: req.user.id, followers_count: 1 })
+      .select().single();
+    if (error) throw error;
+    // Auto-seguir al creador
+    await supabase.from('space_follows').insert({ space_id: data.id, user_id: req.user.id }).catch(() => {});
+    res.status(201).json({ ...data, following: true });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/spaces/:id/follow — seguir/dejar de seguir
+app.post('/api/spaces/:id/follow', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const { data: existing } = await supabase
+      .from('space_follows').select('id').eq('space_id', id).eq('user_id', userId).single();
+    if (existing) {
+      await supabase.from('space_follows').delete().eq('space_id', id).eq('user_id', userId);
+      await supabase.from('spaces').update({ followers_count: supabase.rpc ? undefined : 0 }).eq('id', id);
+      await supabase.rpc('exec_sql', { sql: `UPDATE spaces SET followers_count = GREATEST(0, followers_count - 1) WHERE id = '${id}'` }).catch(() => {});
+      res.json({ following: false });
+    } else {
+      await supabase.from('space_follows').insert({ space_id: id, user_id: userId });
+      await supabase.rpc('exec_sql', { sql: `UPDATE spaces SET followers_count = followers_count + 1 WHERE id = '${id}'` }).catch(() => {});
+      res.json({ following: true });
+    }
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// GET /api/spaces/:id/posts — posts de un espacio
+app.get('/api/spaces/:id/posts', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const page = parseInt(req.query.page) || 1;
+    const limit = 20;
+    const offset = (page - 1) * limit;
+
+    const { data: posts } = await supabase
+      .from('space_posts')
+      .select('*')
+      .eq('space_id', id)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (!posts || posts.length === 0) return res.json([]);
+
+    // Datos de autores
+    const authorIds = [...new Set(posts.map(p => p.author_id))];
+    const { data: authors } = await supabase.from('users').select('id, full_name, avatar_url').in('id', authorIds);
+    const authorsMap = {};
+    (authors || []).forEach(a => { authorsMap[a.id] = a; });
+
+    // Likes del usuario actual
+    const postIds = posts.map(p => p.id);
+    const { data: myLikes } = await supabase.from('space_post_likes').select('post_id').eq('user_id', userId).in('post_id', postIds);
+    const likedSet = new Set((myLikes || []).map(l => l.post_id));
+
+    const now = Date.now();
+    res.json(posts.map(p => {
+      const author = authorsMap[p.author_id] || {};
+      const diff = now - new Date(p.created_at).getTime();
+      const timeStr = diff < 60000 ? 'ahora' : diff < 3600000 ? `${Math.floor(diff/60000)}m` : diff < 86400000 ? `${Math.floor(diff/3600000)}h` : `${Math.floor(diff/86400000)}d`;
+      return {
+        id: p.id,
+        author: author.full_name || 'Usuario',
+        avatar: (author.full_name || 'U').split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase(),
+        avatarUrl: author.avatar_url || '',
+        color: '#00c8a0',
+        text: p.text,
+        imageUrl: p.image_url || null,
+        time: timeStr,
+        likes: p.likes_count || 0,
+        comments: p.comments_count || 0,
+        liked: likedSet.has(p.id),
+      };
+    }));
+  } catch (e) { res.json([]); }
+});
+
+// POST /api/spaces/:id/posts — publicar en un espacio
+app.post('/api/spaces/:id/posts', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { text, image_url } = req.body;
+    if (!text?.trim()) return res.status(400).json({ message: 'texto requerido' });
+    const { data, error } = await supabase
+      .from('space_posts')
+      .insert({ space_id: id, author_id: req.user.id, text: text.trim(), image_url: image_url || null })
+      .select().single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/spaces/posts/:postId/like — dar/quitar like
+app.post('/api/spaces/posts/:postId/like', auth, async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const userId = req.user.id;
+    const { data: existing } = await supabase.from('space_post_likes').select('id').eq('post_id', postId).eq('user_id', userId).single();
+    if (existing) {
+      await supabase.from('space_post_likes').delete().eq('post_id', postId).eq('user_id', userId);
+      await supabase.rpc('exec_sql', { sql: `UPDATE space_posts SET likes_count = GREATEST(0, likes_count - 1) WHERE id = '${postId}'` }).catch(() => {});
+      res.json({ liked: false });
+    } else {
+      await supabase.from('space_post_likes').insert({ post_id: postId, user_id: userId });
+      await supabase.rpc('exec_sql', { sql: `UPDATE space_posts SET likes_count = likes_count + 1 WHERE id = '${postId}'` }).catch(() => {});
+      res.json({ liked: true });
+    }
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// GET /api/spaces/posts/:postId/comments — comentarios de un post
+app.get('/api/spaces/posts/:postId/comments', auth, async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const { data: comments } = await supabase
+      .from('space_post_comments')
+      .select('*')
+      .eq('post_id', postId)
+      .order('created_at', { ascending: true });
+    if (!comments || comments.length === 0) return res.json([]);
+    const authorIds = [...new Set(comments.map(c => c.author_id))];
+    const { data: authors } = await supabase.from('users').select('id, full_name, avatar_url').in('id', authorIds);
+    const authorsMap = {};
+    (authors || []).forEach(a => { authorsMap[a.id] = a; });
+    const now = Date.now();
+    res.json(comments.map(c => {
+      const author = authorsMap[c.author_id] || {};
+      const diff = now - new Date(c.created_at).getTime();
+      const timeStr = diff < 60000 ? 'ahora' : diff < 3600000 ? `${Math.floor(diff/60000)}m` : `${Math.floor(diff/3600000)}h`;
+      return { id: c.id, author: author.full_name || 'Usuario', avatar: (author.full_name||'U').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase(), avatarUrl: author.avatar_url||'', text: c.text, time: timeStr };
+    }));
+  } catch (e) { res.json([]); }
+});
+
+// POST /api/spaces/posts/:postId/comments — comentar
+app.post('/api/spaces/posts/:postId/comments', auth, async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const { text } = req.body;
+    if (!text?.trim()) return res.status(400).json({ message: 'texto requerido' });
+    const { data, error } = await supabase
+      .from('space_post_comments')
+      .insert({ post_id: postId, author_id: req.user.id, text: text.trim() })
+      .select().single();
+    if (error) throw error;
+    await supabase.rpc('exec_sql', { sql: `UPDATE space_posts SET comments_count = comments_count + 1 WHERE id = '${postId}'` }).catch(() => {});
+    const { data: author } = await supabase.from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
+    res.status(201).json({ id: data.id, author: author?.full_name || 'Usuario', avatar: (author?.full_name||'U').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase(), avatarUrl: author?.avatar_url||'', text: data.text, time: 'ahora' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// DELETE /api/spaces/posts/:postId — eliminar post (solo autor o admin del espacio)
+app.delete('/api/spaces/posts/:postId', auth, async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const { error } = await supabase.from('space_posts').delete().eq('id', postId).eq('author_id', req.user.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// STORIES / ESTADOS
+// ════════════════════════════════════════════════════════════════════
+
+// Auto-crear tabla stories si no existe al primer uso
+const ensureStoriesTable = async () => {
+  try {
+    const { error } = await supabase.from('stories').select('id').limit(1);
+    if (error && error.message && error.message.includes('does not exist')) {
+      await supabase.rpc('exec_sql', {
+        sql: `CREATE TABLE IF NOT EXISTS stories (
+          id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+          user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+          media JSONB NOT NULL,
+          type TEXT DEFAULT 'text',
+          views INTEGER DEFAULT 0,
+          reactions JSONB DEFAULT '[]',
+          expires_at TIMESTAMPTZ NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_stories_user_id ON stories(user_id);
+        CREATE INDEX IF NOT EXISTS idx_stories_expires_at ON stories(expires_at);`
+      }).catch(() => {});
+    }
+  } catch {}
+};
+ensureStoriesTable();
+
+app.get('/api/stories', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const now = new Date().toISOString();
+
+    // 1. Mis propios estados
+    const { data: mine } = await supabase
+      .from('stories')
+      .select('*')
+      .eq('user_id', userId)
+      .gt('expires_at', now)
+      .order('created_at', { ascending: false });
+
+    // 2. IDs de contactos (tabla contacts)
+    const { data: contacts } = await supabase
+      .from('contacts')
+      .select('contact_user_id, contact_id')
+      .or(`user_id.eq.${userId},contact_id.eq.${userId}`)
+      .eq('is_blocked', false);
+
+    const contactIds = new Set();
+    (contacts || []).forEach(c => {
+      if (c.contact_user_id && c.contact_user_id !== userId) contactIds.add(c.contact_user_id);
+      if (c.contact_id && c.contact_id !== userId) contactIds.add(c.contact_id);
+    });
+
+    // 3. También incluir usuarios con quienes tengo chats activos
+    const { data: chatParts } = await supabase
+      .from('chat_participants')
+      .select('chat_id')
+      .eq('user_id', userId);
+
+    if (chatParts && chatParts.length > 0) {
+      const chatIds = chatParts.map(c => c.chat_id);
+      const { data: otherParts } = await supabase
+        .from('chat_participants')
+        .select('user_id')
+        .in('chat_id', chatIds)
+        .neq('user_id', userId);
+      (otherParts || []).forEach(p => contactIds.add(p.user_id));
+    }
+
+    // 4. Estados de contactos
+    let contactStories = [];
+    if (contactIds.size > 0) {
+      const { data } = await supabase
+        .from('stories')
+        .select('*')
+        .in('user_id', Array.from(contactIds))
+        .gt('expires_at', now)
+        .order('created_at', { ascending: false });
+      contactStories = data || [];
+    }
+
+    // 5. Obtener datos de usuarios para todos los stories
+    const allStories = [...(mine || []), ...contactStories];
+    const allUserIds = [...new Set(allStories.map(s => s.user_id))];
+    let usersMap = {};
+    if (allUserIds.length > 0) {
+      const { data: usersData } = await supabase
+        .from('users')
+        .select('id, full_name, avatar_url')
+        .in('id', allUserIds);
+      (usersData || []).forEach(u => { usersMap[u.id] = u; });
+    }
+
+    // 6. Formatear respuesta
+    const format = (s, isMe) => {
+      const user = usersMap[s.user_id] || {};
+      const name = user.full_name || 'Usuario';
+      let media = s.media;
+      if (typeof media === 'string') { try { media = JSON.parse(media); } catch { media = []; } }
+      return {
+        id: s.id,
+        userId: s.user_id,
+        userName: name,
+        avatarUrl: user.avatar_url || '',
+        media: Array.isArray(media) ? media : [],
+        views: s.views || 0,
+        reactions: s.reactions || [],
+        seen: false,
+        publishedAt: new Date(s.created_at).getTime(),
+        expiresAt: new Date(s.expires_at).getTime(),
+        isMe,
+      };
+    };
+
+    res.json([
+      ...(mine || []).map(s => format(s, true)),
+      ...contactStories.map(s => format(s, false)),
+    ]);
+  } catch (e) { res.json([]); }
+});
+
+app.post('/api/stories', auth, async (req, res) => {
+  try {
+    const { media, type = 'text' } = req.body;
+    if (!media) return res.status(400).json({ message: 'media requerido' });
+    const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+    const newSlides = Array.isArray(media) ? media : [media];
+
+    // Upsert: añadir a story activa existente o crear nueva
+    const { data: existing } = await supabase
+      .from('stories')
+      .select('id, media')
+      .eq('user_id', req.user.id)
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    let story;
+    if (existing) {
+      let currentMedia = existing.media;
+      if (typeof currentMedia === 'string') { try { currentMedia = JSON.parse(currentMedia); } catch { currentMedia = []; } }
+      const updatedMedia = [...(Array.isArray(currentMedia) ? currentMedia : []), ...newSlides];
+      const { data, error } = await supabase
+        .from('stories')
+        .update({ media: updatedMedia, expires_at: expiresAt })
+        .eq('id', existing.id)
+        .select()
+        .single();
+      if (error) throw error;
+      story = data;
+    } else {
+      const { data, error } = await supabase
+        .from('stories')
+        .insert({ user_id: req.user.id, media: newSlides, type, views: 0, expires_at: expiresAt })
+        .select()
+        .single();
+      if (error) throw error;
+      story = data;
+    }
+    res.status(201).json({ id: story.id, media: story.media, expiresAt: story.expires_at });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.delete('/api/stories/:storyId', auth, async (req, res) => {
+  try {
+    const { error } = await supabase.from('stories').delete().eq('id', req.params.storyId).eq('user_id', req.user.id);
+    if (error) throw error;
+    res.json({ message: 'Story eliminada' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// PATCH /api/stories/:storyId/slide/:idx — editar contenido de un slide
+app.patch('/api/stories/:storyId/slide/:idx', auth, async (req, res) => {
+  try {
+    const { storyId, idx } = req.params;
+    const slideIdx = parseInt(idx);
+    const { content, bg, emoji, music } = req.body;
+    const { data: story, error: fetchErr } = await supabase
+      .from('stories').select('media').eq('id', storyId).eq('user_id', req.user.id).single();
+    if (fetchErr || !story) return res.status(404).json({ message: 'Story no encontrada' });
+    let media = story.media;
+    if (typeof media === 'string') { try { media = JSON.parse(media); } catch { media = []; } }
+    if (!Array.isArray(media) || slideIdx < 0 || slideIdx >= media.length)
+      return res.status(400).json({ message: 'Slide no existe' });
+    const updated = media.map((s, i) => i === slideIdx ? {
+      ...s,
+      ...(content !== undefined ? { content } : {}),
+      ...(bg !== undefined ? { bg } : {}),
+      ...(emoji !== undefined ? { emoji } : {}),
+      ...(music !== undefined ? { music } : {}),
+    } : s);
+    const { error: updateErr } = await supabase.from('stories').update({ media: updated }).eq('id', storyId);
+    if (updateErr) throw updateErr;
+    res.json({ ok: true, media: updated });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.post('/api/stories/:storyId/view', auth, async (req, res) => {
+  try {
+    const { data: s } = await supabase.from('stories').select('views').eq('id', req.params.storyId).single();
+    if (s) await supabase.from('stories').update({ views: (s.views || 0) + 1 }).eq('id', req.params.storyId);
+    res.json({ ok: true });
+  } catch (e) { res.json({ ok: false }); }
+});
+
+app.post('/api/stories/:storyId/react', auth, async (req, res) => {
+  try {
+    const { emoji } = req.body;
+    if (!emoji) return res.status(400).json({ message: 'emoji requerido' });
+    const { data: story } = await supabase.from('stories').select('reactions').eq('id', req.params.storyId).single();
+    if (!story) return res.status(404).json({ message: 'Story no encontrada' });
+    const reactions = story.reactions || [];
+    const existing = reactions.find(r => r.emoji === emoji);
+    const updated = existing ? reactions.map(r => r.emoji === emoji ? { ...r, count: r.count + 1 } : r) : [...reactions, { emoji, count: 1 }];
+    await supabase.from('stories').update({ reactions: updated }).eq('id', req.params.storyId);
+    res.json({ reactions: updated });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// START
+// ════════════════════════════════════════════════════════════════════
+const updateUserVersions = async () => {
+  const isPlaceholderSupabase =
+    !process.env.SUPABASE_URL ||
+    !process.env.SUPABASE_SERVICE_KEY ||
+    process.env.SUPABASE_URL.includes('TU_PROYECTO') ||
+    process.env.SUPABASE_SERVICE_KEY.includes('TU_SERVICE_ROLE_KEY');
+
+  if (isPlaceholderSupabase) {
+    console.warn('Skipping user version update: Supabase credentials are missing or placeholder values.');
+    return;
+  }
+
+  try {
+    const { error } = await supabase.from('users').update({ app_version: APP_VERSION });
+    if (error) {
+      const missingColumn = /column \"app_version\".*does not exist/i.test(error.message || '');
+      console.warn('User versions update not completed:', error.message);
+      if (missingColumn) {
+        console.warn('The users table is missing the app_version column. Add it before retrying.');
+      }
+      return;
+    }
+    console.log(`Updated app_version for all users to ${APP_VERSION}.`);
+  } catch (e) {
+    console.warn('Failed updating user versions:', e.message);
+  }
+};
+
+// ─── WebRTC Signaling — persistido en Supabase ───────────────────────────────
+
+// Iniciar llamada — caller envía offer + push al destinatario
+app.post('/api/call/offer', auth, async (req, res) => {
+  const { callId, offer, targetUserId, type } = req.body;
+  if (!callId || !offer) return res.status(400).json({ error: 'callId y offer requeridos' });
+  try {
+    await supabase.from('call_sessions').upsert({
+      call_id: callId,
+      offer: JSON.stringify(offer),
+      answer: null,
+      caller_candidates: '[]',
+      callee_candidates: '[]',
+      type: type || 'audio',
+      caller_id: req.user.id,
+      target_user_id: targetUserId,
+      ended: false,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'call_id' });
+
+    // Enviar push de llamada entrante al destinatario
+    if (targetUserId) {
+      try {
+        const { data: caller } = await supabase
+          .from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
+        const callerName = caller?.full_name || 'Alguien';
+        const isVideo = (type || 'audio') === 'video';
+        const callPushPayload = {
+          title: isVideo ? `📹 Videollamada de ${callerName}` : `📞 Llamada de ${callerName}`,
+          body: isVideo ? 'Toca para responder la videollamada' : 'Toca para responder la llamada',
+          icon: caller?.avatar_url || '/favicon.svg',
+          badge: '/favicon.svg',
+          tag: `call-${callId}`,
+          requireInteraction: true,
+          url: '/',
+          callId,
+          callerId: req.user.id,
+          callerName,
+          callType: type || 'audio',
+          notificationType: 'incoming_call',
+        };
+
+        // Enviar push inmediatamente — una sola vez
+        // (el SW tiene requireInteraction:true, la notificación no desaparece sola)
+        await sendPushToUser(targetUserId, callPushPayload);
+
+      } catch (pushErr) {
+        console.warn('Push call notification failed:', pushErr.message);
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Error guardando sesión' });
+  }
+});
+
+// Callee responde con answer
+app.post('/api/call/answer', auth, async (req, res) => {
+  const { callId, answer } = req.body;
+  const { data } = await supabase.from('call_sessions').select('call_id').eq('call_id', callId).eq('ended', false).single();
+  if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
+  await supabase.from('call_sessions').update({ answer: JSON.stringify(answer), updated_at: new Date().toISOString() }).eq('call_id', callId);
+  res.json({ ok: true });
+});
+
+// Enviar ICE candidate
+app.post('/api/call/ice', auth, async (req, res) => {
+  const { callId, candidate, role } = req.body;
+  const { data } = await supabase.from('call_sessions').select('caller_candidates, callee_candidates').eq('call_id', callId).single();
+  if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
+  if (role === 'caller') {
+    const arr = JSON.parse(data.caller_candidates || '[]');
+    arr.push(candidate);
+    await supabase.from('call_sessions').update({ caller_candidates: JSON.stringify(arr), updated_at: new Date().toISOString() }).eq('call_id', callId);
+  } else {
+    const arr = JSON.parse(data.callee_candidates || '[]');
+    arr.push(candidate);
+    await supabase.from('call_sessions').update({ callee_candidates: JSON.stringify(arr), updated_at: new Date().toISOString() }).eq('call_id', callId);
+  }
+  res.json({ ok: true });
+});
+
+// Polling — obtener estado de la llamada
+app.get('/api/call/:callId', auth, async (req, res) => {
+  const { data } = await supabase.from('call_sessions').select('*').eq('call_id', req.params.callId).single();
+  if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
+  res.json({
+    offer: JSON.parse(data.offer || 'null'),
+    answer: data.answer ? JSON.parse(data.answer) : null,
+    callerCandidates: JSON.parse(data.caller_candidates || '[]'),
+    calleeCandidates: JSON.parse(data.callee_candidates || '[]'),
+    type: data.type,
+    callerId: data.caller_id,
+    targetUserId: data.target_user_id,
+    ended: data.ended,
+  });
+});
+
+// Terminar llamada
+app.delete('/api/call/:callId', auth, async (req, res) => {
+  await supabase.from('call_sessions').update({ ended: true, updated_at: new Date().toISOString() }).eq('call_id', req.params.callId);
+  // Borrar después de 15 segundos
+  setTimeout(async () => {
+    await supabase.from('call_sessions').delete().eq('call_id', req.params.callId);
+  }, 15000);
+  res.json({ ok: true });
+});
+
+// Notificar llamada entrante (el callee hace polling de esto)
+app.get('/api/call/incoming/:userId', auth, async (req, res) => {
+  const { data } = await supabase
+    .from('call_sessions')
+    .select('*')
+    .eq('target_user_id', req.params.userId)
+    .eq('ended', false)
+    .is('answer', null)
+    .order('created_at', { ascending: false })
+    .limit(5);
+  if (!data || data.length === 0) return res.json([]);
+  // Limpiar sesiones muy antiguas (más de 150 segundos — tiempo para desbloquear teléfono hibernado)
+  const now = Date.now();
+  const valid = data.filter(s => now - new Date(s.created_at).getTime() < 150000);
+  res.json(valid.map(s => ({
+    callId: s.call_id,
+    callerId: s.caller_id,
+    type: s.type,
+    offer: JSON.parse(s.offer || 'null'),
+  })));
+});
+
+// Limpiar sesiones antiguas cada 5 minutos
+setInterval(async () => {
+  const cutoff = new Date(Date.now() - 300000).toISOString(); // 5 minutos — suficiente para llamadas largas
+  await supabase.from('call_sessions').delete().lt('created_at', cutoff);
+}, 300000);
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WEB PUSH — VAPID
+// ─────────────────────────────────────────────────────────────────────────────
+const webpush = require('web-push');
+
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || 'BNeDJFYqIX59vgqEKxWfrI263knyPGHafMEK_WrMPeYaIm8bn62vcOah7hDlgIek4R4utB82g-cT9CwAtGn0wUs';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || 'Ur3h0gh5W6F_dzQNhkXCwtkEV1sMGpo568ZB1Bglpt8';
+
+webpush.setVapidDetails(
+  'mailto:admin@egchat.app',
+  VAPID_PUBLIC_KEY,
+  VAPID_PRIVATE_KEY
+);
+
+// Guardar suscripción push del usuario
+app.post('/api/push/subscribe', auth, async (req, res) => {
+  try {
+    const { subscription } = req.body;
+    if (!subscription || !subscription.endpoint) {
+      return res.status(400).json({ message: 'Suscripción inválida' });
+    }
+    // Guardar en Supabase (tabla push_subscriptions)
+    await supabase.from('push_subscriptions').upsert({
+      user_id: req.user.id,
+      endpoint: subscription.endpoint,
+      p256dh: subscription.keys?.p256dh || '',
+      auth: subscription.keys?.auth || '',
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'user_id,endpoint' });
+
+    res.json({ message: 'Suscripción guardada' });
+  } catch (e) {
+    console.error('Push subscribe error:', e.message);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Eliminar suscripción push
+app.post('/api/push/unsubscribe', auth, async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    await supabase.from('push_subscriptions')
+      .delete()
+      .eq('user_id', req.user.id)
+      .eq('endpoint', endpoint || '');
+    res.json({ message: 'Suscripción eliminada' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Obtener clave pública VAPID
+app.get('/api/push/vapid-public-key', (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+// Función interna para enviar push a un usuario
+const sendPushToUser = async (userId, payload) => {
+  try {
+    const isCall = payload.notificationType === 'incoming_call';
+
+    // ── Web Push (navegador/PWA) ──────────────────────────────────────────
+    const { data: subs } = await supabase
+      .from('push_subscriptions')
+      .select('endpoint, p256dh, auth')
+      .eq('user_id', userId);
+
+    if (subs && subs.length > 0) {
+      const payloadStr = JSON.stringify(payload);
+      // Para llamadas: urgency=high despierta el teléfono aunque esté hibernado
+      // TTL=0 en llamadas significa "entregar ahora o nunca" (no tiene sentido entregar una llamada vieja)
+      const pushOptions = isCall
+        ? { urgency: 'high', TTL: 120 }   // 120s — tiempo para desbloquear el teléfono
+        : { urgency: 'normal', TTL: 86400 };
+      await Promise.allSettled(
+        subs.map(sub =>
+          webpush.sendNotification(
+            { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+            payloadStr,
+            pushOptions
+          ).catch(async err => {
+            if (err.statusCode === 410 || err.statusCode === 404) {
+              await supabase.from('push_subscriptions').delete().eq('endpoint', sub.endpoint);
+            }
+            throw err;
+          })
+        )
+      );
+    }
+
+    // ── Expo Push (app movil nativa — funciona con telefono hibernado) ────
+    const { data: expoSubs } = await supabase
+      .from('expo_push_tokens')
+      .select('token')
+      .eq('user_id', userId);
+
+    if (expoSubs && expoSubs.length > 0) {
+      const expoMessages = expoSubs.map(sub => ({
+        to: sub.token,
+        title: payload.title || 'EGChat',
+        body: payload.body || 'Nueva notificacion',
+        sound: isCall ? 'default' : 'notification.wav',
+        badge: 1,
+        channelId: isCall ? 'egchat-calls' : 'egchat-messages',
+        priority: isCall ? 'high' : 'normal',
+        data: payload,
+        // Llamadas: TTL de 120s para dar tiempo a desbloquear el teléfono
+        ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
+      }));
+
+      for (let i = 0; i < expoMessages.length; i += 100) {
+        const batch = expoMessages.slice(i, i + 100);
+        try {
+          const expoRes = await fetch('https://exp.host/--/api/v2/push/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify(batch),
+          });
+          const result = await expoRes.json();
+          if (result.data) {
+            const invalid = result.data
+              .map((r, idx) => ({ r, token: batch[idx].to }))
+              .filter(({ r }) => r.status === 'error' && r.details?.error === 'DeviceNotRegistered');
+            if (invalid.length > 0) {
+              await Promise.allSettled(
+                invalid.map(({ token }) => supabase.from('expo_push_tokens').delete().eq('token', token))
+              );
+            }
+          }
+        } catch (expoErr) {
+          console.warn('Expo push error:', expoErr.message);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('sendPushToUser error:', e.message);
+  }
+};
+
+// ── Registrar token Expo Push (app movil nativa) ──────────────────────────
+app.post('/api/push/register-expo-token', auth, async (req, res) => {
+  try {
+    const { expoPushToken, platform } = req.body;
+    if (!expoPushToken || !expoPushToken.startsWith('ExponentPushToken[')) {
+      return res.status(400).json({ message: 'Token Expo invalido' });
+    }
+    await supabase.from('expo_push_tokens').upsert({
+      user_id: req.user.id,
+      token: expoPushToken,
+      platform: platform || 'android',
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'token' });
+    res.json({ message: 'Token registrado' });
+  } catch (e) {
+    console.error('Expo token register error:', e.message);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUSH DIAGNOSTICS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Admin: verificar suscripciones por teléfono
+app.get('/api/push/check/:phone', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.query.key;
+  if (!key || key !== (process.env.ADMIN_RESET_KEY || JWT_SECRET)) {
+    return res.status(403).json({ message: 'No autorizado' });
+  }
+  try {
+    const phone = decodeURIComponent(req.params.phone);
+    const { data: user } = await supabase.from('users').select('id, full_name, phone').eq('phone', phone).single();
+    if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
+    const { data: subs } = await supabase.from('push_subscriptions').select('id, endpoint, updated_at').eq('user_id', user.id);
+    res.json({ user: { id: user.id, name: user.full_name, phone: user.phone }, subscriptions: (subs || []).length, details: (subs || []).map(s => ({ id: s.id, endpoint: s.endpoint.slice(0, 80) + '...', updated_at: s.updated_at })) });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Admin: enviar push de prueba por teléfono
+app.post('/api/push/send-test/:phone', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.query.key;
+  if (!key || key !== (process.env.ADMIN_RESET_KEY || JWT_SECRET)) {
+    return res.status(403).json({ message: 'No autorizado' });
+  }
+  try {
+    const phone = decodeURIComponent(req.params.phone);
+    const { data: user } = await supabase.from('users').select('id, full_name').eq('phone', phone).single();
+    if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
+    const result = await sendPushToUser(user.id, {
+      title: '🔔 EGChat — Prueba',
+      body: `Hola ${user.full_name}, las notificaciones funcionan!`,
+      icon: '/favicon.svg',
+      tag: 'test-push-' + Date.now(),
+      url: '/',
+    });
+    res.json({ message: 'Push enviado', userId: user.id, result });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Ver cuántas suscripciones tiene el usuario actual
+app.get('/api/push/my-subscriptions', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('push_subscriptions')
+      .select('id, endpoint, created_at, updated_at')
+      .eq('user_id', req.user.id);
+    if (error) return res.status(500).json({ message: error.message });
+    res.json({ count: (data || []).length, subscriptions: (data || []).map(s => ({ id: s.id, endpoint: s.endpoint.slice(0, 60) + '...', updated_at: s.updated_at })) });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Enviar push de prueba al usuario actual
+app.post('/api/push/test', auth, async (req, res) => {
+  try {
+    const result = await sendPushToUser(req.user.id, {
+      title: '🔔 EGChat — Prueba',
+      body: 'Las notificaciones funcionan correctamente',
+      icon: '/favicon.svg',
+      tag: 'test-push',
+      url: '/',
+    });
+    res.json({ message: 'Push enviado', result });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// NOTICIAS GOBIERNO GE — Scraping de fuentes oficiales
+// ══════════════════════════════════════════════════════════════════
+
+// Cache en memoria para no saturar las fuentes
+const noticiasCache = { data: [], timestamp: 0 };
+const NOTICIAS_TTL = 5 * 60 * 1000; // 5 minutos
+
+// Fuentes oficiales del Gobierno de Guinea Ecuatorial
+const FUENTES_OFICIALES = [
+  { nombre: 'Presidencia del Gobierno', url: 'https://primatura.gob.gq/noticias/', dominio: 'primatura.gob.gq', color: '#1e3a5f' },
+  { nombre: 'Guinea Ecuatorial Press', url: 'https://www.guineaecuatorialpress.com/', dominio: 'guineaecuatorialpress.com', color: '#0369a1' },
+  { nombre: 'Presidencia GQ', url: 'https://www.presidenciagobierno.gq', dominio: 'presidenciagobierno.gq', color: '#1e3a5f' },
+  { nombre: 'La Vice Press', url: 'https://www.lavicepress.com', dominio: 'lavicepress.com', color: '#0d9488' },
+];
+
+// Extrae noticias de primatura.gob.gq parseando el HTML
+async function scrapePrimatura() {
+  const noticias = [];
+  try {
+    const res = await fetch('https://primatura.gob.gq/noticias/', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EGChatBot/1.0)' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return noticias;
+    const html = await res.text();
+
+    // Extraer artículos: busca patrones <h2> o <h3> con enlaces dentro de .post, article, .entry-title
+    const titleRegex = /<(?:h[123]|a)[^>]*class="[^"]*(?:entry-title|post-title)[^"]*"[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const altRegex = /<article[^>]*>([\s\S]*?)<\/article>/gi;
+    const dateRegex = /<time[^>]*datetime="([^"]+)"[^>]*>/i;
+    const linkRegex = /<a[^>]+href="(https?:\/\/primatura\.gob\.gq\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+
+    let m;
+    // Método 1: buscar h2/h3 con clase entry-title
+    while ((m = titleRegex.exec(html)) !== null) {
+      const url = m[1];
+      const title = m[2].replace(/<[^>]+>/g, '').trim();
+      if (title.length > 10) {
+        noticias.push({ title, url, fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Gobierno' });
+      }
+    }
+
+    // Método 2: buscar todos los enlaces a artículos de primatura
+    if (noticias.length === 0) {
+      while ((m = linkRegex.exec(html)) !== null) {
+        const url = m[1];
+        const title = m[2].replace(/<[^>]+>/g, '').trim();
+        if (title.length > 15 && !url.includes('/page/') && !url.includes('/category/') && !url.includes('/tag/')) {
+          noticias.push({ title, url, fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Gobierno' });
+        }
+      }
+    }
+  } catch (e) {
+    console.log('[Noticias] Error scraping primatura:', e.message);
+  }
+  return noticias.slice(0, 10);
+}
+
+// Extrae noticias de guineaecuatorialpress.com
+async function scrapeGEPress() {
+  const noticias = [];
+  try {
+    const res = await fetch('http://guineaecuatorialpress.com/', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EGChatBot/1.0)' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return noticias;
+    const html = await res.text();
+
+    const linkRegex = /<a[^>]+href="(https?:\/\/(?:www\.)?guineaecuatorialpress\.com\/[^"#?]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    const seen = new Set();
+    while ((m = linkRegex.exec(html)) !== null) {
+      const url = m[1];
+      const title = m[2].replace(/<[^>]+>/g, '').trim();
+      if (title.length > 15 && !seen.has(url) && !url.match(/\/(category|tag|page|author)\//)) {
+        seen.add(url);
+        noticias.push({ title, url, fuente: 'Guinea Ecuatorial Press', dominio: 'guineaecuatorialpress.com', color: '#0369a1', category: 'Noticias' });
+      }
+    }
+  } catch (e) {
+    console.log('[Noticias] Error scraping GEPress:', e.message);
+  }
+  return noticias.slice(0, 10);
+}
+
+// Extrae noticias de presidenciagobierno.gq
+async function scrapePresidencia() {
+  const noticias = [];
+  try {
+    const res = await fetch('https://www.presidenciagobierno.gq', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EGChatBot/1.0)' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return noticias;
+    const html = await res.text();
+    const linkRegex = /<a[^>]+href="(https?:\/\/(?:www\.)?presidenciagobierno\.gq\/[^"#?]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    const seen = new Set();
+    while ((m = linkRegex.exec(html)) !== null) {
+      const url = m[1];
+      const title = m[2].replace(/<[^>]+>/g, '').trim();
+      if (title.length > 15 && !seen.has(url) && !url.match(/\/(category|tag|page|author)\//)) {
+        seen.add(url);
+        noticias.push({ title, url, fuente: 'Presidencia GQ', dominio: 'presidenciagobierno.gq', color: '#1e3a5f', category: 'Presidencia' });
+      }
+    }
+  } catch (e) {
+    console.log('[Noticias] Error scraping Presidencia GQ:', e.message);
+  }
+  return noticias.slice(0, 10);
+}
+
+// Extrae noticias de lavicepress.com
+async function scrapeLaVicePress() {
+  const noticias = [];
+  try {
+    const res = await fetch('https://www.lavicepress.com', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EGChatBot/1.0)' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return noticias;
+    const html = await res.text();
+    const linkRegex = /<a[^>]+href="(https?:\/\/(?:www\.)?lavicepress\.com\/[^"#?]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    const seen = new Set();
+    while ((m = linkRegex.exec(html)) !== null) {
+      const url = m[1];
+      const title = m[2].replace(/<[^>]+>/g, '').trim();
+      if (title.length > 15 && !seen.has(url) && !url.match(/\/(category|tag|page|author)\//)) {
+        seen.add(url);
+        noticias.push({ title, url, fuente: 'La Vice Press', dominio: 'lavicepress.com', color: '#0d9488', category: 'Vicepresidencia' });
+      }
+    }
+  } catch (e) {
+    console.log('[Noticias] Error scraping LaVicePress:', e.message);
+  }
+  return noticias.slice(0, 10);
+}
+
+// ── Enviar push de noticia del gobierno a TODOS los usuarios suscritos ────────
+async function sendGovNewsPush(noticia) {
+  try {
+    const { data: subs } = await supabase
+      .from('push_subscriptions')
+      .select('endpoint, p256dh, auth');
+
+    if (!subs || subs.length === 0) return;
+
+    const payload = JSON.stringify({
+      title: `🏛️ ${noticia.fuente}`,
+      body: noticia.title,
+      notificationType: 'government_news',
+      url: '/?view=estados&espacio=e1',
+      tag: `gov-news-${noticia.id || Date.now()}`,
+      icon: '/favicon.svg',
+      badge: '/favicon.svg',
+      newsUrl: noticia.url,
+      newsSource: noticia.fuente,
+    });
+
+    let sent = 0;
+    await Promise.allSettled(
+      subs.map(sub =>
+        webpush.sendNotification(
+          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+          payload,
+          { urgency: 'normal', TTL: 3600 }
+        ).then(() => { sent++; }).catch(async err => {
+          if (err.statusCode === 410 || err.statusCode === 404) {
+            await supabase.from('push_subscriptions').delete().eq('endpoint', sub.endpoint);
+          }
+        })
+      )
+    );
+    console.log(`[GovNews] Push enviado a ${sent}/${subs.length} suscriptores: "${noticia.title.substring(0, 50)}..."`);
+  } catch (e) {
+    console.error('[GovNews] Error enviando push:', e.message);
+  }
+}
+
+// ── Scheduler: revisar noticias nuevas cada 10 minutos y notificar ────────────
+const govNewsSeenUrls = new Set();
+let govNewsSchedulerStarted = false;
+
+async function checkAndNotifyNewGovNews() {
+  try {
+    const [primatura, gepress, presidencia, lavice] = await Promise.allSettled([
+      scrapePrimatura(),
+      scrapeGEPress(),
+      scrapePresidencia(),
+      scrapeLaVicePress(),
+    ]);
+
+    const all = [
+      ...(primatura.status === 'fulfilled' ? primatura.value : []),
+      ...(gepress.status === 'fulfilled' ? gepress.value : []),
+      ...(presidencia.status === 'fulfilled' ? presidencia.value : []),
+      ...(lavice.status === 'fulfilled' ? lavice.value : []),
+    ];
+
+    // Primera ejecución: solo registrar URLs conocidas sin notificar
+    if (govNewsSeenUrls.size === 0) {
+      all.forEach(n => govNewsSeenUrls.add(n.url));
+      console.log(`[GovNews] Scheduler iniciado. ${all.length} noticias registradas como conocidas.`);
+      // Actualizar cache
+      noticiasCache.data = all.map((n, i) => ({ id: `gov-${Date.now()}-${i}`, ...n, scrapedAt: Date.now() }));
+      noticiasCache.timestamp = Date.now();
+      return;
+    }
+
+    // Detectar noticias nuevas
+    const nuevas = all.filter(n => !govNewsSeenUrls.has(n.url));
+    nuevas.forEach(n => govNewsSeenUrls.add(n.url));
+
+    if (nuevas.length > 0) {
+      console.log(`[GovNews] ${nuevas.length} noticias nuevas detectadas!`);
+      // Actualizar cache con todas las noticias
+      noticiasCache.data = all.map((n, i) => ({ id: `gov-${Date.now()}-${i}`, ...n, scrapedAt: Date.now() }));
+      noticiasCache.timestamp = Date.now();
+      // Enviar push solo para las primeras 3 noticias nuevas (evitar spam)
+      for (const noticia of nuevas.slice(0, 3)) {
+        await sendGovNewsPush({ ...noticia, id: `gov-${Date.now()}` });
+        await new Promise(r => setTimeout(r, 1500)); // pausa entre notificaciones
+      }
+    }
+  } catch (e) {
+    console.error('[GovNews] Error en scheduler:', e.message);
+  }
+}
+
+function startGovNewsScheduler() {
+  if (govNewsSchedulerStarted) return;
+  govNewsSchedulerStarted = true;
+  console.log('[GovNews] Scheduler iniciado — revisando cada 10 minutos');
+  // Primera ejecución inmediata
+  checkAndNotifyNewGovNews();
+  // Luego cada 10 minutos
+  setInterval(checkAndNotifyNewGovNews, 10 * 60 * 1000);
+}
+
+// Noticias de respaldo curadas (cuando las fuentes no responden)
+const NOTICIAS_FALLBACK = [
+  { title: 'El Ministerio de Sanidad presenta en Bata su Plan de Accion ante el Encargado de la Coordinacion Administrativa', url: 'https://primatura.gob.gq/el-ministerio-de-sanidad-presenta-en-bata-su-plan-de-accion/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Salud', publishedAt: '2025-10-08' },
+  { title: 'Avanza con firmeza el Plan de Seguro Medico Universal en Guinea Ecuatorial', url: 'https://primatura.gob.gq/avanza-con-firmeza-el-plan-de-seguro-medico-universal-en-guinea-ecuatorial/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Salud', publishedAt: '2025-10-08' },
+  { title: 'Guinea Ecuatorial asume la presidencia rotativa de la CEMAC para el periodo 2026-2027', url: 'https://primatura.gob.gq/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Diplomacia', publishedAt: '2026-01-15' },
+  { title: 'Camerun y Guinea Ecuatorial firman acuerdo para extraccion conjunta de gas del campo Yoyo-Yolanda', url: 'https://primatura.gob.gq/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Energia', publishedAt: '2026-02-03' },
+  { title: 'Guinea Ecuatorial anuncia oficialmente el cambio de capital de Malabo a Ciudad de la Paz', url: 'https://primatura.gob.gq/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Gobierno', publishedAt: '2026-01-03' },
+  { title: 'El Papa Leon XIV visita Guinea Ecuatorial en la ultima etapa de su gira africana', url: 'https://primatura.gob.gq/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Internacional', publishedAt: '2026-04-21' },
+  { title: 'Turquia amplia estrategia portuaria en Africa: Alport asume los puertos de Malabo y Bata', url: 'https://primatura.gob.gq/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Economia', publishedAt: '2026-04-20' },
+  { title: 'TGS desarrollara datos sismicos actualizados para Guinea Ecuatorial', url: 'https://www.guineaecuatorialpress.com/', fuente: 'Guinea Ecuatorial Press', dominio: 'guineaecuatorialpress.com', color: '#0369a1', category: 'Energia', publishedAt: '2026-04-18' },
+  { title: 'Nuevo programa de becas universitarias 2026: plazo de solicitud hasta el 30 de abril', url: 'https://primatura.gob.gq/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Educacion', publishedAt: '2026-04-10' },
+  { title: 'Plan Nacional de Empleo Juvenil 2026: 10.000 puestos de trabajo para jovenes guineanos', url: 'https://primatura.gob.gq/', fuente: 'Presidencia del Gobierno', dominio: 'primatura.gob.gq', color: '#1e3a5f', category: 'Empleo', publishedAt: '2026-03-20' },
+  { title: 'Vicepresidencia lanza programa de digitalizacion de servicios publicos en Guinea Ecuatorial', url: 'https://www.lavicepress.com/', fuente: 'La Vice Press', dominio: 'lavicepress.com', color: '#0d9488', category: 'Tecnologia', publishedAt: '2026-04-15' },
+  { title: 'Presidencia del Gobierno aprueba nuevo plan de infraestructuras para Bata y Malabo', url: 'https://www.presidenciagobierno.gq/', fuente: 'Presidencia GQ', dominio: 'presidenciagobierno.gq', color: '#1e3a5f', category: 'Infraestructura', publishedAt: '2026-04-12' },
+];
+
+app.get('/api/noticias/gobierno', async (req, res) => {
+  try {
+    const now = Date.now();
+    // Devolver cache si es reciente
+    if (noticiasCache.data.length > 0 && now - noticiasCache.timestamp < NOTICIAS_TTL) {
+      return res.json({ noticias: noticiasCache.data, fromCache: true, updatedAt: noticiasCache.timestamp });
+    }
+
+    // Intentar scraping en paralelo de todas las fuentes
+    const [primatura, gepress, presidencia, lavice] = await Promise.allSettled([
+      scrapePrimatura(),
+      scrapeGEPress(),
+      scrapePresidencia(),
+      scrapeLaVicePress(),
+    ]);
+
+    const scraped = [
+      ...(primatura.status === 'fulfilled' ? primatura.value : []),
+      ...(gepress.status === 'fulfilled' ? gepress.value : []),
+      ...(presidencia.status === 'fulfilled' ? presidencia.value : []),
+      ...(lavice.status === 'fulfilled' ? lavice.value : []),
+    ];
+
+    // Si el scraping devuelve resultados, usarlos; si no, usar fallback
+    const noticias = scraped.length >= 3 ? scraped : NOTICIAS_FALLBACK;
+
+    // Añadir id y timestamp
+    const result = noticias.map((n, i) => ({
+      id: `gov-${Date.now()}-${i}`,
+      ...n,
+      publishedAt: n.publishedAt || new Date().toISOString().split('T')[0],
+      scrapedAt: now,
+    }));
+
+    noticiasCache.data = result;
+    noticiasCache.timestamp = now;
+
+    res.json({ noticias: result, fromCache: false, updatedAt: now });
+  } catch (e) {
+    // En caso de error total, devolver fallback
+    res.json({ noticias: NOTICIAS_FALLBACK.map((n, i) => ({ id: `gov-fb-${i}`, ...n, scrapedAt: Date.now() })), fromCache: false, updatedAt: Date.now() });
+  }
+});
+
+if (require.main === module) {
+  app.listen(PORT, async () => {
+    console.log(`\n😎 EGCHAT API + Supabase en http://localhost:${PORT}`);
+    console.log(`   Supabase: ${process.env.SUPABASE_URL ? '✅ Conectado' : '❌ Sin configurar'}`);
+    // Iniciar scheduler de noticias del gobierno
+    startGovNewsScheduler();
+    console.log(`   Auth:   POST /api/auth/register | /api/auth/login`);
+    console.log(`   Wallet: GET  /api/wallet/balance | POST /api/wallet/deposit`);
+    console.log(`   Lia-25: POST /api/lia/chat\n`);
+    // Crear tabla call_sessions si no existe
+    try {
+      await supabase.rpc('exec_sql', { sql: `
+        CREATE TABLE IF NOT EXISTS call_sessions (
+          call_id VARCHAR(100) PRIMARY KEY,
+          offer TEXT, answer TEXT,
+          caller_candidates TEXT DEFAULT '[]',
+          callee_candidates TEXT DEFAULT '[]',
+          type VARCHAR(10) DEFAULT 'audio',
+          caller_id TEXT NOT NULL,
+          target_user_id TEXT NOT NULL,
+          ended BOOLEAN DEFAULT FALSE,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+      `}).catch(() => {});
+    } catch {}
+  });
+  updateUserVersions();
+}
+
+module.exports = app;
+
+
 

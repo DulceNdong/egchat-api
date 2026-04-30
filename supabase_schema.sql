@@ -76,9 +76,93 @@ CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_a
 CREATE INDEX IF NOT EXISTS idx_lia_conversations_user_id ON lia_conversations(user_id);
 CREATE INDEX IF NOT EXISTS idx_contacts_user_id ON contacts(user_id);
 
+-- Tabla de noticias del gobierno
+CREATE TABLE IF NOT EXISTS government_news (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  title TEXT NOT NULL,
+  url TEXT UNIQUE NOT NULL,
+  source VARCHAR(100) NOT NULL,
+  color VARCHAR(20) DEFAULT '#0369a1',
+  category VARCHAR(50),
+  scraped_at TIMESTAMPTZ DEFAULT NOW(),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Tabla de suscripciones push
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  subscription JSONB NOT NULL,
+  active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indices
+CREATE INDEX IF NOT EXISTS idx_government_news_scraped_at ON government_news(scraped_at DESC);
+CREATE INDEX IF NOT EXISTS idx_government_news_source ON government_news(source);
+CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user_id ON push_subscriptions(user_id);
+CREATE INDEX IF NOT EXISTS idx_push_subscriptions_active ON push_subscriptions(active);
+
 -- Codigos de recarga de prueba
 INSERT INTO recharge_codes (code, amount, expires_at) VALUES
   ('1234-5678-9012-3456', 5000,  NOW() + INTERVAL '1 year'),
   ('ABCD-EFGH-IJKL-MNOP', 10000, NOW() + INTERVAL '1 year'),
   ('TEST-CODE-2026-EGCH', 25000, NOW() + INTERVAL '1 year')
 ON CONFLICT (code) DO NOTHING;
+
+-- Tabla de estados/stories
+CREATE TABLE IF NOT EXISTS stories (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+  media JSONB NOT NULL,
+  type TEXT DEFAULT 'text',
+  views INTEGER DEFAULT 0,
+  reactions JSONB DEFAULT '[]',
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_stories_user_id ON stories(user_id);
+CREATE INDEX IF NOT EXISTS idx_stories_expires_at ON stories(expires_at);
+
+-- Tabla de sesiones de llamadas WebRTC
+CREATE TABLE IF NOT EXISTS call_sessions (
+  call_id VARCHAR(100) PRIMARY KEY,
+  offer TEXT,
+  answer TEXT,
+  caller_candidates TEXT DEFAULT '[]',
+  callee_candidates TEXT DEFAULT '[]',
+  type VARCHAR(10) DEFAULT 'audio',
+  caller_id TEXT NOT NULL,
+  target_user_id TEXT NOT NULL,
+  ended BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_call_sessions_target ON call_sessions(target_user_id, ended);
+CREATE INDEX IF NOT EXISTS idx_call_sessions_created ON call_sessions(created_at);
+
+-- Tabla para "eliminar para mí" (mensajes ocultos por usuario)
+-- EJECUTAR ESTE SQL EN SUPABASE si los mensajes vuelven a aparecer al recargar
+CREATE TABLE IF NOT EXISTS message_deletions (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  deleted_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(message_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_deletions_user ON message_deletions(user_id);
+CREATE INDEX IF NOT EXISTS idx_message_deletions_message ON message_deletions(message_id);
+
+-- Tabla de tokens Expo Push (notificaciones nativas Android/iOS con telefono hibernado)
+CREATE TABLE IF NOT EXISTS expo_push_tokens (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+  token VARCHAR(200) UNIQUE NOT NULL,
+  platform VARCHAR(10) DEFAULT 'android',
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_expo_push_tokens_user ON expo_push_tokens(user_id);
