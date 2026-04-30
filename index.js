@@ -691,6 +691,61 @@ app.post('/api/chats/group', auth, async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════════════
+// Obtener participantes de un grupo
+// ════════════════════════════════════════════════════════════════════
+app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    // Verificar acceso
+    const { data: myPart } = await supabase
+      .from('chat_participants')
+      .select('id')
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (!myPart) return res.status(403).json({ message: 'No tienes acceso a este chat' });
+
+    // Obtener chat para saber quién es el creador
+    const { data: chat } = await supabase
+      .from('chats')
+      .select('created_by')
+      .eq('id', chatId)
+      .single();
+
+    const creatorId = chat?.created_by?.toString();
+
+    // Obtener participantes con datos de usuario
+    const { data: parts } = await supabase
+      .from('chat_participants')
+      .select('user_id, users:user_id(id, full_name, phone, avatar_url)')
+      .eq('chat_id', chatId);
+
+    if (!parts) return res.json([]);
+
+    const members = parts.map(p => {
+      const u = p.users || {};
+      const uid = p.user_id?.toString();
+      return {
+        id: uid,
+        user_id: uid,
+        full_name: u.full_name || '',
+        phone: u.phone || '',
+        avatar_url: u.avatar_url || '',
+        online_status: false,
+        role: uid === creatorId ? 'admin' : 'member',
+      };
+    });
+
+    res.json(members);
+  } catch (e) {
+    console.error('Get participants error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // Marcar mensajes como leídos
 app.post('/api/chats/:chatId/read', auth, async (req, res) => {
   try {
