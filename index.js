@@ -56,7 +56,8 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle preflight for all routes
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // --- Middleware auth --------------------------------------------------
 const parseBearerToken = (header) => {
@@ -667,6 +668,13 @@ app.post('/api/chats/group', auth, async (req, res) => {
       .single();
 
     if (createError) throw createError;
+
+    // Insertar participantes en chat_participants para que aparezca en getChats
+    const participantRows = participant_ids.map(uid => ({
+      chat_id: chat.id,
+      user_id: uid,
+    }));
+    await supabase.from('chat_participants').insert(participantRows);
 
     // Formatear respuesta
     const formattedChat = {
@@ -2992,6 +3000,59 @@ app.post('/api/lia/transcribe', auth, async (_req, res) => {
 // ════════════════════════════════════════════════════════════════════
 // GRUPOS DE CHAT
 // ════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════
+// Actualizar nombre y/o avatar de un grupo
+// ════════════════════════════════════════════════════════════════════
+app.put('/api/chats/:chatId', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { name, avatar_url } = req.body;
+
+    // Verificar que el usuario es participante del chat
+    const { data: part } = await supabase
+      .from('chat_participants')
+      .select('id')
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (!part) return res.status(403).json({ message: 'No tienes acceso a este chat' });
+
+    // Verificar que es un grupo
+    const { data: chat } = await supabase
+      .from('chats')
+      .select('id, type, created_by')
+      .eq('id', chatId)
+      .single();
+
+    if (!chat) return res.status(404).json({ message: 'Chat no encontrado' });
+    if (chat.type !== 'group') return res.status(400).json({ message: 'Solo se pueden editar grupos' });
+
+    // Construir objeto de actualización
+    const updates = { updated_at: new Date().toISOString() };
+    if (name !== undefined && name !== null && name.trim() !== '') {
+      updates.name = name.trim();
+    }
+    if (avatar_url !== undefined && avatar_url !== null) {
+      updates.avatar_url = avatar_url;
+    }
+
+    const { data: updated, error } = await supabase
+      .from('chats')
+      .update(updates)
+      .eq('id', chatId)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({ message: 'Grupo actualizado', chat: updated });
+  } catch (e) {
+    console.error('Update group error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // AÁƒÂ±adir participante a grupo
 app.post('/api/chats/:chatId/participants', auth, async (req, res) => {
   try {
