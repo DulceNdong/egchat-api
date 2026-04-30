@@ -792,7 +792,7 @@ app.post('/api/chats/:chatId/read', auth, async (req, res) => {
   }
 });
 
-// Subir archivo de chat
+// Subir archivo de chat — acepta multipart/form-data (Android/iOS) y raw buffer (web)
 app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
@@ -807,16 +807,45 @@ app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
 
     if (!part) return res.status(403).json({ message: 'No tienes acceso a este chat' });
 
-    // Leer el body como buffer (multipart/form-data o raw base64)
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    const buffer = Buffer.concat(chunks);
+    const rawContentType = req.headers['content-type'] || '';
+    let buffer, fileContentType, fileName;
 
-    // Detectar content-type y nombre del archivo desde headers
-    const contentType = req.headers['content-type'] || 'application/octet-stream';
-    const fileName = req.headers['x-file-name']
-      ? decodeURIComponent(req.headers['x-file-name'])
-      : `file_${Date.now()}`;
+    if (rawContentType.includes('multipart/form-data')) {
+      // Parsear multipart/form-data (enviado por Android/iOS con FormData)
+      const busboy = require('busboy');
+      const bb = busboy({ headers: req.headers });
+      const fileData = await new Promise((resolve, reject) => {
+        let fileBuffer = null, fileMime = 'application/octet-stream', fileOrigName = `file_${Date.now()}`;
+        bb.on('file', (fieldname, file, info) => {
+          const { filename, mimeType } = info;
+          fileOrigName = filename || fileOrigName;
+          fileMime = mimeType || fileMime;
+          const chunks = [];
+          file.on('data', d => chunks.push(d));
+          file.on('end', () => { fileBuffer = Buffer.concat(chunks); });
+        });
+        bb.on('close', () => resolve({ buffer: fileBuffer, mime: fileMime, name: fileOrigName }));
+        bb.on('error', reject);
+        req.pipe(bb);
+      });
+      buffer = fileData.buffer;
+      fileContentType = fileData.mime;
+      fileName = fileData.name;
+    } else {
+      // Raw buffer (enviado por web con ArrayBuffer)
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      buffer = Buffer.concat(chunks);
+      fileContentType = rawContentType.split(';')[0].trim() || 'application/octet-stream';
+      fileName = req.headers['x-file-name']
+        ? decodeURIComponent(req.headers['x-file-name'])
+        : `file_${Date.now()}`;
+    }
+
+    if (!buffer || buffer.length === 0) {
+      return res.status(400).json({ message: 'Archivo vacío o no recibido' });
+    }
+
     const ext = fileName.split('.').pop()?.toLowerCase() || 'bin';
     const storagePath = `chats/${chatId}/${Date.now()}_${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
 
@@ -824,7 +853,7 @@ app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
     const { data: uploadData, error: uploadError } = await supabase.storage
       .from('chat-files')
       .upload(storagePath, buffer, {
-        contentType,
+        contentType: fileContentType,
         upsert: false,
       });
 
@@ -843,7 +872,7 @@ app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
     res.json({
       file_url: publicUrl,
       file_name: fileName,
-      file_type: contentType,
+      file_type: fileContentType,
       file_size: buffer.length,
       file_ext: ext,
     });
