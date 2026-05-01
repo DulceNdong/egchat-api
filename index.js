@@ -47,8 +47,6 @@ const corsOptions = {
     if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true);
     // Permitir cualquier subdominio de vercel.app (egchat-v2, egchat-app, etc.)
     if (/^https:\/\/egchat.*\.vercel\.app$/.test(origin)) return callback(null, true);
-    // Permitir cualquier subdominio de netlify.app (para pruebas y deploy alternativo)
-    if (/^https:\/\/.*\.netlify\.app$/.test(origin)) return callback(null, true);
     return callback(new Error('CORS policy: origin not allowed'));
   },
   credentials: true,
@@ -3980,6 +3978,57 @@ const updateUserVersions = async () => {
 };
 
 // ─── WebRTC Signaling — persistido en Supabase ───────────────────────────────
+
+// TURN token endpoint — genera credenciales temporales para TURN server
+app.get('/api/call/turn-token', auth, async (req, res) => {
+  try {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken  = process.env.TWILIO_AUTH_TOKEN;
+
+    if (!accountSid || !authToken) {
+      // Sin Twilio configurado — devolver STUN público gratuito
+      return res.json({
+        turnConfig: null,
+        iceServers: [
+          { urls: ['stun:stun.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+          { urls: 'stun:stun.cloudflare.com:3478' },
+          // TURN público de Open Relay (gratuito, sin garantías)
+          {
+            urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443'],
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+          }
+        ]
+      });
+    }
+
+    // Generar token Twilio TURN (válido 86400s = 24h)
+    const twilio = require('twilio')(accountSid, authToken);
+    const token = await twilio.tokens.create({ ttl: 86400 });
+
+    res.json({
+      turnConfig: {
+        urls: token.iceServers.map(s => s.url || s.urls).flat(),
+        username: token.username,
+        credential: token.password,
+      },
+      iceServers: token.iceServers.map(s => ({
+        urls: s.url || s.urls,
+        username: s.username,
+        credential: s.credential,
+      }))
+    });
+  } catch (e) {
+    console.error('TURN token error:', e.message);
+    // Fallback a STUN si Twilio falla
+    res.json({
+      turnConfig: null,
+      iceServers: [
+        { urls: ['stun:stun.l.google.com:19302', 'stun:stun2.l.google.com:19302'] }
+      ]
+    });
+  }
+});
 
 // Iniciar llamada — caller envía offer + push al destinatario
 app.post('/api/call/offer', auth, async (req, res) => {
