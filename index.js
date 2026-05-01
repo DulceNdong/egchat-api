@@ -593,7 +593,7 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
     const { data: message, error } = await supabase
       .from('messages')
       .insert({ chat_id: chatId, sender_id: req.user.id, text: text || null, type, reply_to: reply_to || null, file_url: file_url || null, status: 'sent' })
-      .select('id, text, type, created_at, sender_id, status')
+      .select('id, text, type, created_at, sender_id, status, file_url')
       .single();
 
     if (error) throw error;
