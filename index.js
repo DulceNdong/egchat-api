@@ -3979,54 +3979,45 @@ const updateUserVersions = async () => {
 
 // ─── WebRTC Signaling — persistido en Supabase ───────────────────────────────
 
-// TURN token endpoint — genera credenciales temporales para TURN server
-app.get('/api/call/turn-token', auth, async (req, res) => {
+// TURN token endpoint — genera credenciales temporales Twilio NTS
+const TWILIO_ACCOUNT_SID  = process.env.TWILIO_ACCOUNT_SID  || 'ACff9d3745f2c407073c40ac4e1dcef577';
+const TWILIO_API_KEY_SID  = process.env.TWILIO_API_KEY_SID  || 'SK209f78884ca306d243479a8b8acc0938';
+const TWILIO_API_KEY_SECRET = process.env.TWILIO_API_KEY_SECRET || '1yRDaznxTsrmhtrMlCtJsgls5qgpOo5';
+
+async function getTwilioIceServers() {
+  const client = require('twilio')(TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET, { accountSid: TWILIO_ACCOUNT_SID });
+  const token = await client.tokens.create({ ttl: 86400 });
+  return token.iceServers.map(s => ({
+    urls: s.url || s.urls,
+    username: s.username,
+    credential: s.credential,
+  }));
+}
+
+// Ruta principal usada por el frontend
+app.get('/api/turn-token', auth, async (req, res) => {
   try {
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const authToken  = process.env.TWILIO_AUTH_TOKEN;
-
-    if (!accountSid || !authToken) {
-      // Sin Twilio configurado — devolver STUN público gratuito
-      return res.json({
-        turnConfig: null,
-        iceServers: [
-          { urls: ['stun:stun.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
-          { urls: 'stun:stun.cloudflare.com:3478' },
-          // TURN público de Open Relay (gratuito, sin garantías)
-          {
-            urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443'],
-            username: 'openrelayproject',
-            credential: 'openrelayproject'
-          }
-        ]
-      });
-    }
-
-    // Generar token Twilio TURN (válido 86400s = 24h)
-    const twilio = require('twilio')(accountSid, authToken);
-    const token = await twilio.tokens.create({ ttl: 86400 });
-
-    res.json({
-      turnConfig: {
-        urls: token.iceServers.map(s => s.url || s.urls).flat(),
-        username: token.username,
-        credential: token.password,
-      },
-      iceServers: token.iceServers.map(s => ({
-        urls: s.url || s.urls,
-        username: s.username,
-        credential: s.credential,
-      }))
-    });
+    const iceServers = await getTwilioIceServers();
+    res.json({ iceServers });
   } catch (e) {
     console.error('TURN token error:', e.message);
-    // Fallback a STUN si Twilio falla
-    res.json({
-      turnConfig: null,
-      iceServers: [
-        { urls: ['stun:stun.l.google.com:19302', 'stun:stun2.l.google.com:19302'] }
-      ]
-    });
+    res.json({ iceServers: [
+      { urls: ['stun:stun.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+      { urls: 'stun:stun.cloudflare.com:3478' }
+    ]});
+  }
+});
+
+// Alias para compatibilidad
+app.get('/api/call/turn-token', auth, async (req, res) => {
+  try {
+    const iceServers = await getTwilioIceServers();
+    res.json({ iceServers, turnConfig: iceServers.find(s => String(s.urls).includes('turn:')) || null });
+  } catch (e) {
+    console.error('TURN token error:', e.message);
+    res.json({ iceServers: [
+      { urls: ['stun:stun.l.google.com:19302', 'stun:stun2.l.google.com:19302'] }
+    ]});
   }
 });
 
