@@ -3982,9 +3982,9 @@ const updateUserVersions = async () => {
 // TURN token endpoint — genera credenciales temporales para TURN server
 app.get('/api/call/turn-token', auth, async (req, res) => {
   try {
-    const accountSid  = 'TWILIO_ACCOUNT_SID_REMOVED';
-    const apiKeySid   = 'TWILIO_API_KEY_SID_REMOVED';
-    const apiKeySecret = 'TWILIO_API_KEY_SECRET_REMOVED';
+    const accountSid  = process.env.TWILIO_ACCOUNT_SID;
+    const apiKeySid   = process.env.TWILIO_API_KEY_SID;
+    const apiKeySecret = process.env.TWILIO_API_KEY_SECRET;
 
     const client = require('twilio')(apiKeySid, apiKeySecret, { accountSid });
     const token = await client.tokens.create({ ttl: 86400 });
