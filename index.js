@@ -3982,36 +3982,14 @@ const updateUserVersions = async () => {
 // TURN token endpoint — genera credenciales temporales para TURN server
 app.get('/api/call/turn-token', auth, async (req, res) => {
   try {
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const authToken  = process.env.TWILIO_AUTH_TOKEN;
+    const accountSid  = 'TWILIO_ACCOUNT_SID_REMOVED';
+    const apiKeySid   = 'TWILIO_API_KEY_SID_REMOVED';
+    const apiKeySecret = 'TWILIO_API_KEY_SECRET_REMOVED';
 
-    if (!accountSid || !authToken) {
-      // Sin Twilio configurado — devolver STUN público gratuito
-      return res.json({
-        turnConfig: null,
-        iceServers: [
-          { urls: ['stun:stun.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
-          { urls: 'stun:stun.cloudflare.com:3478' },
-          // TURN público de Open Relay (gratuito, sin garantías)
-          {
-            urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443'],
-            username: 'openrelayproject',
-            credential: 'openrelayproject'
-          }
-        ]
-      });
-    }
-
-    // Generar token Twilio TURN (válido 86400s = 24h)
-    const twilio = require('twilio')(accountSid, authToken);
-    const token = await twilio.tokens.create({ ttl: 86400 });
+    const client = require('twilio')(apiKeySid, apiKeySecret, { accountSid });
+    const token = await client.tokens.create({ ttl: 86400 });
 
     res.json({
-      turnConfig: {
-        urls: token.iceServers.map(s => s.url || s.urls).flat(),
-        username: token.username,
-        credential: token.password,
-      },
       iceServers: token.iceServers.map(s => ({
         urls: s.url || s.urls,
         username: s.username,
@@ -4020,11 +3998,11 @@ app.get('/api/call/turn-token', auth, async (req, res) => {
     });
   } catch (e) {
     console.error('TURN token error:', e.message);
-    // Fallback a STUN si Twilio falla
     res.json({
-      turnConfig: null,
       iceServers: [
-        { urls: ['stun:stun.l.google.com:19302', 'stun:stun2.l.google.com:19302'] }
+        { urls: ['stun:stun.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+        { urls: 'stun:stun.cloudflare.com:3478' },
+        { urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443'], username: 'openrelayproject', credential: 'openrelayproject' }
       ]
     });
   }
