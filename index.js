@@ -525,6 +525,9 @@ app.get('/api/chats', auth, async (req, res) => {
       id: chat.id,
       type: chat.type || 'private',
       name: chat.name,
+      avatar_url: chat.avatar_url || null,
+      description: chat.description || null,
+      created_by: chat.created_by || null,
       participants: participantsByChat[chat.id] || [],
       last_message: lastMessageByChat[chat.id] || null,
       updated_at: chat.updated_at,
@@ -593,7 +596,7 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
     const { data: message, error } = await supabase
       .from('messages')
       .insert({ chat_id: chatId, sender_id: req.user.id, text: text || null, type, reply_to: reply_to || null, file_url: file_url || null, status: 'sent' })
-      .select('id, text, type, created_at, sender_id, status')
+      .select('id, text, type, created_at, sender_id, status, file_url')
       .single();
 
     if (error) throw error;
@@ -794,6 +797,70 @@ app.post('/api/chats/group', auth, async (req, res) => {
     res.status(201).json(formattedChat);
   } catch (e) {
     console.error('Create group chat error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// Upload avatar de grupo — recibe base64, sube a Supabase Storage
+// ════════════════════════════════════════════════════════════════════
+app.post('/api/chats/:chatId/avatar', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { base64, mimeType = 'image/jpeg' } = req.body;
+
+    if (!base64) return res.status(400).json({ message: 'base64 requerido' });
+
+    // Verificar acceso
+    const { data: part } = await supabase
+      .from('chat_participants')
+      .select('id')
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
+      .single();
+    if (!part) return res.status(403).json({ message: 'Sin acceso' });
+
+    // Convertir base64 a buffer
+    const base64Data = base64.replace(/^data:image\/\w+;base64,/, '');
+    const buffer = Buffer.from(base64Data, 'base64');
+    const ext = mimeType.split('/')[1] || 'jpg';
+    const fileName = `group-avatars/${chatId}-${Date.now()}.${ext}`;
+
+    // Subir a Supabase Storage (bucket: avatars)
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('avatars')
+      .upload(fileName, buffer, {
+        contentType: mimeType,
+        upsert: true,
+      });
+
+    if (uploadError) {
+      // Si falla Storage, guardar el base64 directamente en la BD como fallback
+      const { data: updated } = await supabase
+        .from('chats')
+        .update({ avatar_url: base64, updated_at: new Date().toISOString() })
+        .eq('id', chatId)
+        .select('avatar_url')
+        .single();
+      return res.json({ avatar_url: updated?.avatar_url || base64 });
+    }
+
+    // Obtener URL pública
+    const { data: publicData } = supabase.storage
+      .from('avatars')
+      .getPublicUrl(fileName);
+
+    const publicUrl = publicData?.publicUrl || '';
+
+    // Actualizar en la BD
+    await supabase
+      .from('chats')
+      .update({ avatar_url: publicUrl, updated_at: new Date().toISOString() })
+      .eq('id', chatId);
+
+    res.json({ avatar_url: publicUrl });
+  } catch (e) {
+    console.error('Upload group avatar error:', e);
     res.status(500).json({ message: e.message });
   }
 });
