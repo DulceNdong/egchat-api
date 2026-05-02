@@ -4073,22 +4073,29 @@ const FALLBACK_ICE = [
 // Ruta principal usada por el frontend
 app.get('/api/turn-token', auth, async (req, res) => {
   try {
-    const iceServers = await getTwilioIceServers();
-    res.json({ iceServers });
-  } catch (e) {
-    console.error('TURN token error:', e.message);
-    res.json({ iceServers: FALLBACK_ICE });
-  }
-});
+    const accountSid  = process.env.TWILIO_ACCOUNT_SID;
+    const apiKeySid   = process.env.TWILIO_API_KEY_SID;
+    const apiKeySecret = process.env.TWILIO_API_KEY_SECRET;
 
-// Alias para compatibilidad
-app.get('/api/call/turn-token', auth, async (req, res) => {
-  try {
-    const iceServers = await getTwilioIceServers();
-    res.json({ iceServers });
+    const client = require('twilio')(apiKeySid, apiKeySecret, { accountSid });
+    const token = await client.tokens.create({ ttl: 86400 });
+
+    res.json({
+      iceServers: token.iceServers.map(s => ({
+        urls: s.url || s.urls,
+        username: s.username,
+        credential: s.credential,
+      }))
+    });
   } catch (e) {
     console.error('TURN token error:', e.message);
-    res.json({ iceServers: FALLBACK_ICE });
+    res.json({
+      iceServers: [
+        { urls: ['stun:stun.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+        { urls: 'stun:stun.cloudflare.com:3478' },
+        { urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443'], username: 'openrelayproject', credential: 'openrelayproject' }
+      ]
+    });
   }
 });
 
