@@ -4250,6 +4250,34 @@ webpush.setVapidDetails(
   VAPID_PRIVATE_KEY
 );
 
+// ─────────────────────────────────────────────────────────────────────────────
+// FIREBASE ADMIN — FCM API V1 (nativo Capacitor)
+// ─────────────────────────────────────────────────────────────────────────────
+let firebaseAdmin = null;
+try {
+  const admin = require('firebase-admin');
+  // Opción 1: credenciales como JSON en variable de entorno FIREBASE_SERVICE_ACCOUNT
+  // Opción 2: ruta al archivo en GOOGLE_APPLICATION_CREDENTIALS (estándar Google)
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    if (!admin.apps.length) {
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    }
+    firebaseAdmin = admin;
+    console.log('[FCM] Firebase Admin inicializado con FIREBASE_SERVICE_ACCOUNT');
+  } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    if (!admin.apps.length) {
+      admin.initializeApp({ credential: admin.credential.applicationDefault() });
+    }
+    firebaseAdmin = admin;
+    console.log('[FCM] Firebase Admin inicializado con GOOGLE_APPLICATION_CREDENTIALS');
+  } else {
+    console.warn('[FCM] No hay credenciales Firebase configuradas — FCM nativo desactivado.');
+  }
+} catch (e) {
+  console.warn('[FCM] firebase-admin no disponible:', e.message);
+}
+
 // Guardar suscripción push del usuario
 app.post('/api/push/subscribe', auth, async (req, res) => {
   try {
