@@ -15,6 +15,38 @@ const JWT_SECRET = process.env.JWT_SECRET || 'EGchat2025!xK9mP3nQ7rL2vW8tY4uJ6hF
 const JWT_SECRET_FALLBACK = 'EGchat2025!xK9mP3nQ7rL2vW8tY4uJ6hF1bN5cA0dE_prod_secret';
 console.log('JWT_SECRET source:', process.env.JWT_SECRET ? 'environment' : 'fallback');
 
+// ── Deep Links — archivos .well-known ────────────────────────────────────────
+// Deben servirse con Content-Type correcto para que Android/iOS los validen
+app.get('/.well-known/assetlinks.json', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.json([{
+    relation: ['delegate_permission/common.handle_all_urls'],
+    target: {
+      namespace: 'android_app',
+      package_name: 'com.egchat.app',
+      sha256_cert_fingerprints: [
+        process.env.APP_SHA256_FINGERPRINT || 'REEMPLAZAR_CON_SHA256_DE_TU_KEYSTORE'
+      ]
+    }
+  }]);
+});
+
+app.get('/.well-known/apple-app-site-association', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.json({
+    applinks: {
+      apps: [],
+      details: [{
+        appID: `${process.env.IOS_TEAM_ID || 'TEAM_ID'}.com.egchat.app`,
+        paths: ['/chat/*', '/profile/*', '/pay/*']
+      }]
+    },
+    webcredentials: {
+      apps: [`${process.env.IOS_TEAM_ID || 'TEAM_ID'}.com.egchat.app`]
+    }
+  });
+});
+
 // Verificar token con múltiples secrets para compatibilidad
 const verifyToken = (token) => {
   const secrets = [JWT_SECRET, JWT_SECRET_FALLBACK].filter((s, i, arr) => arr.indexOf(s) === i);
