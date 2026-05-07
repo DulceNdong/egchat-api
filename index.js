@@ -4395,6 +4395,26 @@ app.post('/api/push/register-expo-token', auth, async (req, res) => {
   }
 });
 
+// ── Registrar token FCM nativo (Capacitor @capacitor/push-notifications) ──
+app.post('/api/push/fcm-token', auth, async (req, res) => {
+  try {
+    const { fcm_token, platform } = req.body;
+    if (!fcm_token) {
+      return res.status(400).json({ message: 'fcm_token requerido' });
+    }
+    await supabase.from('fcm_tokens').upsert({
+      user_id: req.user.id,
+      token: fcm_token,
+      platform: platform || 'android',
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'token' });
+    res.json({ message: 'Token FCM registrado' });
+  } catch (e) {
+    console.error('FCM token register error:', e.message);
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PUSH DIAGNOSTICS
 // ─────────────────────────────────────────────────────────────────────────────
