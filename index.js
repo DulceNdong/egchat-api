@@ -4399,62 +4399,58 @@ const sendPushToUser = async (userId, payload) => {
       }
     }
 
-    // ── FCM nativo (Capacitor @capacitor/push-notifications) ─────────────
-    // Usa la API HTTP v1 de Firebase para enviar a tokens FCM registrados
-    // desde la app Android/iOS compilada con Capacitor.
-    const { data: fcmSubs } = await supabase
-      .from('fcm_tokens')
-      .select('token')
-      .eq('user_id', userId);
+    // ── FCM nativo — API V1 via firebase-admin (Capacitor) ───────────────
+    if (firebaseAdmin) {
+      const { data: fcmSubs } = await supabase
+        .from('fcm_tokens')
+        .select('token')
+        .eq('user_id', userId);
 
-    if (fcmSubs && fcmSubs.length > 0) {
-      const FCM_SERVER_KEY = process.env.FCM_SERVER_KEY;
-      if (FCM_SERVER_KEY) {
+      if (fcmSubs && fcmSubs.length > 0) {
         await Promise.allSettled(
           fcmSubs.map(async sub => {
             try {
-              const fcmBody = {
-                to: sub.token,
-                priority: isCall ? 'high' : 'normal',
+              const message = {
+                token: sub.token,
                 notification: {
                   title: payload.title || 'EGChat',
                   body: payload.body || 'Nueva notificacion',
-                  sound: 'default',
                 },
-                // data: campos accesibles en pushNotificationActionPerformed
+                // data: todos los valores deben ser strings (requisito FCM API V1)
                 data: {
-                  chat_id: payload.chatId || payload.chat_id || '',
-                  type: payload.notificationType || 'message',
-                  title: payload.title || '',
-                  body: payload.body || '',
-                  callId: payload.callId || '',
-                  callType: payload.callType || '',
-                  callerName: payload.callerName || '',
+                  chat_id:     String(payload.chatId || payload.chat_id || ''),
+                  type:        String(payload.notificationType || 'message'),
+                  title:       String(payload.title || ''),
+                  body:        String(payload.body || ''),
+                  call_id:     String(payload.callId || ''),
+                  call_type:   String(payload.callType || ''),
+                  caller_name: String(payload.callerName || ''),
+                },
+                android: {
+                  priority: isCall ? 'high' : 'normal',
+                  notification: {
+                    sound: 'default',
+                    channelId: isCall ? 'egchat-calls' : 'egchat-messages',
+                  },
+                },
+                apns: {
+                  payload: { aps: { sound: 'default', badge: 1 } },
                 },
               };
-              const fcmRes = await fetch('https://fcm.googleapis.com/fcm/send', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  Authorization: `key=${FCM_SERVER_KEY}`,
-                },
-                body: JSON.stringify(fcmBody),
-              });
-              const result = await fcmRes.json();
-              // Limpiar tokens inválidos
-              if (result.failure === 1) {
-                const err = result.results?.[0]?.error;
-                if (err === 'NotRegistered' || err === 'InvalidRegistration') {
-                  await supabase.from('fcm_tokens').delete().eq('token', sub.token);
-                }
-              }
+              await firebaseAdmin.messaging().send(message);
             } catch (fcmErr) {
-              console.warn('FCM send error:', fcmErr.message);
+              // Limpiar tokens inválidos automáticamente
+              if (
+                fcmErr.code === 'messaging/registration-token-not-registered' ||
+                fcmErr.code === 'messaging/invalid-registration-token'
+              ) {
+                await supabase.from('fcm_tokens').delete().eq('token', sub.token);
+              } else {
+                console.warn('[FCM] send error:', fcmErr.message);
+              }
             }
           })
         );
-      } else {
-        console.warn('[FCM] FCM_SERVER_KEY no configurada — omitiendo envío FCM nativo.');
       }
     }
 
