@@ -119,6 +119,24 @@ async function saveNews(newsItem) {
       return { isNew: false, id: existing.id };
     }
 
+    // Verificar cuántas noticias hay — no guardar más de 30
+    const { count } = await supabase
+      .from('government_news')
+      .select('*', { count: 'exact', head: true });
+
+    if (count >= 30) {
+      // Eliminar la más antigua para hacer espacio
+      const { data: oldest } = await supabase
+        .from('government_news')
+        .select('id')
+        .order('scraped_at', { ascending: true })
+        .limit(1)
+        .single();
+      if (oldest) {
+        await supabase.from('government_news').delete().eq('id', oldest.id);
+      }
+    }
+
     // Insertar nueva noticia
     const { data, error } = await supabase
       .from('government_news')
@@ -230,19 +248,48 @@ async function runScraper() {
   return totalNew;
 }
 
-// Ejecutar cada 10 minutos
-const INTERVAL = 10 * 60 * 1000; // 10 minutos
+// Ejecutar una vez al día (24 horas)
+const INTERVAL = 24 * 60 * 60 * 1000; // 24 horas
+
+// Limpiar noticias antiguas — mantener solo las 30 más recientes
+async function cleanOldNews() {
+  try {
+    const { data: keep } = await supabase
+      .from('government_news')
+      .select('id')
+      .order('scraped_at', { ascending: false })
+      .limit(30);
+
+    if (!keep || keep.length === 0) return;
+
+    const keepIds = keep.map(r => r.id);
+    const { error } = await supabase
+      .from('government_news')
+      .delete()
+      .not('id', 'in', `(${keepIds.map(id => `'${id}'`).join(',')})`);
+
+    if (!error) {
+      console.log('🧹 Noticias antiguas limpiadas (se mantienen las 30 más recientes)');
+    }
+  } catch (e) {
+    console.error('Error limpiando noticias:', e.message);
+  }
+}
 
 async function startScheduler() {
   console.log('🚀 Scraper de noticias del gobierno iniciado');
-  console.log(`⏱️  Intervalo: cada ${INTERVAL / 60000} minutos`);
-  
+  console.log(`⏱️  Intervalo: una vez al día (cada 24 horas)`);
+
+  // Limpiar noticias antiguas al arrancar
+  await cleanOldNews();
+
   // Ejecutar inmediatamente al iniciar
   await runScraper();
-  
-  // Luego cada 10 minutos
+
+  // Luego cada 24 horas
   setInterval(async () => {
     try {
+      await cleanOldNews();
       await runScraper();
     } catch (error) {
       console.error('Error en scraper:', error);
