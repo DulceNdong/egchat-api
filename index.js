@@ -25,7 +25,7 @@ app.get('/.well-known/assetlinks.json', (req, res) => {
       namespace: 'android_app',
       package_name: 'com.egchat.app',
       sha256_cert_fingerprints: [
-        process.env.APP_SHA256_FINGERPRINT || 'FA:C6:17:45:DC:09:03:78:6F:B9:ED:E6:2A:96:2B:39:9F:73:48:F0:BB:6F:89:9B:83:32:66:75:91:03:3B:9C'
+        process.env.APP_SHA256_FINGERPRINT || 'ED:C4:E5:32:2F:FF:A6:35:C1:95:D8:35:1B:01:1B:74:B4:FC:65:E6:7D:53:66:95:73:90:30:E6:93:5F:C6:32'
       ]
     }
   }]);
