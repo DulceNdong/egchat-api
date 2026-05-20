@@ -4105,27 +4105,35 @@ const FALLBACK_ICE = [
 // Ruta principal usada por el frontend
 app.get('/api/turn-token', auth, async (req, res) => {
   try {
-    const accountSid  = process.env.TWILIO_ACCOUNT_SID;
-    const apiKeySid   = process.env.TWILIO_API_KEY_SID;
-    const apiKeySecret = process.env.TWILIO_API_KEY_SECRET;
+    // Metered TURN Server — egchat.metered.live
+    const METERED_API_KEY = process.env.METERED_API_KEY || 'JcmmvEroGtWAOMkMX8O3d9PYNe5mbMraUll_L9YKqwa0VgT';
+    const METERED_DOMAIN  = process.env.METERED_DOMAIN  || 'egchat.metered.live';
 
-    const client = require('twilio')(apiKeySid, apiKeySecret, { accountSid });
-    const token = await client.tokens.create({ ttl: 86400 });
+    const response = await fetch(
+      `https://${METERED_DOMAIN}/api/v1/turn/credentials?apiKey=${METERED_API_KEY}`
+    );
+    if (!response.ok) throw new Error(`Metered API error: ${response.status}`);
+    const iceServers = await response.json();
 
-    res.json({
-      iceServers: token.iceServers.map(s => ({
-        urls: s.url || s.urls,
-        username: s.username,
-        credential: s.credential,
-      }))
-    });
+    res.json({ iceServers });
   } catch (e) {
     console.error('TURN token error:', e.message);
+    // Fallback con servidores STUN públicos + Metered hardcoded
     res.json({
       iceServers: [
         { urls: ['stun:stun.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
         { urls: 'stun:stun.cloudflare.com:3478' },
-        { urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443'], username: 'openrelayproject', credential: 'openrelayproject' }
+        {
+          urls: [
+            'turn:egchat.metered.live:80',
+            'turn:egchat.metered.live:80?transport=tcp',
+            'turn:egchat.metered.live:443',
+            'turn:egchat.metered.live:443?transport=tcp',
+            'turns:egchat.metered.live:443?transport=tcp',
+          ],
+          username: 'fallback',
+          credential: 'JcmmvEroGtWAOMkMX8O3d9PYNe5mbMraUll_L9YKqwa0VgT'
+        }
       ]
     });
   }
