@@ -4356,6 +4356,17 @@ app.post('/api/call/offer', auth, async (req, res) => {
       updated_at: new Date().toISOString(),
     }, { onConflict: 'call_id' });
 
+    // Notificar al destinatario via SSE (instantáneo)
+    if (targetUserId) {
+      emitToUser(targetUserId, {
+        type: 'incoming_call',
+        callId,
+        callerId: req.user.id,
+        callType: type || 'audio',
+        offer,
+      });
+    }
+
     // Enviar push de llamada entrante al destinatario
     if (targetUserId) {
       try {
@@ -4396,25 +4407,37 @@ app.post('/api/call/offer', auth, async (req, res) => {
 // Callee responde con answer
 app.post('/api/call/answer', auth, async (req, res) => {
   const { callId, answer } = req.body;
-  const { data } = await supabase.from('call_sessions').select('call_id').eq('call_id', callId).eq('ended', false).single();
+  const { data } = await supabase.from('call_sessions').select('call_id, caller_id').eq('call_id', callId).eq('ended', false).single();
   if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
   await supabase.from('call_sessions').update({ answer: JSON.stringify(answer), updated_at: new Date().toISOString() }).eq('call_id', callId);
+  // Notificar al caller via SSE (instantáneo — elimina el polling de answer)
+  if (data.caller_id) {
+    emitToUser(data.caller_id, { type: 'call_answer', callId, answer });
+  }
   res.json({ ok: true });
 });
 
 // Enviar ICE candidate
 app.post('/api/call/ice', auth, async (req, res) => {
   const { callId, candidate, role } = req.body;
-  const { data } = await supabase.from('call_sessions').select('caller_candidates, callee_candidates').eq('call_id', callId).single();
+  const { data } = await supabase.from('call_sessions').select('caller_candidates, callee_candidates, caller_id, target_user_id').eq('call_id', callId).single();
   if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
   if (role === 'caller') {
     const arr = JSON.parse(data.caller_candidates || '[]');
     arr.push(candidate);
     await supabase.from('call_sessions').update({ caller_candidates: JSON.stringify(arr), updated_at: new Date().toISOString() }).eq('call_id', callId);
+    // Enviar ICE al callee via SSE
+    if (data.target_user_id) {
+      emitToUser(data.target_user_id, { type: 'call_ice', callId, candidate, role: 'caller' });
+    }
   } else {
     const arr = JSON.parse(data.callee_candidates || '[]');
     arr.push(candidate);
     await supabase.from('call_sessions').update({ callee_candidates: JSON.stringify(arr), updated_at: new Date().toISOString() }).eq('call_id', callId);
+    // Enviar ICE al caller via SSE
+    if (data.caller_id) {
+      emitToUser(data.caller_id, { type: 'call_ice', callId, candidate, role: 'callee' });
+    }
   }
   res.json({ ok: true });
 });
@@ -4437,7 +4460,14 @@ app.get('/api/call/:callId', auth, async (req, res) => {
 
 // Terminar llamada
 app.delete('/api/call/:callId', auth, async (req, res) => {
+  const { data } = await supabase.from('call_sessions').select('caller_id, target_user_id').eq('call_id', req.params.callId).single();
   await supabase.from('call_sessions').update({ ended: true, updated_at: new Date().toISOString() }).eq('call_id', req.params.callId);
+  // Notificar a ambos participantes via SSE
+  if (data) {
+    const payload = { type: 'call_ended', callId: req.params.callId };
+    if (data.caller_id) emitToUser(data.caller_id, payload);
+    if (data.target_user_id) emitToUser(data.target_user_id, payload);
+  }
   // Borrar después de 15 segundos
   setTimeout(async () => {
     await supabase.from('call_sessions').delete().eq('call_id', req.params.callId);
