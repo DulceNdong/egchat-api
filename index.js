@@ -5113,6 +5113,27 @@ app.get('/api/noticias/gobierno', async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════════════
+// BATCH USER PROFILES — obtener perfiles actualizados de múltiples usuarios
+// Usado para sincronizar avatares y nombres en tiempo real
+// ════════════════════════════════════════════════════════════════════
+app.post('/api/users/batch', auth, async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) return res.json([]);
+    // Limitar a 100 IDs por petición
+    const safeIds = ids.slice(0, 100);
+    const { data: users, error } = await supabase
+      .from('users')
+      .select('id, full_name, avatar_url, phone')
+      .in('id', safeIds);
+    if (error) throw error;
+    res.json(users || []);
+  } catch (e) {
+    res.json([]);
+  }
+});
+
 if (require.main === module) {
   app.listen(PORT, async () => {
     console.log(`\n😎 EGCHAT API + Supabase en http://localhost:${PORT}`);
