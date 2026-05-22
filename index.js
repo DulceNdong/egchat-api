@@ -227,11 +227,7 @@ app.get('/', (req, res) => res.json({
 
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
-app.get('/jwt-debug', (req, res) => res.json({
-  jwt_secret_source: process.env.JWT_SECRET ? 'environment' : 'fallback',
-  jwt_secret_first10: JWT_SECRET.substring(0, 10),
-  jwt_secret_length: JWT_SECRET.length,
-}));
+// jwt-debug eliminado por seguridad — expone información del secret
 
 app.get('/debug', (req, res) => res.json({
   supabase_url: process.env.SUPABASE_URL ? 'âœ… set' : 'âŒ missing',
@@ -366,7 +362,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ message: 'phone y password son requeridos' });
 
     const { data: user, error } = await supabase
-      .from('users').select('*').eq('phone', phone).maybeSingle();
+      .from('users').select('id, phone, full_name, avatar_url, password_hash, app_version').eq('phone', phone).maybeSingle();
 
     if (error || !user) return res.status(401).json({ message: 'Credenciales incorrectas' });
 
@@ -4043,6 +4039,208 @@ app.post('/api/stories/:storyId/react', auth, async (req, res) => {
     await supabase.from('stories').update({ reactions: updated }).eq('id', req.params.storyId);
     res.json({ reactions: updated });
   } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// GROUP STORIES / ESTADOS DE GRUPOS
+// ════════════════════════════════════════════════════════════════════
+
+// Auto-crear tabla group_stories si no existe
+const ensureGroupStoriesTable = async () => {
+  try {
+    const { error } = await supabase.from('group_stories').select('id').limit(1);
+    if (error && error.message && error.message.includes('does not exist')) {
+      await supabase.rpc('exec_sql', {
+        sql: `CREATE TABLE IF NOT EXISTS group_stories (
+          id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+          group_id TEXT NOT NULL,
+          user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+          media JSONB NOT NULL DEFAULT '[]',
+          views INTEGER DEFAULT 0,
+          expires_at TIMESTAMPTZ NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_group_stories_group_id ON group_stories(group_id);
+        CREATE INDEX IF NOT EXISTS idx_group_stories_expires_at ON group_stories(expires_at);`
+      }).catch(() => {});
+    }
+  } catch {}
+};
+ensureGroupStoriesTable();
+
+// GET /api/stories/groups — obtener estados de todos los grupos del usuario
+app.get('/api/stories/groups', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const now = new Date().toISOString();
+
+    // Obtener grupos del usuario
+    const { data: chatParts } = await supabase
+      .from('chat_participants')
+      .select('chat_id')
+      .eq('user_id', userId);
+
+    if (!chatParts || chatParts.length === 0) return res.json([]);
+
+    const chatIds = chatParts.map(c => c.chat_id);
+    const { data: groupChats } = await supabase
+      .from('chats')
+      .select('id, name, avatar_url, created_by')
+      .in('id', chatIds)
+      .eq('type', 'group');
+
+    if (!groupChats || groupChats.length === 0) return res.json([]);
+
+    const groupIds = groupChats.map(g => g.id.toString());
+
+    // Obtener stories activos de esos grupos
+    const { data: stories } = await supabase
+      .from('group_stories')
+      .select('*')
+      .in('group_id', groupIds)
+      .gt('expires_at', now)
+      .order('created_at', { ascending: false });
+
+    if (!stories || stories.length === 0) return res.json([]);
+
+    // Obtener datos de autores
+    const authorIds = [...new Set(stories.map(s => s.user_id))];
+    const { data: authors } = await supabase
+      .from('users')
+      .select('id, full_name, avatar_url')
+      .in('id', authorIds);
+    const authorsMap = {};
+    (authors || []).forEach(u => { authorsMap[u.id] = u; });
+
+    // Agrupar por grupo — un entry por grupo con todos sus slides
+    const byGroup = {};
+    stories.forEach(s => {
+      const gid = s.group_id;
+      if (!byGroup[gid]) byGroup[gid] = { slides: [], latestAt: 0, totalViews: 0 };
+      let media = s.media;
+      if (typeof media === 'string') { try { media = JSON.parse(media); } catch { media = []; } }
+      const author = authorsMap[s.user_id] || {};
+      (Array.isArray(media) ? media : []).forEach(slide => {
+        byGroup[gid].slides.push({ ...slide, storyId: s.id, authorName: author.full_name || 'Miembro' });
+      });
+      const ts = new Date(s.created_at).getTime();
+      if (ts > byGroup[gid].latestAt) byGroup[gid].latestAt = ts;
+      byGroup[gid].totalViews += s.views || 0;
+    });
+
+    const result = groupChats
+      .filter(g => byGroup[g.id.toString()])
+      .map(g => {
+        const gid = g.id.toString();
+        const entry = byGroup[gid];
+        return {
+          groupId: gid,
+          groupName: g.name || 'Grupo',
+          groupAvatarUrl: g.avatar_url || '',
+          isAdmin: g.created_by === userId,
+          media: entry.slides,
+          views: entry.totalViews,
+          publishedAt: entry.latestAt,
+        };
+      });
+
+    res.json(result);
+  } catch (e) { res.json([]); }
+});
+
+// POST /api/stories/groups/:groupId — publicar estado en un grupo
+app.post('/api/stories/groups/:groupId', auth, async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const { media } = req.body;
+    if (!media) return res.status(400).json({ message: 'media requerido' });
+
+    // Verificar que el usuario pertenece al grupo
+    const { data: part } = await supabase
+      .from('chat_participants')
+      .select('chat_id')
+      .eq('chat_id', groupId)
+      .eq('user_id', req.user.id)
+      .single();
+    if (!part) return res.status(403).json({ message: 'No perteneces a este grupo' });
+
+    const newSlides = Array.isArray(media) ? media : [media];
+    const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+
+    // Upsert: añadir a story activa del usuario en este grupo o crear nueva
+    const { data: existing } = await supabase
+      .from('group_stories')
+      .select('id, media')
+      .eq('group_id', groupId)
+      .eq('user_id', req.user.id)
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    let story;
+    if (existing) {
+      let currentMedia = existing.media;
+      if (typeof currentMedia === 'string') { try { currentMedia = JSON.parse(currentMedia); } catch { currentMedia = []; } }
+      const updatedMedia = [...(Array.isArray(currentMedia) ? currentMedia : []), ...newSlides];
+      const { data, error } = await supabase
+        .from('group_stories')
+        .update({ media: updatedMedia, expires_at: expiresAt })
+        .eq('id', existing.id)
+        .select()
+        .single();
+      if (error) throw error;
+      story = data;
+    } else {
+      const { data, error } = await supabase
+        .from('group_stories')
+        .insert({ group_id: groupId, user_id: req.user.id, media: newSlides, views: 0, expires_at: expiresAt })
+        .select()
+        .single();
+      if (error) throw error;
+      story = data;
+    }
+
+    // Notificar a los miembros del grupo
+    try {
+      const { data: members } = await supabase
+        .from('chat_participants')
+        .select('user_id')
+        .eq('chat_id', groupId);
+      const { data: sender } = await supabase
+        .from('users').select('full_name').eq('id', req.user.id).single();
+      const { data: group } = await supabase
+        .from('chats').select('name').eq('id', groupId).single();
+      const memberIds = (members || []).map(m => m.user_id).filter(id => id !== req.user.id);
+      emitToUsers(memberIds, {
+        type: 'group_story_new',
+        groupId,
+        groupName: group?.name || 'Grupo',
+        authorName: sender?.full_name || 'Miembro',
+      });
+    } catch {}
+
+    res.status(201).json({ id: story.id, media: story.media, expiresAt: story.expires_at });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/stories/groups/:groupId/view — registrar vista
+app.post('/api/stories/groups/:groupId/view', auth, async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const now = new Date().toISOString();
+    const { data: stories } = await supabase
+      .from('group_stories')
+      .select('id, views')
+      .eq('group_id', groupId)
+      .gt('expires_at', now);
+    if (stories && stories.length > 0) {
+      await Promise.all(stories.map(s =>
+        supabase.from('group_stories').update({ views: (s.views || 0) + 1 }).eq('id', s.id)
+      ));
+    }
+    res.json({ ok: true });
+  } catch (e) { res.json({ ok: false }); }
 });
 
 // ════════════════════════════════════════════════════════════════════
