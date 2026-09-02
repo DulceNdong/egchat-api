@@ -6890,7 +6890,7 @@ app.post('/api/admin/run-migration', async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════
 // MI DJANGUE ROUTES — Sistema de tanda/caja de ahorro rotativo
 // ══════════════════════════════════════════════════════════════════════
-const djangueRoutes = require('./djangueRoutes');
+const djangueRoutes = require('./src/djangueRoutes');
 app.use('/api', djangueRoutes);
 
 if (require.main === module) {
