@@ -1,0 +1,377 @@
+-- EGCHAT full dependencies (backend sync)
+-- Ejecutar completo en Supabase SQL Editor.
+
+create extension if not exists "pgcrypto";
+
+create table if not exists users (
+  id uuid primary key default gen_random_uuid(),
+  phone varchar(20) unique not null,
+  full_name varchar(100) not null,
+  password_hash varchar(255) not null,
+  avatar_url text,
+  status varchar(20) default 'offline',
+  last_seen timestamptz,
+  created_at timestamptz default now(),
+  last_login timestamptz,
+  is_active boolean default true
+);
+
+create table if not exists wallets (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid unique references users(id) on delete cascade,
+  balance numeric(15,2) default 5000,
+  currency varchar(3) default 'XAF',
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists transactions (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete cascade,
+  type varchar(30) not null,
+  amount numeric(15,2) not null,
+  method varchar(100),
+  reference text,
+  status varchar(20) default 'completed',
+  created_at timestamptz default now()
+);
+
+create table if not exists recharge_codes (
+  id uuid primary key default gen_random_uuid(),
+  code varchar(40) unique not null,
+  amount numeric(15,2) not null,
+  used boolean default false,
+  used_by uuid references users(id) on delete set null,
+  created_by uuid references users(id) on delete set null,
+  used_at timestamptz,
+  expires_at timestamptz,
+  created_at timestamptz default now()
+);
+
+create table if not exists contacts (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete cascade,
+  contact_user_id uuid references users(id) on delete cascade,
+  contact_id uuid references users(id) on delete cascade,
+  nickname varchar(100),
+  name varchar(100),
+  phone varchar(20),
+  is_blocked boolean default false,
+  is_favorite boolean default false,
+  created_at timestamptz default now(),
+  unique(user_id, contact_user_id)
+);
+
+create table if not exists chats (
+  id uuid primary key default gen_random_uuid(),
+  type text default 'private',
+  name text,
+  avatar_url text,
+  created_by uuid references users(id) on delete set null,
+  participants jsonb default '[]'::jsonb,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists chat_participants (
+  id uuid primary key default gen_random_uuid(),
+  chat_id uuid references chats(id) on delete cascade,
+  user_id uuid references users(id) on delete cascade,
+  joined_at timestamptz default now(),
+  unread_count integer default 0,
+  unique(chat_id, user_id)
+);
+
+create table if not exists messages (
+  id uuid primary key default gen_random_uuid(),
+  chat_id uuid references chats(id) on delete cascade,
+  sender_id uuid references users(id) on delete set null,
+  text text,
+  type text default 'text',
+  status text default 'sent',
+  reply_to uuid,
+  file_url text,
+  created_at timestamptz default now()
+);
+
+alter table messages
+  add constraint messages_reply_to_fkey
+  foreign key (reply_to) references messages(id) on delete set null;
+
+create table if not exists message_reads (
+  id uuid primary key default gen_random_uuid(),
+  chat_id uuid references chats(id) on delete cascade,
+  user_id uuid references users(id) on delete cascade,
+  last_read_message_id uuid references messages(id) on delete set null,
+  read_at timestamptz default now(),
+  unique(chat_id, user_id)
+);
+
+create table if not exists lia_conversations (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete cascade,
+  message text not null,
+  reply text not null,
+  created_at timestamptz default now()
+);
+
+create table if not exists ledger_accounts (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete cascade,
+  code varchar(40) unique not null,
+  name varchar(120) not null,
+  account_type varchar(30) not null,
+  currency varchar(3) default 'XAF',
+  is_system boolean default false,
+  is_active boolean default true,
+  created_at timestamptz default now()
+);
+
+create table if not exists ledger_journals (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete cascade,
+  reference varchar(80),
+  concept text not null,
+  total_amount numeric(15,2) not null default 0,
+  status varchar(20) not null default 'draft',
+  requires_approval boolean default false,
+  created_by uuid references users(id) on delete set null,
+  approved_by uuid references users(id) on delete set null,
+  approved_at timestamptz,
+  created_at timestamptz default now()
+);
+
+create table if not exists ledger_entries (
+  id uuid primary key default gen_random_uuid(),
+  journal_id uuid references ledger_journals(id) on delete cascade,
+  account_id uuid references ledger_accounts(id) on delete restrict,
+  entry_type varchar(6) not null check (entry_type in ('debit','credit')),
+  amount numeric(15,2) not null check (amount > 0),
+  currency varchar(3) default 'XAF',
+  memo text,
+  counterparty_user_id uuid references users(id) on delete set null,
+  created_at timestamptz default now()
+);
+
+create table if not exists ledger_approvals (
+  id uuid primary key default gen_random_uuid(),
+  journal_id uuid references ledger_journals(id) on delete cascade,
+  requested_by uuid references users(id) on delete set null,
+  approved_by uuid references users(id) on delete set null,
+  status varchar(20) not null default 'pending',
+  reason text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  unique(journal_id)
+);
+
+create table if not exists taxi_rides (
+  id uuid primary key default gen_random_uuid(),
+  ride_ref varchar(60) unique not null,
+  user_id uuid references users(id) on delete cascade,
+  origin jsonb not null,
+  destination jsonb not null,
+  ride_type varchar(30) not null,
+  fare numeric(15,2) not null,
+  status varchar(30) not null default 'searching',
+  driver jsonb,
+  rating integer,
+  rating_comment text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists service_orders (
+  id uuid primary key default gen_random_uuid(),
+  order_ref varchar(60) unique not null,
+  user_id uuid references users(id) on delete cascade,
+  provider varchar(30) not null,
+  service_type varchar(40) not null,
+  contract_ref varchar(80),
+  amount numeric(15,2) default 0,
+  status varchar(30) not null default 'pending',
+  payload jsonb default '{}'::jsonb,
+  response jsonb default '{}'::jsonb,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists cemac_transfers (
+  id uuid primary key default gen_random_uuid(),
+  transfer_ref varchar(80) unique not null,
+  user_id uuid references users(id) on delete cascade,
+  from_country varchar(4) not null,
+  to_country varchar(4) not null,
+  beneficiary_name varchar(120) not null,
+  beneficiary_account varchar(60) not null,
+  amount numeric(15,2) not null,
+  fee numeric(15,2) not null default 0,
+  status varchar(30) not null default 'pending',
+  metadata jsonb default '{}'::jsonb,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists audit_logs (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete set null,
+  action varchar(80) not null,
+  module varchar(40) not null,
+  entity_id varchar(80),
+  details jsonb default '{}'::jsonb,
+  created_at timestamptz default now()
+);
+
+create index if not exists idx_contacts_user on contacts(user_id);
+create index if not exists idx_contacts_contact on contacts(contact_user_id);
+create index if not exists idx_wallets_user on wallets(user_id);
+create index if not exists idx_transactions_user on transactions(user_id);
+create index if not exists idx_chats_updated_at on chats(updated_at desc);
+create index if not exists idx_chat_participants_user on chat_participants(user_id);
+create index if not exists idx_messages_chat on messages(chat_id);
+create index if not exists idx_messages_created on messages(created_at desc);
+create index if not exists idx_reads_chat_user on message_reads(chat_id, user_id);
+create index if not exists idx_ledger_accounts_user on ledger_accounts(user_id);
+create index if not exists idx_ledger_journals_user_created on ledger_journals(user_id, created_at desc);
+create index if not exists idx_ledger_entries_journal on ledger_entries(journal_id);
+create index if not exists idx_ledger_approvals_status on ledger_approvals(status);
+create index if not exists idx_taxi_rides_user_created on taxi_rides(user_id, created_at desc);
+create index if not exists idx_taxi_rides_ref on taxi_rides(ride_ref);
+create index if not exists idx_service_orders_user_created on service_orders(user_id, created_at desc);
+create index if not exists idx_service_orders_provider_status on service_orders(provider, status);
+create index if not exists idx_cemac_transfers_user_created on cemac_transfers(user_id, created_at desc);
+create index if not exists idx_cemac_transfers_ref on cemac_transfers(transfer_ref);
+create index if not exists idx_audit_logs_user_created on audit_logs(user_id, created_at desc);
+
+insert into recharge_codes (code, amount, expires_at)
+values
+  ('EGCHAT-RESET-001', 5000, now() + interval '365 days'),
+  ('EGCHAT-RESET-002', 10000, now() + interval '365 days')
+on conflict (code) do nothing;
+
+-- Columnas y tablas faltantes detectadas en el deploy
+ALTER TABLE users ADD COLUMN IF NOT EXISTS app_version varchar(20) default '2.5.3';
+
+CREATE TABLE IF NOT EXISTS stories (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete cascade,
+  media jsonb default '[]'::jsonb,
+  created_at timestamptz default now(),
+  expires_at timestamptz default (now() + interval '24 hours')
+);
+
+CREATE TABLE IF NOT EXISTS group_stories (
+  id uuid primary key default gen_random_uuid(),
+  group_id uuid references chats(id) on delete cascade,
+  user_id uuid references users(id) on delete cascade,
+  media jsonb default '[]'::jsonb,
+  created_at timestamptz default now(),
+  expires_at timestamptz default (now() + interval '24 hours')
+);
+
+CREATE TABLE IF NOT EXISTS spaces (
+  id uuid primary key default gen_random_uuid(),
+  name varchar(120) not null,
+  description text,
+  type varchar(30) default 'community',
+  cover text,
+  emoji varchar(10),
+  created_by uuid references users(id) on delete set null,
+  created_at timestamptz default now()
+);
+
+CREATE TABLE IF NOT EXISTS space_followers (
+  id uuid primary key default gen_random_uuid(),
+  space_id uuid references spaces(id) on delete cascade,
+  user_id uuid references users(id) on delete cascade,
+  created_at timestamptz default now(),
+  unique(space_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS space_posts (
+  id uuid primary key default gen_random_uuid(),
+  space_id uuid references spaces(id) on delete cascade,
+  user_id uuid references users(id) on delete cascade,
+  text text,
+  image_url text,
+  likes integer default 0,
+  created_at timestamptz default now()
+);
+
+CREATE TABLE IF NOT EXISTS space_post_likes (
+  id uuid primary key default gen_random_uuid(),
+  post_id uuid references space_posts(id) on delete cascade,
+  user_id uuid references users(id) on delete cascade,
+  created_at timestamptz default now(),
+  unique(post_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS space_comments (
+  id uuid primary key default gen_random_uuid(),
+  post_id uuid references space_posts(id) on delete cascade,
+  user_id uuid references users(id) on delete cascade,
+  text text not null,
+  created_at timestamptz default now()
+);
+
+CREATE TABLE IF NOT EXISTS message_deletions (
+  id uuid primary key default gen_random_uuid(),
+  message_id uuid references messages(id) on delete cascade,
+  user_id uuid references users(id) on delete cascade,
+  created_at timestamptz default now(),
+  unique(message_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete cascade,
+  title text,
+  body text,
+  data jsonb default '{}'::jsonb,
+  read boolean default false,
+  created_at timestamptz default now()
+);
+
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete cascade,
+  endpoint text not null,
+  keys jsonb not null,
+  platform varchar(20),
+  created_at timestamptz default now(),
+  unique(endpoint)
+);
+
+CREATE TABLE IF NOT EXISTS chat_wallpapers (
+  id uuid primary key default gen_random_uuid(),
+  chat_id uuid references chats(id) on delete cascade,
+  user_id uuid references users(id) on delete cascade,
+  wallpaper_type varchar(20) default 'default',
+  wallpaper_value text,
+  wallpaper_settings jsonb default '{}'::jsonb,
+  created_at timestamptz default now(),
+  unique(chat_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS contact_favorites (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete cascade,
+  contact_id uuid references contacts(id) on delete cascade,
+  created_at timestamptz default now(),
+  unique(user_id, contact_id)
+);
+
+CREATE TABLE IF NOT EXISTS chat_favorites (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references users(id) on delete cascade,
+  chat_id uuid references chats(id) on delete cascade,
+  created_at timestamptz default now(),
+  unique(user_id, chat_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stories_user ON stories(user_id);
+CREATE INDEX IF NOT EXISTS idx_group_stories_group ON group_stories(group_id);
+CREATE INDEX IF NOT EXISTS idx_spaces_created_by ON spaces(created_by);
+CREATE INDEX IF NOT EXISTS idx_space_posts_space ON space_posts(space_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_push_subs_user ON push_subscriptions(user_id);
