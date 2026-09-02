@@ -1,0 +1,11 @@
+# railway.toml — mantener por compatibilidad
+# Para deploy GRATUITO usar Koyeb: https://app.koyeb.com
+# Ver: MIGRACION_FIREBASE_RAILWAY.md → FASE 3 (actualizada)
+[build]
+builder = "nixpacks"
+buildCommand = "npm install --production"
+
+[deploy]
+startCommand = "node index.firebase.js"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
