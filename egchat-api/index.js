@@ -7437,6 +7437,91 @@ app.get('/api/djangue', auth, async (req, res) => {
   }
 });
 
+// ── GET /api/djangue/my-list — Lista separada admin/miembro ───────
+// IMPORTANTE: debe ir ANTES de /:id para que Express no lo confunda con id="my-list"
+app.get('/api/djangue/my-list', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Grupos donde soy dueño o secretario
+    const { data: ownedGroups } = await supabase
+      .from('djangue_groups')
+      .select(`id, name, logo_url, frequency, quota_amount, currency,
+               max_members, status, current_turn, total_turns, next_payout_at,
+               owner_id, secretary_id, created_at,
+               djangue_wallets (balance),
+               djangue_members (count)`)
+      .or(`owner_id.eq.${userId},secretary_id.eq.${userId}`)
+      .order('created_at', { ascending: false });
+
+    // Grupos donde soy miembro pero no owner/secretary
+    const { data: memberRows } = await supabase
+      .from('djangue_members')
+      .select('group_id')
+      .eq('user_id', userId)
+      .eq('status', 'active');
+
+    const memberGroupIds = (memberRows || []).map(r => r.group_id);
+    const ownedIds = (ownedGroups || []).map(g => g.id);
+    const purelyMemberIds = memberGroupIds.filter(id => !ownedIds.includes(id));
+
+    let memberGroups = [];
+    if (purelyMemberIds.length > 0) {
+      const { data } = await supabase
+        .from('djangue_groups')
+        .select(`id, name, logo_url, frequency, quota_amount, currency,
+                 max_members, status, current_turn, total_turns, next_payout_at,
+                 owner_id, secretary_id, created_at,
+                 djangue_wallets (balance),
+                 djangue_members (count)`)
+        .in('id', purelyMemberIds)
+        .order('created_at', { ascending: false });
+      memberGroups = data || [];
+    }
+
+    const enrich = async (g, role) => {
+      const { data: myMember } = await supabase
+        .from('djangue_members')
+        .select('id, turn_order')
+        .eq('group_id', g.id)
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      const { data: myContrib } = myMember ? await supabase
+        .from('djangue_contributions')
+        .select('status')
+        .eq('group_id', g.id)
+        .eq('user_id', userId)
+        .eq('turn_number', g.current_turn)
+        .maybeSingle() : { data: null };
+
+      return {
+        ...g,
+        wallet_balance: g.djangue_wallets?.[0]?.balance ?? 0,
+        member_count: g.djangue_members?.[0]?.count ?? 0,
+        my_role: role,
+        my_turn_order: myMember?.turn_order ?? null,
+        my_paid_this_turn: myContrib?.status === 'paid',
+        is_my_turn: myMember?.turn_order === g.current_turn,
+        next_payout_date: g.next_payout_at,
+      };
+    };
+
+    const adminEnriched = await Promise.all(
+      (ownedGroups || []).map(g =>
+        enrich(g, g.owner_id === userId ? 'owner' : 'secretary')
+      )
+    );
+    const memberEnriched = await Promise.all(
+      memberGroups.map(g => enrich(g, 'member'))
+    );
+
+    res.json({ admin: adminEnriched, member: memberEnriched });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // ── POST /api/djangue — Crear grupo ───────────────────────────────
 app.post('/api/djangue', auth, async (req, res) => {
   try {
@@ -8019,6 +8104,492 @@ app.post('/api/push/register-expo-token', auth, async (req, res) => {
     }, { onConflict: 'user_id,token' });
 
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// DJANGUE — Rutas faltantes (v2)
+// ══════════════════════════════════════════════════════════════════
+
+// ── GET /api/djangue/:id/member-view — Vista del integrante ───────
+app.get('/api/djangue/:id/member-view', auth, async (req, res) => {
+  try {
+    const userId  = req.user.id;
+    const groupId = req.params.id;
+
+    const { data: group } = await supabase
+      .from('djangue_groups').select('*').eq('id', groupId).single();
+    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
+
+    const { data: myMember } = await supabase
+      .from('djangue_members')
+      .select('id, turn_order')
+      .eq('group_id', groupId).eq('user_id', userId).maybeSingle();
+
+    if (!myMember && group.owner_id !== userId && group.secretary_id !== userId)
+      return res.status(403).json({ message: 'No eres miembro de este djangue' });
+
+    const turnOrder = myMember?.turn_order ?? null;
+
+    // Mis contribuciones históricas
+    const { data: myContribs } = await supabase
+      .from('djangue_contributions')
+      .select('id, turn_number, amount, paid_at, status')
+      .eq('group_id', groupId).eq('user_id', userId)
+      .order('turn_number');
+
+    // Mis payouts recibidos
+    const { data: myPayouts } = await supabase
+      .from('djangue_payouts')
+      .select('id, turn_number, amount, paid_at')
+      .eq('group_id', groupId).eq('beneficiary_id', userId)
+      .order('turn_number');
+
+    // Moras pendientes
+    const { data: penalties } = await supabase
+      .from('djangue_penalties')
+      .select('id, penalty_amount, turn_number, status')
+      .eq('group_id', groupId).eq('user_id', userId);
+
+    const pendingPenalties = (penalties || [])
+      .filter(p => p.status === 'pending')
+      .reduce((sum, p) => sum + Number(p.penalty_amount || 0), 0);
+    const totalPenaltiesPaid = (penalties || [])
+      .filter(p => p.status === 'paid')
+      .reduce((sum, p) => sum + Number(p.penalty_amount || 0), 0);
+
+    // Contribución del turno actual
+    const { data: currentContrib } = await supabase
+      .from('djangue_contributions')
+      .select('status, amount')
+      .eq('group_id', groupId).eq('user_id', userId)
+      .eq('turn_number', group.current_turn).maybeSingle();
+
+    const paidCurrentTurn = currentContrib?.status === 'paid';
+
+    // Calcular turnos hasta el mío
+    const turnsUntilMine = turnOrder
+      ? (turnOrder >= group.current_turn
+          ? turnOrder - group.current_turn
+          : group.total_turns - group.current_turn + turnOrder)
+      : null;
+
+    // Estimar fecha de mi turno
+    let myTurnDateEstimate = null;
+    if (turnsUntilMine !== null && group.next_payout_at) {
+      const base = new Date(group.next_payout_at);
+      const msPerTurn = {
+        daily: 86400000, weekly: 604800000,
+        monthly: 30 * 86400000, annual: 365 * 86400000,
+      }[group.frequency] || 30 * 86400000;
+      myTurnDateEstimate = new Date(base.getTime() + turnsUntilMine * msPerTurn).toISOString();
+    }
+
+    const totalPaid = (myContribs || []).filter(c => c.status === 'paid').reduce((s, c) => s + Number(c.amount), 0);
+    const totalReceived = (myPayouts || []).reduce((s, p) => s + Number(p.amount), 0);
+    const onTimePaid = (myContribs || []).filter(c => c.status === 'paid' && c.paid_at).length;
+    const totalDue = (myContribs || []).filter(c => c.status !== 'justified').length;
+
+    res.json({
+      group_id: group.id,
+      group_name: group.name,
+      group_logo: group.logo_url,
+      frequency: group.frequency,
+      quota_amount: group.quota_amount,
+      currency: group.currency,
+      current_turn: group.current_turn,
+      total_turns: group.total_turns,
+      status: group.status,
+      chat_group_id: group.chat_group_id,
+      next_payout_at: group.next_payout_at,
+      my_turn_order: turnOrder,
+      is_my_turn: turnOrder === group.current_turn,
+      paid_current_turn: paidCurrentTurn,
+      amount_paid_current_turn: paidCurrentTurn ? Number(currentContrib?.amount || 0) : 0,
+      amount_owed: paidCurrentTurn ? 0 : Number(group.quota_amount),
+      turns_until_mine: turnsUntilMine,
+      my_turn_date_estimate: myTurnDateEstimate,
+      expected_payout: Number(group.quota_amount) * ((group.total_turns || 1) - 1),
+      total_paid: totalPaid,
+      turns_received: (myPayouts || []).length,
+      total_received: totalReceived,
+      payment_streak: onTimePaid,
+      on_time_percentage: totalDue > 0 ? Math.round((onTimePaid / totalDue) * 100) : 100,
+      my_contributions: myContribs || [],
+      my_payouts: myPayouts || [],
+      pending_penalties: pendingPenalties,
+      total_penalties_paid: totalPenaltiesPaid,
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── GET /api/djangue/:id/secretary-view — Panel del secretario ────
+app.get('/api/djangue/:id/secretary-view', auth, async (req, res) => {
+  try {
+    const userId  = req.user.id;
+    const groupId = req.params.id;
+
+    const { data: group } = await supabase
+      .from('djangue_groups').select('*').eq('id', groupId).single();
+    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
+
+    if (group.owner_id !== userId && group.secretary_id !== userId)
+      return res.status(403).json({ message: 'Solo el secretario o administrador puede ver esta vista' });
+
+    const { data: members } = await supabase
+      .from('djangue_members')
+      .select('id, turn_order, user_id')
+      .eq('group_id', groupId).eq('status', 'active')
+      .order('turn_order');
+
+    const membersWithInfo = await Promise.all((members || []).map(async (m) => {
+      const { data: user } = await supabase
+        .from('users').select('id, full_name, phone, avatar_url').eq('id', m.user_id).single();
+      const { data: contrib } = await supabase
+        .from('djangue_contributions')
+        .select('status, justification_note')
+        .eq('group_id', groupId).eq('user_id', m.user_id)
+        .eq('turn_number', group.current_turn).maybeSingle();
+      return {
+        ...m,
+        user,
+        paid_current_turn: contrib?.status === 'paid',
+        has_justified: contrib?.status === 'justified',
+        justification_note: contrib?.justification_note || null,
+        is_current_beneficiary: m.turn_order === group.current_turn,
+      };
+    }));
+
+    const paidCount    = membersWithInfo.filter(m => m.paid_current_turn).length;
+    const pendingCount = membersWithInfo.filter(m => !m.paid_current_turn && !m.is_current_beneficiary && !m.has_justified).length;
+
+    res.json({
+      id: group.id,
+      name: group.name,
+      current_turn: group.current_turn,
+      quota_amount: group.quota_amount,
+      currency: group.currency,
+      penalty_percent: group.penalty_percent,
+      notification_days_before: group.notification_days_before,
+      notification_final_days: group.notification_final_days,
+      period_end_date: group.period_end_date,
+      chat_group_id: group.chat_group_id,
+      members: membersWithInfo,
+      paid_count: paidCount,
+      pending_count: pendingCount,
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/djangue/:id/justify — Integrante justifica ausencia ─
+app.post('/api/djangue/:id/justify', auth, async (req, res) => {
+  try {
+    const userId  = req.user.id;
+    const groupId = req.params.id;
+    const { note } = req.body;
+
+    if (!note?.trim()) return res.status(400).json({ message: 'La justificación no puede estar vacía' });
+
+    const { data: member } = await supabase
+      .from('djangue_members')
+      .select('id').eq('group_id', groupId).eq('user_id', userId).eq('status', 'active').maybeSingle();
+    if (!member) return res.status(403).json({ message: 'No eres miembro de este djangue' });
+
+    const { data: group } = await supabase
+      .from('djangue_groups').select('current_turn').eq('id', groupId).single();
+
+    await supabase.from('djangue_contributions').upsert({
+      group_id: groupId,
+      member_id: member.id,
+      user_id: userId,
+      turn_number: group.current_turn,
+      amount: 0,
+      status: 'justified',
+      justification_note: note.trim(),
+    }, { onConflict: 'group_id,member_id,turn_number' });
+
+    res.json({ ok: true, message: 'Justificación registrada correctamente' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/djangue/:id/justify-absence — Secretario justifica a un miembro ─
+app.post('/api/djangue/:id/justify-absence', auth, async (req, res) => {
+  try {
+    const userId  = req.user.id;
+    const groupId = req.params.id;
+    const { member_id, note } = req.body;
+
+    if (!member_id || !note?.trim())
+      return res.status(400).json({ message: 'member_id y note son requeridos' });
+
+    const { data: group } = await supabase
+      .from('djangue_groups').select('*').eq('id', groupId).single();
+    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
+    if (group.owner_id !== userId && group.secretary_id !== userId)
+      return res.status(403).json({ message: 'Solo el secretario o administrador puede justificar ausencias' });
+
+    const { data: targetMember } = await supabase
+      .from('djangue_members')
+      .select('id, user_id').eq('id', member_id).eq('group_id', groupId).maybeSingle();
+    if (!targetMember) return res.status(404).json({ message: 'Miembro no encontrado' });
+
+    await supabase.from('djangue_contributions').upsert({
+      group_id: groupId,
+      member_id: member_id,
+      user_id: targetMember.user_id,
+      turn_number: group.current_turn,
+      amount: 0,
+      status: 'justified',
+      justification_note: note.trim(),
+    }, { onConflict: 'group_id,member_id,turn_number' });
+
+    res.json({ ok: true, message: 'Ausencia justificada correctamente' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/djangue/:id/send-reminder — Enviar recordatorio ─────
+app.post('/api/djangue/:id/send-reminder', auth, async (req, res) => {
+  try {
+    const userId  = req.user.id;
+    const groupId = req.params.id;
+    const { type, member_id } = req.body;
+
+    const { data: group } = await supabase
+      .from('djangue_groups').select('*').eq('id', groupId).single();
+    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
+    if (group.owner_id !== userId && group.secretary_id !== userId)
+      return res.status(403).json({ message: 'Solo el secretario o administrador puede enviar recordatorios' });
+
+    const pushPayload = {
+      title: '⏰ Recordatorio — Djangue',
+      body: `Recuerda pagar tu cuota del djangue "${group.name}" antes de que se cierre el turno ${group.current_turn}.`,
+      data: { type: 'djangue_reminder', group_id: groupId },
+    };
+
+    if (member_id) {
+      // Recordatorio a un solo miembro
+      const { data: targetMember } = await supabase
+        .from('djangue_members')
+        .select('user_id').eq('id', member_id).eq('group_id', groupId).maybeSingle();
+      if (!targetMember) return res.status(404).json({ message: 'Miembro no encontrado' });
+      await sendPushToUser(targetMember.user_id, pushPayload);
+    } else {
+      // Recordatorio a todos los que no han pagado
+      const { data: members } = await supabase
+        .from('djangue_members')
+        .select('id, user_id, turn_order')
+        .eq('group_id', groupId).eq('status', 'active');
+
+      const { data: paidContribs } = await supabase
+        .from('djangue_contributions')
+        .select('user_id')
+        .eq('group_id', groupId).eq('turn_number', group.current_turn).eq('status', 'paid');
+
+      const paidUserIds = new Set((paidContribs || []).map(c => c.user_id));
+
+      const pending = (members || []).filter(m =>
+        !paidUserIds.has(m.user_id) && m.turn_order !== group.current_turn
+      );
+
+      await Promise.allSettled(pending.map(m => sendPushToUser(m.user_id, pushPayload)));
+    }
+
+    res.json({ ok: true, message: 'Recordatorio(s) enviado(s)' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/djangue/:id/add-member — Alias de /members ──────────
+app.post('/api/djangue/:id/add-member', auth, async (req, res) => {
+  try {
+    const userId  = req.user.id;
+    const groupId = req.params.id;
+    const { phone } = req.body;
+
+    if (!phone) return res.status(400).json({ message: 'Teléfono requerido' });
+
+    const { data: group } = await supabase
+      .from('djangue_groups').select('*').eq('id', groupId).single();
+    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
+    if (group.owner_id !== userId && group.secretary_id !== userId)
+      return res.status(403).json({ message: 'Solo el responsable o secretario pueden agregar miembros' });
+
+    const { data: newUser } = await supabase
+      .from('users').select('id, full_name, phone, avatar_url').eq('phone', phone).maybeSingle();
+    if (!newUser) return res.status(404).json({ message: 'Usuario no encontrado con ese teléfono' });
+
+    const { data: existing } = await supabase
+      .from('djangue_members')
+      .select('id').eq('group_id', groupId).eq('user_id', newUser.id).maybeSingle();
+    if (existing) return res.status(409).json({ message: 'Este usuario ya es miembro del djangue' });
+
+    const { data: currentMembers } = await supabase
+      .from('djangue_members').select('id').eq('group_id', groupId).eq('status', 'active');
+    if ((currentMembers || []).length >= group.max_members)
+      return res.status(400).json({ message: `El djangue está lleno (máx. ${group.max_members} miembros)` });
+
+    const nextTurn = group.total_turns + 1;
+
+    const { data: member, error } = await supabase
+      .from('djangue_members')
+      .insert({ group_id: groupId, user_id: newUser.id, turn_order: nextTurn, status: 'active' })
+      .select().single();
+    if (error) throw error;
+
+    await supabase.from('djangue_groups').update({ total_turns: nextTurn }).eq('id', groupId);
+
+    // Notificar al nuevo miembro
+    try {
+      await sendPushToUser(newUser.id, {
+        title: '🎉 Te agregaron a un djangue',
+        body: `Fuiste agregado al djangue "${group.name}". Tu turno es el #${nextTurn}.`,
+        data: { type: 'djangue_added', group_id: groupId },
+      });
+    } catch {}
+
+    res.status(201).json({ member, user: newUser });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── DELETE /api/djangue/:id/remove-member — Eliminar integrante ───
+app.delete('/api/djangue/:id/remove-member', auth, async (req, res) => {
+  try {
+    const userId  = req.user.id;
+    const groupId = req.params.id;
+    const { member_id } = req.body;
+
+    if (!member_id) return res.status(400).json({ message: 'member_id requerido' });
+
+    const { data: group } = await supabase
+      .from('djangue_groups').select('*').eq('id', groupId).single();
+    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
+    if (group.owner_id !== userId && group.secretary_id !== userId)
+      return res.status(403).json({ message: 'Solo el responsable o secretario pueden eliminar miembros' });
+
+    const { data: target } = await supabase
+      .from('djangue_members').select('id, turn_order').eq('id', member_id).eq('group_id', groupId).maybeSingle();
+    if (!target) return res.status(404).json({ message: 'Miembro no encontrado' });
+
+    // Marcar como removido (no borrar para preservar historial)
+    await supabase.from('djangue_members').update({ status: 'removed' }).eq('id', member_id);
+
+    // Actualizar total_turns
+    const { data: activeMembers } = await supabase
+      .from('djangue_members').select('id').eq('group_id', groupId).eq('status', 'active');
+    await supabase.from('djangue_groups')
+      .update({ total_turns: (activeMembers || []).length })
+      .eq('id', groupId);
+
+    res.json({ ok: true, message: 'Integrante eliminado del djangue' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── PATCH /api/djangue/:id — Actualizar configuración del djangue ─
+app.patch('/api/djangue/:id', auth, async (req, res) => {
+  try {
+    const userId  = req.user.id;
+    const groupId = req.params.id;
+
+    const { data: group } = await supabase
+      .from('djangue_groups').select('*').eq('id', groupId).single();
+    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
+    if (group.owner_id !== userId)
+      return res.status(403).json({ message: 'Solo el administrador puede modificar la configuración' });
+
+    const {
+      name, slogan, description, logo_url, penalty_percent,
+      notification_days_before, notification_final_days, status,
+      frequency, quota_amount, max_members,
+    } = req.body;
+
+    const updates = {};
+    if (name !== undefined)                    updates.name = name;
+    if (slogan !== undefined)                  updates.slogan = slogan;
+    if (description !== undefined)             updates.description = description;
+    if (logo_url !== undefined)                updates.logo_url = logo_url;
+    if (penalty_percent !== undefined)         updates.penalty_percent = Number(penalty_percent);
+    if (notification_days_before !== undefined) updates.notification_days_before = Number(notification_days_before);
+    if (notification_final_days !== undefined)  updates.notification_final_days  = Number(notification_final_days);
+    if (status !== undefined)                  updates.status = status;
+
+    // Verificar si hay cotizaciones activas antes de cambiar aspectos financieros
+    const { data: activePaidContribs } = await supabase
+      .from('djangue_contributions')
+      .select('id').eq('group_id', groupId).eq('status', 'paid').limit(1);
+
+    const canModifyFinancial = !(activePaidContribs?.length > 0);
+
+    if (canModifyFinancial) {
+      if (frequency  !== undefined) updates.frequency   = frequency;
+      if (quota_amount !== undefined) updates.quota_amount = Number(quota_amount);
+      if (max_members !== undefined) updates.max_members  = Number(max_members);
+    }
+
+    const { data: updated, error } = await supabase
+      .from('djangue_groups').update(updates).eq('id', groupId).select().single();
+    if (error) throw error;
+
+    res.json({ ...updated, can_modify_financial: canModifyFinancial });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/upload/djangue-logo — Subir logo ────────────────────
+app.post('/api/upload/djangue-logo', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Recibir base64 o multipart
+    let base64Data, mimeType, filename;
+
+    if (req.headers['content-type']?.includes('application/json')) {
+      // Body JSON con { base64, mimeType }
+      base64Data = req.body.base64;
+      mimeType   = req.body.mimeType || 'image/jpeg';
+      filename   = `djangue-logo-${userId}-${Date.now()}.jpg`;
+    } else {
+      // Multipart form data — leer buffer
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      await new Promise(resolve => req.on('end', resolve));
+      const buffer = Buffer.concat(chunks);
+      base64Data = buffer.toString('base64');
+      mimeType   = req.headers['content-type']?.split(';')[0] || 'image/jpeg';
+      const ext  = mimeType.split('/')[1] || 'jpg';
+      filename   = `djangue-logo-${userId}-${Date.now()}.${ext}`;
+    }
+
+    if (!base64Data) return res.status(400).json({ message: 'No se recibió imagen' });
+
+    const buffer = Buffer.from(base64Data, 'base64');
+
+    const { data, error } = await supabase.storage
+      .from('avatars')
+      .upload(`djangue/${filename}`, buffer, {
+        contentType: mimeType,
+        upsert: true,
+      });
+
+    if (error) throw error;
+
+    const { data: urlData } = supabase.storage.from('avatars').getPublicUrl(`djangue/${filename}`);
+    res.json({ ok: true, url: urlData.publicUrl });
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
