@@ -6889,9 +6889,9 @@ app.post('/api/admin/run-migration', async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════
 // MI DJANGUE ROUTES — Sistema de tanda/caja de ahorro rotativo
-// ══════════════════════════════════════════════════════════════════════
-const djangueRoutes = require('./djangueRoutes');
-app.use('/api', djangueRoutes);
+// Las rutas están definidas inline en este archivo para evitar
+// problemas de módulos externos en Render
+// app.use('/api', require('./djangueRoutes')); // <- usando rutas inline abajo
 
 if (require.main === module) {
   app.listen(PORT, async () => {
