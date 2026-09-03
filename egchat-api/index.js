@@ -8288,6 +8288,132 @@ app.get('/api/djangue/:id/secretary-view', auth, async (req, res) => {
   }
 });
 
+// ── GET /api/djangue/:id/admin-stats — Estadísticas para el admin ─
+app.get('/api/djangue/:id/admin-stats', auth, async (req, res) => {
+  try {
+    const userId  = req.user.id;
+    const groupId = req.params.id;
+
+    const { data: group } = await supabase
+      .from('djangue_groups').select('*').eq('id', groupId).single();
+    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
+
+    if (group.owner_id !== userId && group.secretary_id !== userId)
+      return res.status(403).json({ message: 'Solo el administrador o secretario puede ver las estadísticas' });
+
+    // Miembros activos
+    const { data: members } = await supabase
+      .from('djangue_members').select('id, turn_order, user_id, status')
+      .eq('group_id', groupId).eq('status', 'active').order('turn_order');
+
+    const activeMembers = members || [];
+
+    // Total recaudado
+    const { data: contributions } = await supabase
+      .from('djangue_contributions').select('amount, status, turn_number, user_id, paid_at, created_at')
+      .eq('group_id', groupId);
+
+    const totalCollected = (contributions || [])
+      .filter(c => c.status === 'paid')
+      .reduce((sum, c) => sum + Number(c.amount), 0);
+
+    // Pagos a tiempo vs tarde
+    const paidContribs = (contributions || []).filter(c => c.status === 'paid' && c.paid_at);
+    const onTimePayments = paidContribs.filter(c =>
+      new Date(c.paid_at) <= new Date(new Date(c.created_at).getTime() + 86400000)
+    ).length;
+    const latePayments = paidContribs.length - onTimePayments;
+    const complianceRate = paidContribs.length > 0
+      ? Math.round((onTimePayments / paidContribs.length) * 100) : 100;
+
+    // Total entregado (payouts)
+    const { data: payouts } = await supabase
+      .from('djangue_payouts').select('amount, status, turn_number, beneficiary_id, created_at')
+      .eq('group_id', groupId);
+
+    const totalDelivered = (payouts || [])
+      .filter(p => p.status === 'completed')
+      .reduce((sum, p) => sum + Number(p.amount), 0);
+
+    const completedTurns = (payouts || []).filter(p => p.status === 'completed').length;
+
+    // Moras
+    const { data: penalties } = await supabase
+      .from('djangue_penalties').select('amount, status, user_id, turn_number')
+      .eq('group_id', groupId);
+
+    const totalPenalties = (penalties || []).reduce((sum, p) => sum + Number(p.amount), 0);
+
+    // Info de usuarios para los miembros
+    const membersWithInfo = await Promise.all(activeMembers.map(async (m) => {
+      const { data: user } = await supabase
+        .from('users').select('id, full_name, avatar_url').eq('id', m.user_id).single();
+      const memberContribs = (contributions || []).filter(c => c.user_id === m.user_id && c.status === 'paid');
+      const memberPenalties = (penalties || []).filter(p => p.user_id === m.user_id && p.status === 'pending');
+      return {
+        ...m,
+        user,
+        total_contributed: memberContribs.reduce((s, c) => s + Number(c.amount), 0),
+        pending_penalties: memberPenalties.reduce((s, p) => s + Number(p.amount), 0),
+        is_current_beneficiary: m.turn_order === group.current_turn,
+      };
+    }));
+
+    // Próximos turnos
+    const upcomingTurns = activeMembers
+      .filter(m => m.turn_order >= group.current_turn)
+      .slice(0, 5)
+      .map(m => {
+        const user = membersWithInfo.find(mi => mi.user_id === m.user_id)?.user;
+        return {
+          turn_number: m.turn_order,
+          beneficiary_name: user?.full_name || 'Desconocido',
+          beneficiary_avatar: user?.avatar_url || null,
+          expected_amount: Number(group.quota_amount) * (activeMembers.length - 1),
+        };
+      });
+
+    // Últimos payouts
+    const recentPayouts = await Promise.all(
+      (payouts || []).filter(p => p.status === 'completed')
+        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+        .slice(0, 5)
+        .map(async (p) => {
+          const { data: user } = await supabase
+            .from('users').select('full_name').eq('id', p.beneficiary_id).single();
+          return {
+            turn_number: p.turn_number,
+            beneficiary_name: user?.full_name || 'Desconocido',
+            amount: p.amount,
+            delivered_at: p.created_at,
+          };
+        })
+    );
+
+    res.json({
+      group_id: group.id,
+      group_name: group.name,
+      group_logo: group.logo_url,
+      currency: group.currency,
+      total_collected: totalCollected,
+      total_delivered: totalDelivered,
+      total_penalties: totalPenalties,
+      active_members: activeMembers.length,
+      completed_turns: completedTurns,
+      total_turns: group.total_turns,
+      current_turn: group.current_turn,
+      overall_compliance_rate: complianceRate,
+      on_time_payments: onTimePayments,
+      late_payments: latePayments,
+      upcoming_turns: upcomingTurns,
+      recent_payouts: recentPayouts,
+      members: membersWithInfo,
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // ── POST /api/djangue/:id/justify — Integrante justifica ausencia ─
 app.post('/api/djangue/:id/justify', auth, async (req, res) => {
   try {
