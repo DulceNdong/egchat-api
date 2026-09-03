@@ -6894,6 +6894,106 @@ app.post('/api/admin/run-migration', async (req, res) => {
 // problemas de módulos externos en Render
 // app.use('/api', require('./djangueRoutes')); // <- usando rutas inline abajo
 
+// ── Multer para subida de logo de djangue ────────────────────────
+const multerDjangue = (() => {
+  try { return require('multer'); } catch { return null; }
+})();
+const djangueUpload = multerDjangue ? multerDjangue({ storage: multerDjangue.memoryStorage(), limits: { fileSize: 5*1024*1024 } }) : null;
+
+// ── UPLOAD LOGO DJANGUE ──────────────────────────────────────────
+app.post('/api/upload/djangue-logo', auth, async (req, res) => {
+  res.json({ success: true, url: `https://ui-avatars.com/api/?name=D&size=200&background=C9A227&color=fff` });
+});
+
+// ── CREAR DJANGUE ────────────────────────────────────────────────
+app.post('/api/djangue', auth, async (req, res) => {
+  try {
+    const { name, slogan, description, logo_url, frequency, quota_amount, max_members, penalty_percent, notification_days_before, notification_final_days } = req.body;
+    if (!name?.trim()) return res.status(400).json({ error: 'El nombre es obligatorio' });
+    if (!['daily','weekly','biweekly','monthly','annual'].includes(frequency)) return res.status(400).json({ error: 'Frecuencia inválida' });
+    if (!quota_amount || quota_amount <= 0) return res.status(400).json({ error: 'Cuota inválida' });
+
+    const periodEnd = new Date();
+    if (frequency === 'daily') periodEnd.setDate(periodEnd.getDate()+1);
+    else if (frequency === 'weekly') periodEnd.setDate(periodEnd.getDate()+7);
+    else if (frequency === 'biweekly') periodEnd.setDate(periodEnd.getDate()+14);
+    else if (frequency === 'monthly') periodEnd.setMonth(periodEnd.getMonth()+1);
+    else periodEnd.setFullYear(periodEnd.getFullYear()+1);
+
+    const { data: group, error } = await supabase.from('djangue_groups').insert({
+      name: name.trim(), slogan: slogan?.trim()||null, description: description?.trim()||null,
+      logo_url: logo_url||null, frequency, quota_amount: Number(quota_amount), currency: 'XAF',
+      max_members: Number(max_members||12), penalty_percent: Number(penalty_percent||10),
+      notification_days_before: Number(notification_days_before||10),
+      notification_final_days: Number(notification_final_days||5),
+      status: 'active', owner_id: req.user.id, current_turn: 1, total_turns: Number(max_members||12),
+      period_start_date: new Date().toISOString(), period_end_date: periodEnd.toISOString(),
+      next_payout_at: periodEnd.toISOString(),
+    }).select().single();
+    if (error) throw error;
+
+    // Crear wallet
+    const { data: wallet } = await supabase.from('djangue_wallets').insert({ group_id: group.id, balance: 0, currency: 'XAF' }).select().single();
+    if (wallet) await supabase.from('djangue_groups').update({ wallet_id: wallet.id }).eq('id', group.id);
+
+    // Agregar owner como miembro turno 1
+    await supabase.from('djangue_members').insert({ group_id: group.id, user_id: req.user.id, turn_order: 1, status: 'active', role: 'owner', joined_at: new Date().toISOString() });
+
+    res.json({ success: true, id: group.id, name: group.name });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── OBTENER DJANGUES DEL USUARIO ────────────────────────────────
+app.get('/api/djangue', auth, async (req, res) => {
+  try {
+    const { data: memberships } = await supabase.from('djangue_members').select('group_id, turn_order, status, role').eq('user_id', req.user.id).eq('status', 'active');
+    if (!memberships?.length) return res.json([]);
+    const groupIds = memberships.map(m => m.group_id);
+    const { data: groups } = await supabase.from('djangue_groups').select('*').in('id', groupIds);
+    const result = await Promise.all((groups||[]).map(async g => {
+      const m = memberships.find(x => x.group_id === g.id);
+      const { count } = await supabase.from('djangue_members').select('*',{count:'exact',head:true}).eq('group_id',g.id).eq('status','active');
+      return { id:g.id, name:g.name, logo_url:g.logo_url, my_role:g.owner_id===req.user.id?'owner':g.secretary_id===req.user.id?'secretary':'member', status:g.status, current_turn:g.current_turn, total_turns:g.total_turns, is_my_turn:m.turn_order===g.current_turn, member_count:count||0, quota_amount:Number(g.quota_amount), currency:g.currency, frequency:g.frequency, chat_group_id:g.chat_group_id };
+    }));
+    res.json(result);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DETALLE DE UN DJANGUE ────────────────────────────────────────
+app.get('/api/djangue/:id', auth, async (req, res) => {
+  try {
+    const { data: group } = await supabase.from('djangue_groups').select('*').eq('id', req.params.id).single();
+    if (!group) return res.status(404).json({ error: 'No encontrado' });
+    const { data: membership } = await supabase.from('djangue_members').select('*').eq('group_id', req.params.id).eq('user_id', req.user.id).maybeSingle();
+    if (!membership) return res.status(403).json({ error: 'No eres miembro' });
+    const { data: members } = await supabase.from('djangue_members').select('*,users:user_id(id,full_name,phone,avatar_url)').eq('group_id', req.params.id).eq('status','active').order('turn_order',{ascending:true});
+    const { data: wallet } = await supabase.from('djangue_wallets').select('*').eq('group_id', req.params.id).maybeSingle();
+    const { data: contributions } = await supabase.from('djangue_contributions').select('*').eq('group_id', req.params.id).eq('turn_number', group.current_turn);
+    const myRole = group.owner_id===req.user.id?'owner':group.secretary_id===req.user.id?'secretary':'member';
+    res.json({ ...group, my_role:myRole, my_turn_number:membership.turn_order, is_my_turn:membership.turn_order===group.current_turn, members:members||[], wallet:wallet||null, current_turn_contributions:contributions||[] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── AGREGAR MIEMBRO ──────────────────────────────────────────────
+app.post('/api/djangue/:id/members', auth, async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Teléfono requerido' });
+    const { data: group } = await supabase.from('djangue_groups').select('owner_id,secretary_id,max_members,status,chat_group_id').eq('id', req.params.id).single();
+    if (!group) return res.status(404).json({ error: 'No encontrado' });
+    if (group.owner_id !== req.user.id && group.secretary_id !== req.user.id) return res.status(403).json({ error: 'Sin permiso' });
+    const { data: user } = await supabase.from('users').select('id').eq('phone', phone).maybeSingle();
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+    const { data: existing } = await supabase.from('djangue_members').select('id').eq('group_id', req.params.id).eq('user_id', user.id).maybeSingle();
+    if (existing) return res.status(400).json({ error: 'Ya es miembro' });
+    const { count } = await supabase.from('djangue_members').select('*',{count:'exact',head:true}).eq('group_id', req.params.id).eq('status','active');
+    if (count >= group.max_members) return res.status(400).json({ error: 'Máximo de miembros alcanzado' });
+    const { data: member } = await supabase.from('djangue_members').insert({ group_id:req.params.id, user_id:user.id, turn_order:count+1, status:'active', role:'member', joined_at:new Date().toISOString() }).select().single();
+    if (group.chat_group_id) await supabase.from('group_members').insert({ group_id:group.chat_group_id, user_id:user.id, role:'member' });
+    res.json({ success:true, member });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 if (require.main === module) {
   app.listen(PORT, async () => {
     console.log(`\n😎 EGCHAT API + Supabase en http://localhost:${PORT}`);
