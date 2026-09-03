@@ -288,7 +288,7 @@ module.exports = function mountAdmin(app, _supabase, jwt, bcrypt) {
       } catch { return { ok: false, latency: 9999 }; }
     };
     const [api, db] = await Promise.all([
-      ping('https://egchat-api.onrender.com/health'),
+      ping('https://egchat-api-xlxj.onrender.com/health'),
       ping(`${process.env.SUPABASE_URL || ''}/rest/v1/`),
     ]);
     res.json({
@@ -298,7 +298,7 @@ module.exports = function mountAdmin(app, _supabase, jwt, bcrypt) {
       supabaseMaxConns: 100,
       cdnHitRate: 94,
       services: [
-        { name: 'API Render', url: 'egchat-api.onrender.com', status: api.ok ? 'ok' : 'down', latency: api.latency },
+        { name: 'API Render', url: 'egchat-api-xlxj.onrender.com', status: api.ok ? 'ok' : 'down', latency: api.latency },
         { name: 'Supabase DB', url: 'supabase.co', status: db.ok ? 'ok' : 'degraded', latency: db.latency },
         { name: 'Vercel CDN', url: 'egchat-v2.vercel.app', status: 'ok', latency: 22 },
       ],
