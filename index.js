@@ -263,7 +263,8 @@ app.get('/', (req, res) => res.json({
   message: 'EGCHAT API funcionando!',
   version: APP_VERSION,
   database: 'Supabase',
-  status: 'active'
+  status: 'active',
+  deploy_test: 'RENDER_UPDATED_v2.6.2'
 }));
 
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
