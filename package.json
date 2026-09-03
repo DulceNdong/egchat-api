@@ -1,6 +1,6 @@
 {
   "name": "egchat-api",
-  "version": "2.6.2",
+  "version": "2.6.3",
   "description": "EGCHAT Backend API con Supabase",
   "main": "index.js",
   "scripts": {

@@ -6,12 +6,22 @@
 
 const https = require('https');
 
-const RENDER_API = 'https://egchat-api.onrender.com';
-const LOCAL_VERSION = '2.6.2'; // Versión esperada tras el push
+const RENDER_API = process.env.RENDER_API || 'https://egchat-api-xlxj.onrender.com';
+const LOCAL_VERSION = process.env.LOCAL_VERSION || '7bfcbc3-TWILIO-FIXED';
+const AUTH_TOKEN = process.env.RENDER_TOKEN || '';
+const TEST_DEPLOY_PATH = '/api/test-deploy';
 
-function checkEndpoint(path) {
+function checkEndpoint(method, path, body = null) {
   return new Promise((resolve, reject) => {
-    https.get(`${RENDER_API}${path}`, (res) => {
+    const payload = body ? JSON.stringify(body) : null;
+    const request = https.request(`${RENDER_API}${path}`, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(AUTH_TOKEN ? { Authorization: `Bearer ${AUTH_TOKEN}` } : {}),
+        ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {})
+      }
+    }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
@@ -19,10 +29,14 @@ function checkEndpoint(path) {
           const json = JSON.parse(data);
           resolve({ status: res.statusCode, data: json });
         } catch {
-          resolve({ status: res.statusCode, data: data });
+          resolve({ status: res.statusCode, data });
         }
       });
-    }).on('error', reject);
+    });
+
+    request.on('error', reject);
+    if (payload) request.write(payload);
+    request.end();
   });
 }
 
@@ -31,15 +45,15 @@ async function main() {
 
   // 1. Check version
   console.log('1️⃣  Verificando versión desplegada...');
-  const rootCheck = await checkEndpoint('/');
-  const deployedVersion = rootCheck.data?.version || 'unknown';
+  const deployCheck = await checkEndpoint('GET', TEST_DEPLOY_PATH);
+  const deployedVersion = deployCheck.data?.version || deployCheck.data?.build || 'unknown';
   console.log(`   Versión local:      ${LOCAL_VERSION}`);
   console.log(`   Versión en Render:  ${deployedVersion}`);
   
-  if (deployedVersion === LOCAL_VERSION) {
+  if (deployedVersion !== 'unknown' && deployedVersion === LOCAL_VERSION) {
     console.log('   ✅ Deploy actualizado\n');
   } else {
-    console.log('   ⚠️  Deploy desactualizado - Render aún no actualizó\n');
+    console.log('   ℹ️  No hay coincidencia exacta de versión, pero seguimos con la verificación funcional\n');
   }
 
   // 2. Check missing endpoints
@@ -57,7 +71,7 @@ async function main() {
   let notFound = 0;
 
   for (const endpoint of endpoints) {
-    const result = await checkEndpoint(endpoint.path);
+    const result = await checkEndpoint(endpoint.method, endpoint.path);
     const status = result.status;
     
     // 401 = endpoint existe pero requiere auth (BUENO)
@@ -84,10 +98,10 @@ async function main() {
 
   if (notFound > 0) {
     console.log('⚠️  ACCIÓN REQUERIDA:');
-    console.log('   Render no ha actualizado el código. Opciones:\n');
-    console.log('   1. Esperar 2-5 minutos más (Render puede tardar)');
-    console.log('   2. Ir a dashboard.render.com → egchat-api → Manual Deploy');
-    console.log('   3. Ejecutar: git commit --allow-empty -m "force deploy" && git push\n');
+    console.log('   Hay endpoints que no responden en la instancia actual.\n');
+    console.log('   1. Revisa que Render esté apuntando al repo y rama correctos.');
+    console.log('   2. Confirma que el servicio activo sea el de egchat-api-xlxj.onrender.com.');
+    console.log('   3. Si cambió el código, fuerza un redeploy desde Render.\n');
   } else {
     console.log('✅ Todos los endpoints están disponibles!');
     console.log('   Puedes continuar con tu testing.\n');

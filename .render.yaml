@@ -1,3 +1,6 @@
+# Render auto-detect configuration
+# Este archivo fuerza a Render a usar la configuración correcta
+
 services:
   - type: web
     name: egchat-api
@@ -7,6 +10,7 @@ services:
     buildCommand: npm install --production
     startCommand: node index.js
     healthCheckPath: /health
+    autoDeploy: true
     envVars:
       - key: NODE_ENV
         value: production
@@ -14,11 +18,3 @@ services:
         value: 10000
       - key: APP_VERSION
         value: "2.6.3-FORCE-DEPLOY"
-      - key: CORS_ALLOWED_ORIGINS
-        value: https://egchat-app.vercel.app,https://egchat-v2.vercel.app,http://localhost:3001,http://localhost:5173
-      - key: JWT_SECRET
-        sync: false
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false

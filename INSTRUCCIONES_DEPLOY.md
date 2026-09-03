@@ -2,9 +2,8 @@
 
 ## ⚠️ Situación Actual
 
-- ✅ Código pusheado a GitHub (commit `c8856a5`)
-- ❌ Render NO ha hecho auto-deploy (todavía en v2.5.5)
-- 🎯 Necesitas: v2.6.1 con los endpoints de djangue y chats
+- ✅ Código pusheado a GitHub
+- 🎯 Usa el servicio correcto: `egchat-api-xlxj`
 
 ---
 
@@ -19,7 +18,7 @@ https://dashboard.render.com/
 
 ### 2️⃣ Seleccionar tu Servicio
 
-1. Busca el servicio **`egchat-api`** en la lista
+1. Busca el servicio **`egchat-api-xlxj`** en la lista
 2. Haz clic en el nombre del servicio para abrir su panel
 
 ### 3️⃣ Hacer Deploy Manual
@@ -34,7 +33,7 @@ En la página del servicio:
 ### 4️⃣ Monitorear el Build
 
 - Verás los logs del build en tiempo real
-- Debe decir algo como: `Building from commit c8856a5...`
+- Debe decir que el nuevo servicio está desplegando el commit correcto
 - El build toma 2-5 minutos típicamente
 - Cuando termine, dirá: `Build successful` y `Live ✓`
 
@@ -61,7 +60,7 @@ Para que Render haga deploy automático en futuros pushes:
 
 ### En el Dashboard de Render:
 
-1. Ve a tu servicio **`egchat-api`**
+1. Ve a tu servicio **`egchat-api-xlxj`**
 2. Click en **"Settings"** (menú izquierdo)
 3. Busca la sección **"Build & Deploy"**
 4. Asegúrate que esté **activado**:
@@ -76,7 +75,7 @@ Para que Render haga deploy automático en futuros pushes:
 
 ### Verificar versión actual en Render:
 ```bash
-curl -s https://egchat-api.onrender.com/ | grep version
+curl -s https://egchat-api-xlxj.onrender.com/ | grep version
 ```
 
 ### Verificar endpoints:
@@ -107,7 +106,7 @@ node monitor-deploy.js
 1. Verifica que el build dice "Live ✓"
 2. Espera 30 segundos más (propagación de CDN)
 3. Haz hard refresh: `Ctrl+Shift+R` (Windows) o `Cmd+Shift+R` (Mac)
-4. Prueba con curl: `curl -s https://egchat-api.onrender.com/`
+4. Prueba con curl: `curl -s https://egchat-api-xlxj.onrender.com/`
 
 ---
 

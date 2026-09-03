@@ -6,8 +6,8 @@
 
 const https = require('https');
 
-const RENDER_API = 'https://egchat-api.onrender.com';
-const TARGET_VERSION = '2.6.2';
+const RENDER_API = process.env.RENDER_API || 'https://egchat-api-xlxj.onrender.com';
+const TARGET_VERSION = process.env.TARGET_VERSION || '7bfcbc3-TWILIO-FIXED';
 const CHECK_INTERVAL = 10000; // 10 segundos
 const MAX_CHECKS = 30; // 5 minutos máximo
 
@@ -15,7 +15,7 @@ let checkCount = 0;
 
 function getVersion() {
   return new Promise((resolve, reject) => {
-    https.get(`${RENDER_API}/`, (res) => {
+    https.get(`${RENDER_API}/api/test-deploy`, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
