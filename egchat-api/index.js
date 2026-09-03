@@ -25,7 +25,7 @@ const verifyToken = (token) => {
   }
   throw new Error('Token inválido o expirado');
 };
-const APP_VERSION = '2.5.7'; // fix: activar rutas de djangue - forzar redespliegue
+const APP_VERSION = '2.6.2'; // fix: sincronizar versiones - forzar limpieza de cache
 const chatStreams = new Map();
 const dependencyCache = { timestamp: 0, result: null };
 
