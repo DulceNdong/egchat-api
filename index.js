@@ -25,7 +25,7 @@ const verifyToken = (token) => {
   }
   throw new Error('Token inválido o expirado');
 };
-const APP_VERSION = '2.6.2'; // fix: sincronizar versiones - forzar limpieza de cache
+const APP_VERSION = '2.6.3-FORCE-DEPLOY'; // FORZAR RENDER A ACTUALIZAR
 const chatStreams = new Map();
 const dependencyCache = { timestamp: 0, result: null };
 
