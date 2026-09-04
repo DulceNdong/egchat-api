@@ -2549,12 +2549,19 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
       return res.status(400).json({ message: 'Monto máximo: 10,000,000 XAF' });
     }
 
-    // Obtener wallet del remitente
-    const { data: senderWallet, error: senderError } = await supabase
+    // Obtener wallet del remitente — si no existe, crearlo con balance 0
+    let { data: senderWallet, error: senderError } = await supabase
       .from('wallets').select('balance').eq('user_id', req.user.id).single();
 
     if (senderError || !senderWallet) {
-      return res.status(404).json({ message: 'Wallet no encontrado' });
+      // Crear wallet automáticamente
+      const { data: newWallet, error: createError } = await supabase
+        .from('wallets').insert({ user_id: req.user.id, balance: 0, currency: 'XAF' })
+        .select('balance').single();
+      if (createError || !newWallet) {
+        return res.status(500).json({ message: 'No se pudo inicializar el monedero' });
+      }
+      senderWallet = newWallet;
     }
 
     if (amount > senderWallet.balance) {
@@ -2601,7 +2608,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
       return res.status(500).json({ message: 'Error al procesar la transferencia' });
     }
 
-    // Si se encontró destinatario, actualizar su wallet
+    // Si se encontró destinatario, actualizar su wallet (crear si no existe)
     if (recipientId) {
       const { data: recipientWallet } = await supabase
         .from('wallets').select('balance').eq('user_id', recipientId).single();
@@ -2610,6 +2617,10 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
         await supabase.from('wallets')
           .update({ balance: recipientWallet.balance + amount })
           .eq('user_id', recipientId);
+      } else {
+        // Crear wallet del destinatario con el importe recibido
+        await supabase.from('wallets')
+          .insert({ user_id: recipientId, balance: amount, currency: 'XAF' });
       }
     }
 
