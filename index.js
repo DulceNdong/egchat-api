@@ -267,7 +267,7 @@ app.get('/', (req, res) => res.json({
   deploy_test: 'RENDER_UPDATED_v2.6.2'
 }));
 
-app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', version: APP_VERSION, timestamp: new Date().toISOString() }));
 
 // Test deploy version
 app.get('/api/test-deploy', (req, res) => res.json({ version: '7bfcbc3-TWILIO-FIXED', wallet_transfer: 'active', supabase: true, sms_verification: 'active' }));
@@ -8026,5 +8026,4 @@ app.post('/api/push/register-expo-token', auth, async (req, res) => {
 });
 
 module.exports = app;
-
 
