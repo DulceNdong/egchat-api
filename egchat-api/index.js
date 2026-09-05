@@ -270,7 +270,7 @@ app.get('/', (req, res) => res.json({
 app.get('/health', (req, res) => res.json({ status: 'ok', version: APP_VERSION, timestamp: new Date().toISOString() }));
 
 // Test deploy version
-app.get('/api/test-deploy', (req, res) => res.json({ version: '7bfcbc3-TWILIO-FIXED', wallet_transfer: 'active', supabase: true, sms_verification: 'active' }));
+app.get('/api/test-deploy', (req, res) => res.json({ version: 'a87c238-PIN-ROUTES', wallet_transfer: 'active', supabase: true, pin_system: 'active' }));
 
 // Helper para generar hash de contraseña (solo dev)
 app.post('/api/dev/hash-password', async (req, res) => {
