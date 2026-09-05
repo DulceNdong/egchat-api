@@ -545,6 +545,56 @@ app.put('/api/auth/profile', auth, async (req, res) => {
 
 app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'Sesión cerrada' }));
 
+// ── PIN de seguridad ─────────────────────────────────────────────
+// Permite proteger transferencias con un PIN de 6 dígitos.
+// El PIN se almacena como SHA-256 en la columna pin_hash de users.
+
+const crypto = require('crypto');
+const hashPin = (pin) => crypto.createHash('sha256').update(String(pin)).digest('hex');
+
+app.get('/api/auth/has-pin', auth, async (req, res) => {
+  try {
+    const { data: user, error } = await supabase
+      .from('users').select('pin_hash').eq('id', req.user.id).single();
+    if (error) return res.status(500).json({ message: 'Error al verificar PIN' });
+    res.json({ hasPin: !!(user?.pin_hash) });
+  } catch (e) {
+    res.status(500).json({ message: 'Error interno' });
+  }
+});
+
+app.post('/api/auth/setup-pin', auth, async (req, res) => {
+  try {
+    const { pin } = req.body;
+    if (!pin || String(pin).length !== 6 || !/^\d{6}$/.test(String(pin))) {
+      return res.status(400).json({ message: 'El PIN debe ser exactamente 6 dígitos numéricos' });
+    }
+    const pin_hash = hashPin(pin);
+    const { error } = await supabase
+      .from('users').update({ pin_hash }).eq('id', req.user.id);
+    if (error) return res.status(500).json({ message: 'Error al guardar el PIN' });
+    res.json({ success: true, message: 'PIN configurado correctamente' });
+  } catch (e) {
+    res.status(500).json({ message: 'Error interno' });
+  }
+});
+
+app.post('/api/auth/verify-pin', auth, async (req, res) => {
+  try {
+    const { pin } = req.body;
+    if (!pin) return res.status(400).json({ message: 'PIN requerido', valid: false });
+    const { data: user, error } = await supabase
+      .from('users').select('pin_hash').eq('id', req.user.id).single();
+    if (error || !user) return res.status(404).json({ message: 'Usuario no encontrado', valid: false });
+    if (!user.pin_hash) return res.status(400).json({ message: 'PIN no configurado', valid: false });
+    const valid = hashPin(pin) === user.pin_hash;
+    if (!valid) return res.status(401).json({ message: 'PIN incorrecto', valid: false });
+    res.json({ valid: true, message: 'PIN verificado' });
+  } catch (e) {
+    res.status(500).json({ message: 'Error interno', valid: false });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════
 // SESIONES MULTI-DISPOSITIVO
 // Registro, heartbeat, listado y revocación de sesiones activas.
