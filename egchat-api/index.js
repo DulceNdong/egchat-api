@@ -270,7 +270,7 @@ app.get('/', (req, res) => res.json({
 app.get('/health', (req, res) => res.json({ status: 'ok', version: APP_VERSION, timestamp: new Date().toISOString() }));
 
 // Test deploy version
-app.get('/api/test-deploy', (req, res) => res.json({ version: 'a87c238-PIN-ROUTES', wallet_transfer: 'active', supabase: true, pin_system: 'active' }));
+app.get('/api/test-deploy', (req, res) => res.json({ version: 'f407c66-TRANSFER-MSG', wallet_transfer: 'active', supabase: true, pin_system: 'active', transfer_chat_msg: 'active' }));
 
 // Helper para generar hash de contraseña (solo dev)
 app.post('/api/dev/hash-password', async (req, res) => {
@@ -2695,6 +2695,103 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
         reference: `Transferencia de usuario${concept ? ' · ' + concept : ''}`,
         status: 'completed',
         created_at: new Date().toISOString()
+      });
+
+      // Obtener nuevo saldo del destinatario para la notificación
+      const { data: recWalletUpdated } = await supabase
+        .from('wallets').select('balance').eq('user_id', recipientId).single();
+      const recNewBalance = recWalletUpdated?.balance ?? amount;
+
+      // Buscar el chat privado entre remitente y receptor para insertar mensaje automático
+      const { data: senderUser } = await supabase
+        .from('users').select('full_name, phone').eq('id', req.user.id).single();
+      const senderDisplayName = senderUser?.full_name || senderUser?.phone || 'Usuario';
+
+      const { data: chatParticipations } = await supabase
+        .from('chat_participants')
+        .select('chat_id')
+        .eq('user_id', req.user.id);
+
+      let transferChatId = null;
+      if (chatParticipations?.length) {
+        const chatIds = chatParticipations.map(p => p.chat_id);
+        const { data: sharedChats } = await supabase
+          .from('chat_participants')
+          .select('chat_id')
+          .eq('user_id', recipientId)
+          .in('chat_id', chatIds);
+
+        if (sharedChats?.length) {
+          // Verificar que sea un chat privado (solo 2 participantes)
+          for (const sc of sharedChats) {
+            const { count } = await supabase
+              .from('chat_participants')
+              .select('*', { count: 'exact', head: true })
+              .eq('chat_id', sc.chat_id);
+            if (count === 2) { transferChatId = sc.chat_id; break; }
+          }
+        }
+      }
+
+      if (transferChatId) {
+        const code = Math.floor(100000 + Math.random() * 900000).toString();
+        const transferMsgText = [
+          '💸 Transferencia recibida',
+          `💰 ${amount.toLocaleString()} XAF`,
+          `👤 De: ${senderDisplayName}`,
+          '🏦 Monedero EGCHAT',
+          `🔑 Ref: ${code}`,
+          '✅ Completado',
+        ].join('\n');
+
+        const { data: autoMsg } = await supabase
+          .from('messages')
+          .insert({
+            chat_id: transferChatId,
+            sender_id: req.user.id,
+            text: transferMsgText,
+            type: 'transfer',
+            status: 'sent',
+            created_at: new Date().toISOString(),
+          })
+          .select('id, text, type, created_at, sender_id, status')
+          .single();
+
+        if (autoMsg) {
+          await supabase.from('chats')
+            .update({ updated_at: new Date().toISOString() })
+            .eq('id', transferChatId);
+
+          // Emitir el mensaje a ambos participantes vía SSE
+          emitToUser(String(req.user.id), {
+            type: 'new_message',
+            chatId: transferChatId,
+            message: { ...autoMsg, senderName: senderDisplayName },
+          });
+          emitToUser(String(recipientId), {
+            type: 'new_message',
+            chatId: transferChatId,
+            message: { ...autoMsg, senderName: senderDisplayName },
+          });
+          emitToUser(String(req.user.id), { type: 'chat_updated', chatId: transferChatId, ts: Date.now() });
+          emitToUser(String(recipientId), { type: 'chat_updated', chatId: transferChatId, ts: Date.now() });
+        }
+      }
+
+      // Notificar al destinatario vía SSE
+      emitToUser(String(recipientId), {
+        type: 'transfer_received',
+        amount,
+        senderName: senderDisplayName,
+        newBalance: recNewBalance,
+        ts: Date.now(),
+      });
+
+      // Notificar al remitente su nuevo saldo
+      emitToUser(String(req.user.id), {
+        type: 'wallet_updated',
+        balance: newBalance,
+        ts: Date.now(),
       });
     }
 
