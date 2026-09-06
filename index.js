@@ -2140,10 +2140,31 @@ app.delete('/api/messages/:messageId', auth, async (req, res) => {
           .delete()
           .eq('id', messageId);
         if (hardDeleteError) throw hardDeleteError;
+
+        // Notificar a todos los participantes del chat vía SSE
+        try {
+          const { data: parts } = await supabase
+            .from('chat_participants')
+            .select('user_id')
+            .eq('chat_id', message.chat_id);
+          const targetUsers = (parts || []).map((p) => p.user_id);
+          emitToUsers(targetUsers, { type: 'message_deleted', chatId: message.chat_id, messageId });
+        } catch (_) { /* silent — notificación best-effort */ }
+
         return res.json({ message: 'Mensaje eliminado exitosamente', soft_delete: false });
       }
       throw updateError;
     }
+
+    // Notificar a todos los participantes del chat vía SSE
+    try {
+      const { data: parts } = await supabase
+        .from('chat_participants')
+        .select('user_id')
+        .eq('chat_id', message.chat_id);
+      const targetUsers = (parts || []).map((p) => p.user_id);
+      emitToUsers(targetUsers, { type: 'message_deleted', chatId: message.chat_id, messageId });
+    } catch (_) { /* silent — notificación best-effort */ }
 
     res.json({ message: 'Mensaje eliminado para todos', soft_delete: true, retained_for_years: 5 });
   } catch (e) {
