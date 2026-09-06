@@ -2055,7 +2055,7 @@ app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
   }
 });
 
-// Eliminar mensaje para mí (solo oculta para el usuario actual)
+// Eliminar mensaje para mí (soft-delete: oculta solo para el usuario — se retiene 5 años)
 app.delete('/api/messages/:messageId/for-me', auth, async (req, res) => {
   try {
     const { messageId } = req.params;
@@ -2081,29 +2081,33 @@ app.delete('/api/messages/:messageId/for-me', auth, async (req, res) => {
 
     if (!part) return res.status(403).json({ message: 'Sin acceso a este chat' });
 
-    // Registrar la eliminación para este usuario (upsert para evitar duplicados)
+    // Soft-delete: registrar eliminación para este usuario con timestamp
+    // El registro se purga automáticamente después de 5 años (retention_expires_at)
     const { error: delError } = await supabase
       .from('message_deletions')
-      .upsert({ message_id: messageId, user_id: req.user.id }, { onConflict: 'message_id,user_id' });
+      .upsert(
+        { message_id: messageId, user_id: req.user.id, deleted_at: new Date().toISOString() },
+        { onConflict: 'message_id,user_id' }
+      );
 
-    // Si la tabla no existe, ignorar el error (el cliente maneja el filtro localmente)
+    // Tolerar tabla inexistente durante la migración (el cliente filtra localmente)
     if (delError && !delError.message?.includes('does not exist') && !delError.code?.includes('42P01')) {
       throw delError;
     }
 
-    res.json({ message: 'Mensaje eliminado para ti' });
+    res.json({ message: 'Mensaje eliminado para ti', retained_for_years: 5 });
   } catch (e) {
     console.error('Delete message for me error:', e);
     res.status(500).json({ message: e.message });
   }
 });
 
-// Eliminar mensaje para todos (solo el remitente puede hacerlo)
+// Eliminar mensaje para todos (soft-delete — el mensaje queda en BD 5 años)
 app.delete('/api/messages/:messageId', auth, async (req, res) => {
   try {
     const { messageId } = req.params;
 
-    // Verificar que el mensaje pertenece al usuario
+    // Verificar que el mensaje existe y pertenece al usuario
     const { data: message, error: msgError } = await supabase
       .from('messages')
       .select('id, sender_id, chat_id')
@@ -2118,15 +2122,28 @@ app.delete('/api/messages/:messageId', auth, async (req, res) => {
       return res.status(403).json({ message: 'No puedes eliminar mensajes de otros usuarios' });
     }
 
-    // Eliminar mensaje
-    const { error: deleteError } = await supabase
+    // Soft-delete: marcar como eliminado con timestamp
+    // retention_expires_at = deleted_at + 5 años (columna generada en BD)
+    const now = new Date().toISOString();
+    const { error: updateError } = await supabase
       .from('messages')
-      .delete()
+      .update({ deleted_at: now, deleted_by: req.user.id, text: null, file_url: null })
       .eq('id', messageId);
 
-    if (deleteError) throw deleteError;
+    if (updateError) {
+      // Fallback: si las columnas nuevas aún no existen (pre-migración), hacer hard delete
+      if (updateError.message?.includes('column') || updateError.code === '42703') {
+        const { error: hardDeleteError } = await supabase
+          .from('messages')
+          .delete()
+          .eq('id', messageId);
+        if (hardDeleteError) throw hardDeleteError;
+        return res.json({ message: 'Mensaje eliminado exitosamente', soft_delete: false });
+      }
+      throw updateError;
+    }
 
-    res.json({ message: 'Mensaje eliminado exitosamente' });
+    res.json({ message: 'Mensaje eliminado para todos', soft_delete: true, retained_for_years: 5 });
   } catch (e) {
     console.error('Delete message error:', e);
     res.status(500).json({ message: e.message });
