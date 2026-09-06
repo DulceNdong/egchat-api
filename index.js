@@ -2173,6 +2173,75 @@ app.delete('/api/messages/:messageId', auth, async (req, res) => {
   }
 });
 
+// Eliminar chat completamente (mensajes + participantes + chat + contacto asociado)
+app.delete('/api/chats/:chatId', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const userId = req.user.id;
+
+    // 1. Verificar que el usuario es participante del chat
+    const { data: myPart, error: partErr } = await supabase
+      .from('chat_participants')
+      .select('chat_id')
+      .eq('chat_id', chatId)
+      .eq('user_id', userId)
+      .single();
+
+    if (partErr || !myPart) {
+      return res.status(403).json({ message: 'No tienes acceso a este chat' });
+    }
+
+    // 2. Obtener el tipo de chat y el otro participante (solo para chats privados)
+    const { data: chat } = await supabase
+      .from('chats')
+      .select('id, type')
+      .eq('id', chatId)
+      .single();
+
+    let otherUserId = null;
+    if (chat?.type === 'private') {
+      const { data: allParts } = await supabase
+        .from('chat_participants')
+        .select('user_id')
+        .eq('chat_id', chatId)
+        .neq('user_id', userId);
+      otherUserId = allParts?.[0]?.user_id || null;
+    }
+
+    // 3. Borrar mensajes del chat (hard delete — permanente)
+    await supabase.from('message_deletions').delete().in(
+      'message_id',
+      (await supabase.from('messages').select('id').eq('chat_id', chatId)).data?.map(m => m.id) || []
+    );
+    await supabase.from('messages').delete().eq('chat_id', chatId);
+
+    // 4. Borrar participantes
+    await supabase.from('chat_participants').delete().eq('chat_id', chatId);
+
+    // 5. Borrar el chat
+    const { error: chatDelErr } = await supabase
+      .from('chats')
+      .delete()
+      .eq('id', chatId);
+
+    if (chatDelErr) throw chatDelErr;
+
+    // 6. Borrar el contacto asociado (solo chats privados, best-effort)
+    if (otherUserId) {
+      await supabase
+        .from('contacts')
+        .delete()
+        .eq('user_id', userId)
+        .eq('contact_user_id', otherUserId);
+    }
+
+    res.json({ message: 'Chat y contacto eliminados permanentemente' });
+  } catch (e) {
+    console.error('Delete chat error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // ════════════════════════════════════════════════════════════════════
 // CONTACTOS - GESTIÁƒâ€œN COMPLETA
 // ════════════════════════════════════════════════════════════════════
