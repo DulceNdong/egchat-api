@@ -1406,14 +1406,16 @@ app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
 
     if (!part) return res.status(403).json({ message: 'No tienes acceso a este chat' });
 
+    // Excluir mensajes con soft-delete global (deleted_at IS NOT NULL = borrado para todos)
     const { data: messages } = await supabase
       .from('messages')
       .select('id, text, type, created_at, sender_id, status, reply_to, file_url')
       .eq('chat_id', chatId)
+      .is('deleted_at', null)          // soft-delete: excluir borrados para todos
       .order('created_at', { ascending: false })
       .range(from, from + limit - 1);
 
-    // Filtrar mensajes que el usuario eliminó para sí mismo
+    // Filtrar mensajes que el usuario eliminó para sí mismo (message_deletions)
     const { data: deletions } = await supabase
       .from('message_deletions')
       .select('message_id')
