@@ -25,7 +25,7 @@ const verifyToken = (token) => {
   }
   throw new Error('Token inválido o expirado');
 };
-const APP_VERSION = '2.6.3-FORCE-DEPLOY'; // FORZAR RENDER A ACTUALIZAR
+const APP_VERSION = '2.6.4-ADMIN-ROUTES'; // Admin portal routes mounted
 const chatStreams = new Map();
 const dependencyCache = { timestamp: 0, result: null };
 
