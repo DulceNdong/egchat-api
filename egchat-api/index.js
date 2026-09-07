@@ -7165,6 +7165,41 @@ app.post('/api/djangue', auth, async (req, res) => {
       await supabase.from('djangue_groups').update({ total_turns: 2 }).eq('id', group.id);
     }
 
+    // ── Crear grupo de chat para el djangue ──────────────────────
+    try {
+      const memberIds = secretaryId && secretaryId !== userId
+        ? [userId, secretaryId]
+        : [userId];
+
+      const { data: chatGroup } = await supabase
+        .from('chats')
+        .insert({
+          type: 'group',
+          name: `💰 ${name}`,
+          created_by: userId,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .select('id')
+        .single();
+
+      if (chatGroup) {
+        // Añadir participantes al chat
+        await supabase.from('chat_participants').insert(
+          memberIds.map(uid => ({ chat_id: chatGroup.id, user_id: uid }))
+        );
+        // Vincular el chat al djangue
+        await supabase.from('djangue_groups')
+          .update({ chat_group_id: chatGroup.id })
+          .eq('id', group.id);
+
+        res.status(201).json({ ...group, wallet_id: wallet?.id, chat_group_id: chatGroup.id });
+        return;
+      }
+    } catch (chatErr) {
+      console.warn('Could not create djangue chat group (non-fatal):', chatErr);
+    }
+
     res.status(201).json({ ...group, wallet_id: wallet?.id });
   } catch (e) {
     console.error('Create djangue error:', e);
@@ -7233,6 +7268,9 @@ app.post('/api/djangue/:id/members', auth, async (req, res) => {
     res.json({ success:true, member });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
+// ── Admin Portal Routes ────────────────────────────────────────────
+require('./adminRoutes')(app, supabase, JWT_SECRET);
 
 if (require.main === module) {
   app.listen(PORT, async () => {
@@ -8873,6 +8911,68 @@ app.post('/api/djangue/:id/send-reminder', auth, async (req, res) => {
 
     res.json({ ok: true, message: 'Recordatorio(s) enviado(s)' });
   } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/djangue/:id/ensure-chat — Crear chat si no existe ───
+app.post('/api/djangue/:id/ensure-chat', auth, async (req, res) => {
+  try {
+    const userId  = req.user.id;
+    const groupId = req.params.id;
+
+    const { data: group } = await supabase
+      .from('djangue_groups')
+      .select('id, name, owner_id, chat_group_id')
+      .eq('id', groupId)
+      .single();
+
+    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
+    if (group.owner_id !== userId) return res.status(403).json({ message: 'Solo el administrador puede crear el chat' });
+
+    // Si ya tiene chat, devolver el existente
+    if (group.chat_group_id) {
+      return res.json({ chat_group_id: group.chat_group_id });
+    }
+
+    // Obtener todos los miembros activos
+    const { data: members } = await supabase
+      .from('djangue_members')
+      .select('user_id')
+      .eq('group_id', groupId)
+      .eq('status', 'active');
+
+    const memberIds = (members || []).map(m => m.user_id);
+    if (!memberIds.includes(userId)) memberIds.push(userId);
+
+    // Crear el grupo de chat
+    const { data: chatGroup, error: chatErr } = await supabase
+      .from('chats')
+      .insert({
+        type: 'group',
+        name: `💰 ${group.name}`,
+        created_by: userId,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .select('id')
+      .single();
+
+    if (chatErr || !chatGroup) throw chatErr || new Error('No se pudo crear el chat');
+
+    // Añadir participantes
+    await supabase.from('chat_participants').insert(
+      memberIds.map(uid => ({ chat_id: chatGroup.id, user_id: uid }))
+    );
+
+    // Vincular al djangue
+    await supabase.from('djangue_groups')
+      .update({ chat_group_id: chatGroup.id })
+      .eq('id', groupId);
+
+    res.json({ chat_group_id: chatGroup.id });
+  } catch (e) {
+    console.error('Ensure djangue chat error:', e);
     res.status(500).json({ message: e.message });
   }
 });
