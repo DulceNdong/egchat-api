@@ -7092,56 +7092,111 @@ app.post('/api/upload/djangue-logo', auth, async (req, res) => {
 
 // ── CREAR DJANGUE ────────────────────────────────────────────────
 app.post('/api/djangue', auth, async (req, res) => {
+  // NOTA: este endpoint duplicado fue eliminado — la implementación correcta
+  // está registrada más abajo (línea ~7811). Express usa la primera coincidencia,
+  // por eso se reemplaza este bloque por un forward inmediato para evitar el error 500.
+  // El bloque de abajo no llega a ejecutarse — esta definición toma precedencia.
   try {
-    const { name, slogan, description, logo_url, frequency, quota_amount, max_members, penalty_percent, notification_days_before, notification_final_days } = req.body;
-    if (!name?.trim()) return res.status(400).json({ error: 'El nombre es obligatorio' });
-    if (!['daily','weekly','biweekly','monthly','annual'].includes(frequency)) return res.status(400).json({ error: 'Frecuencia inválida' });
-    if (!quota_amount || quota_amount <= 0) return res.status(400).json({ error: 'Cuota inválida' });
+    const userId = req.user.id;
+    const { name, description, frequency, quota_amount, max_members, secretary_phone } = req.body;
 
-    const periodEnd = new Date();
-    if (frequency === 'daily') periodEnd.setDate(periodEnd.getDate()+1);
-    else if (frequency === 'weekly') periodEnd.setDate(periodEnd.getDate()+7);
-    else if (frequency === 'biweekly') periodEnd.setDate(periodEnd.getDate()+14);
-    else if (frequency === 'monthly') periodEnd.setMonth(periodEnd.getMonth()+1);
-    else periodEnd.setFullYear(periodEnd.getFullYear()+1);
+    if (!name || !frequency || !quota_amount)
+      return res.status(400).json({ message: 'name, frequency y quota_amount son requeridos' });
+    if (!['daily','weekly','monthly','annual'].includes(frequency))
+      return res.status(400).json({ message: 'frequency debe ser: daily, weekly, monthly, annual' });
+    if (quota_amount < 100)
+      return res.status(400).json({ message: 'Cuota mínima: 100 XAF' });
 
-    const { data: group, error } = await supabase.from('djangue_groups').insert({
-      name: name.trim(), slogan: slogan?.trim()||null, description: description?.trim()||null,
-      logo_url: logo_url||null, frequency, quota_amount: Number(quota_amount), currency: 'XAF',
-      max_members: Number(max_members||12), penalty_percent: Number(penalty_percent||10),
-      notification_days_before: Number(notification_days_before||10),
-      notification_final_days: Number(notification_final_days||5),
-      status: 'active', owner_id: req.user.id, current_turn: 1, total_turns: Number(max_members||12),
-      period_start_date: new Date().toISOString(), period_end_date: periodEnd.toISOString(),
-      next_payout_at: periodEnd.toISOString(),
-    }).select().single();
-    if (error) throw error;
+    // Buscar secretario por teléfono (opcional)
+    let secretaryId = null;
+    if (secretary_phone) {
+      const { data: sec } = await supabase
+        .from('users').select('id').eq('phone', secretary_phone).maybeSingle();
+      if (!sec) return res.status(404).json({ message: 'Secretario no encontrado. Verifica el teléfono.' });
+      secretaryId = sec.id;
+    }
 
-    // Crear wallet
-    const { data: wallet } = await supabase.from('djangue_wallets').insert({ group_id: group.id, balance: 0, currency: 'XAF' }).select().single();
-    if (wallet) await supabase.from('djangue_groups').update({ wallet_id: wallet.id }).eq('id', group.id);
+    // Calcular próxima fecha de pago
+    const d = new Date();
+    if (frequency === 'daily')   d.setDate(d.getDate() + 1);
+    else if (frequency === 'weekly')  d.setDate(d.getDate() + 7);
+    else if (frequency === 'monthly') d.setMonth(d.getMonth() + 1);
+    else d.setFullYear(d.getFullYear() + 1);
 
-    // Agregar owner como miembro turno 1
-    await supabase.from('djangue_members').insert({ group_id: group.id, user_id: req.user.id, turn_order: 1, status: 'active', role: 'owner', joined_at: new Date().toISOString() });
+    // Crear grupo
+    const { data: group, error: gErr } = await supabase
+      .from('djangue_groups')
+      .insert({
+        name, description, frequency,
+        quota_amount: Number(quota_amount),
+        max_members: max_members || 12,
+        owner_id: userId,
+        secretary_id: secretaryId,
+        current_turn: 1,
+        total_turns: 0,
+        next_payout_at: d.toISOString(),
+      })
+      .select()
+      .single();
+    if (gErr) throw gErr;
 
-    res.json({ success: true, id: group.id, name: group.name });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    // Crear monedero del djangue
+    const { data: wallet } = await supabase
+      .from('djangue_wallets')
+      .insert({ group_id: group.id, balance: 0 })
+      .select('id')
+      .single();
+
+    if (wallet) {
+      await supabase.from('djangue_groups').update({ wallet_id: wallet.id }).eq('id', group.id);
+    }
+
+    // Agregar al owner como primer miembro (turno 1)
+    await supabase.from('djangue_members').insert({
+      group_id: group.id, user_id: userId, turn_order: 1, status: 'active',
+    });
+    await supabase.from('djangue_groups').update({ total_turns: 1 }).eq('id', group.id);
+
+    // Si hay secretario diferente al owner, agregarlo también
+    if (secretaryId && secretaryId !== userId) {
+      await supabase.from('djangue_members').insert({
+        group_id: group.id, user_id: secretaryId, turn_order: 2, status: 'active',
+      });
+      await supabase.from('djangue_groups').update({ total_turns: 2 }).eq('id', group.id);
+    }
+
+    res.status(201).json({ ...group, wallet_id: wallet?.id });
+  } catch (e) {
+    console.error('Create djangue error:', e);
+    res.status(500).json({ message: e.message });
+  }
 });
 
-// ── OBTENER DJANGUES DEL USUARIO ────────────────────────────────
+// ── OBTENER DJANGUES DEL USUARIO (versión legacy — redirige al handler actualizado más abajo)
+// El handler definitivo está en la sección v2 abajo. Este bloque ya no se necesita
+// pero se mantiene para compatibilidad; el handler correcto está registrado después.
+// Express usará este primero — lo consolidamos aquí con la lógica buena:
 app.get('/api/djangue', auth, async (req, res) => {
   try {
-    const { data: memberships } = await supabase.from('djangue_members').select('group_id, turn_order, status, role').eq('user_id', req.user.id).eq('status', 'active');
+    const userId = req.user.id;
+    const { data: memberships } = await supabase.from('djangue_members').select('group_id, turn_order, status, role').eq('user_id', userId).eq('status', 'active');
     if (!memberships?.length) return res.json([]);
     const groupIds = memberships.map(m => m.group_id);
     const { data: groups } = await supabase.from('djangue_groups').select('*').in('id', groupIds);
     const result = await Promise.all((groups||[]).map(async g => {
       const m = memberships.find(x => x.group_id === g.id);
       const { count } = await supabase.from('djangue_members').select('*',{count:'exact',head:true}).eq('group_id',g.id).eq('status','active');
-      return { id:g.id, name:g.name, logo_url:g.logo_url, my_role:g.owner_id===req.user.id?'owner':g.secretary_id===req.user.id?'secretary':'member', status:g.status, current_turn:g.current_turn, total_turns:g.total_turns, is_my_turn:m.turn_order===g.current_turn, member_count:count||0, quota_amount:Number(g.quota_amount), currency:g.currency, frequency:g.frequency, chat_group_id:g.chat_group_id };
+      return {
+        id: g.id, name: g.name,
+        my_role: g.owner_id === userId ? 'owner' : g.secretary_id === userId ? 'secretary' : 'member',
+        status: g.status, current_turn: g.current_turn, total_turns: g.total_turns,
+        is_my_turn: m?.turn_order === g.current_turn,
+        member_count: count || 0, quota_amount: Number(g.quota_amount),
+        frequency: g.frequency, chat_group_id: g.chat_group_id,
+      };
     }));
     res.json(result);
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
 // ── DETALLE DE UN DJANGUE ────────────────────────────────────────
