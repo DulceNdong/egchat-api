@@ -2190,10 +2190,21 @@ app.delete('/api/messages/:messageId', auth, async (req, res) => {
           .delete()
           .eq('id', messageId);
         if (hardDeleteError) throw hardDeleteError;
+        // Notificar a todos los participantes del chat
+        try {
+          const { data: parts } = await supabase.from('chat_participants').select('user_id').eq('chat_id', message.chat_id);
+          emitToUsers((parts || []).map(p => p.user_id), { type: 'message_deleted', chatId: message.chat_id, messageId });
+        } catch {}
         return res.json({ message: 'Mensaje eliminado exitosamente', soft_delete: false });
       }
       throw updateError;
     }
+
+    // Notificar a todos los participantes del chat que el mensaje fue eliminado
+    try {
+      const { data: parts } = await supabase.from('chat_participants').select('user_id').eq('chat_id', message.chat_id);
+      emitToUsers((parts || []).map(p => p.user_id), { type: 'message_deleted', chatId: message.chat_id, messageId });
+    } catch {}
 
     res.json({ message: 'Mensaje eliminado para todos', soft_delete: true, retained_for_years: 5 });
   } catch (e) {
@@ -2201,9 +2212,6 @@ app.delete('/api/messages/:messageId', auth, async (req, res) => {
     res.status(500).json({ message: e.message });
   }
 });
-
-// ════════════════════════════════════════════════════════════════════
-// CONTACTOS - GESTIÁƒâ€œN COMPLETA
 // ════════════════════════════════════════════════════════════════════
 
 // Obtener todos los contactos del usuario
