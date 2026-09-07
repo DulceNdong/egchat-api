@@ -350,7 +350,7 @@ module.exports = function mountAdmin(app, _supabase, jwt, bcrypt) {
         try {
           const cR = await client.query(`SELECT country, COUNT(*) as count FROM users WHERE country IS NOT NULL GROUP BY country ORDER BY count DESC LIMIT 5`);
           if (cR.rows.length > 0) {
-            const flags: Record<string,string> = {'Guinea Ecuatorial':'🇬🇶','Camerún':'🇨🇲','Gabón':'🇬🇦','España':'🇪🇸','Francia':'🇫🇷'};
+            const flags = {'Guinea Ecuatorial':'🇬🇶','Camerún':'🇨🇲','Gabón':'🇬🇦','España':'🇪🇸','Francia':'🇫🇷'};
             byCountry = cR.rows.map(r => ({ country: r.country, flag: flags[r.country]||'🌍', count: parseInt(r.count), pct: Math.round(parseInt(r.count)/total*100) }));
           }
         } catch {}
