@@ -25,7 +25,7 @@ const verifyToken = (token) => {
   }
   throw new Error('Token inválido o expirado');
 };
-const APP_VERSION = '2.5.7'; // fix: activar rutas de djangue - forzar redespliegue
+const APP_VERSION = '2.5.8-admin-portal'; // fix: admin routes mounted
 const chatStreams = new Map();
 const dependencyCache = { timestamp: 0, result: null };
 
@@ -6892,6 +6892,9 @@ app.post('/api/admin/run-migration', async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════
 const djangueRoutes = require('./djangueRoutes');
 app.use('/api', djangueRoutes);
+
+// ── Admin Portal Routes ───────────────────────────────────────────
+require('./adminRoutes')(app, supabase, JWT_SECRET);
 
 if (require.main === module) {
   app.listen(PORT, async () => {
