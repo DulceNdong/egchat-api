@@ -393,7 +393,7 @@ router.get('/djangue/:id', authenticate, async (req, res) => {
     // Verificar que el usuario es miembro
     const { data: membership, error: membershipError } = await supabase
       .from('djangue_members')
-      .select('*')
+      .select('id, turn_order, turn_number, status, role')
       .eq('group_id', id)
       .eq('user_id', req.userId)
       .maybeSingle();
@@ -424,7 +424,7 @@ router.get('/djangue/:id', authenticate, async (req, res) => {
       `)
       .eq('group_id', id)
       .eq('status', 'active')
-      .order('turn_number', { ascending: true });
+      .order('turn_order', { ascending: true, nullsFirst: false });
 
     if (membersError) {
       console.error('Error obteniendo miembros:', membersError);
@@ -444,14 +444,27 @@ router.get('/djangue/:id', authenticate, async (req, res) => {
       .eq('group_id', id)
       .eq('turn_number', group.current_turn);
 
+    // Total recaudado y esperado en el turno actual
+    const totalPaidThisTurn = (contributions || [])
+      .filter(c => c.status === 'paid')
+      .reduce((sum, c) => sum + Number(c.amount || 0), 0);
+    const paidCount = (contributions || []).filter(c => c.status === 'paid').length;
+    const memberCount = (members || []).length;
+    const expectedTotal = group.quota_amount * Math.max(memberCount - 1, 0);
+
     res.json({
       ...group,
       my_role: myRole,
-      my_turn_number: membership.turn_number,
-      is_my_turn: membership.turn_number === group.current_turn,
+      my_turn_order: membership.turn_number ?? membership.turn_order ?? null,
+      my_turn_number: membership.turn_number ?? membership.turn_order ?? null,
+      is_my_turn: (membership.turn_number ?? membership.turn_order) === group.current_turn,
       members: members || [],
       wallet: wallet || null,
       current_turn_contributions: contributions || [],
+      total_paid_this_turn: totalPaidThisTurn,
+      expected_total_this_turn: expectedTotal,
+      paid_count: paidCount,
+      pending_count: memberCount - paidCount,
     });
 
   } catch (error) {
