@@ -522,19 +522,19 @@ app.get('/api/auth/me', auth, async (req, res) => {
     });
   }
   const { data: user } = await supabase
-    .from('users').select('id, phone, full_name, avatar_url, created_at').eq('id', req.user.id).single();
+    .from('users').select('id, phone, full_name, avatar_url, banner_url, created_at').eq('id', req.user.id).single();
   if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
   res.json({ ...user, app_version: APP_VERSION });
 });
 
 app.put('/api/auth/profile', auth, async (req, res) => {
   try {
-    const { full_name, avatar_url } = req.body;
+    const { full_name, avatar_url, banner_url } = req.body;
     const { data: user, error } = await supabase
       .from('users')
-      .update({ full_name, avatar_url })
+      .update({ full_name, avatar_url, banner_url })
       .eq('id', req.user.id)
-      .select('id, phone, full_name, avatar_url')
+      .select('id, phone, full_name, avatar_url, banner_url')
       .single();
     if (error) throw error;
     res.json(user);
@@ -2526,7 +2526,7 @@ app.get('/api/contacts/search', auth, async (req, res) => {
 
     let query = supabase
       .from('users')
-      .select('id, phone, full_name, avatar_url')
+      .select('id, phone, full_name, avatar_url, banner_url')
       .neq('id', req.user.id)
       .limit(50);
 
@@ -3494,7 +3494,7 @@ app.put('/api/user/profile', auth, async (req, res) => {
   if (avatar_url !== undefined) updates.avatar_url = avatar_url;
   if (city) updates.city = city;
   const { data: user } = await supabase
-    .from('users').update(updates).eq('id', req.user.id).select('id, phone, full_name, avatar_url').single();
+    .from('users').update(updates).eq('id', req.user.id).select('id, phone, full_name, avatar_url, banner_url').single();
   res.json({ ...user, app_version: APP_VERSION });
 });
 
