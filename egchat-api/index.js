@@ -7179,6 +7179,204 @@ app.post('/api/moments/:momentId/comments', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ══════════════════════════════════════════════════════════════════
+// NUEVOS ENDPOINTS: Moment notify, Story notify, Live, New-content
+// ══════════════════════════════════════════════════════════════════
+
+// ── Helper: obtener contactos de un usuario ─────────────────────
+async function getUserContactIds(userId) {
+  // Los contactos son participantes de chats privados del usuario
+  const { data } = await supabase
+    .from('chat_participants')
+    .select('chat_id')
+    .eq('user_id', userId);
+  if (!data?.length) return [];
+  const chatIds = data.map(r => r.chat_id);
+  const { data: peers } = await supabase
+    .from('chat_participants')
+    .select('user_id')
+    .in('chat_id', chatIds)
+    .neq('user_id', userId);
+  return [...new Set((peers || []).map(p => p.user_id))];
+}
+
+// ── POST /api/moments/:momentId/notify ─────────────────────────
+// Envía push a todos los contactos cuando se publica un Moment
+app.post('/api/moments/:momentId/notify', auth, async (req, res) => {
+  try {
+    const { momentId } = req.params;
+    const { authorName, preview } = req.body;
+    const contactIds = await getUserContactIds(req.user.id);
+    if (!contactIds.length) return res.json({ sent: 0 });
+
+    const pushPayload = {
+      title: `${authorName || 'Tu contacto'} publicó un Moment 📸`,
+      body: preview || 'Toca para verlo',
+      data: { type: 'new_moment', momentId, userId: req.user.id },
+      channelId: 'egchat-messages',
+    };
+
+    const results = await Promise.allSettled(contactIds.map(uid => sendPushToUser(uid, pushPayload)));
+    const sent = results.filter(r => r.status === 'fulfilled').length;
+    res.json({ sent });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/stories/:storyId/notify ──────────────────────────
+// Envía push a todos los contactos cuando se publica un Estado
+app.post('/api/stories/:storyId/notify', auth, async (req, res) => {
+  try {
+    const { storyId } = req.params;
+    const { authorName } = req.body;
+    const contactIds = await getUserContactIds(req.user.id);
+    if (!contactIds.length) return res.json({ sent: 0 });
+
+    const pushPayload = {
+      title: `${authorName || 'Tu contacto'} tiene un estado nuevo 🟢`,
+      body: 'Toca para ver su estado antes de que expire',
+      data: { type: 'new_story', storyId, userId: req.user.id },
+      channelId: 'egchat-messages',
+    };
+
+    const results = await Promise.allSettled(contactIds.map(uid => sendPushToUser(uid, pushPayload)));
+    const sent = results.filter(r => r.status === 'fulfilled').length;
+    res.json({ sent });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/stories/contacts-new ──────────────────────────────
+// Stories nuevas de contactos (últimas 24h) — para indicadores
+app.get('/api/stories/contacts-new', auth, async (req, res) => {
+  try {
+    const contactIds = await getUserContactIds(req.user.id);
+    if (!contactIds.length) return res.json([]);
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { data, error } = await supabase
+      .from('stories')
+      .select('id, user_id, created_at')
+      .in('user_id', contactIds)
+      .gte('created_at', since)
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/moments/contacts-new ──────────────────────────────
+// Moments nuevos de contactos (últimas 24h) — para indicadores
+app.get('/api/moments/contacts-new', auth, async (req, res) => {
+  try {
+    const contactIds = await getUserContactIds(req.user.id);
+    if (!contactIds.length) return res.json([]);
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { data, error } = await supabase
+      .from('moments')
+      .select('id, user_id, created_at')
+      .in('user_id', contactIds)
+      .gte('created_at', since)
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// LIVE STREAMING ENDPOINTS
+// ══════════════════════════════════════════════════════════════════
+
+// Tabla en memoria para lives activos (sin BD — real-time via Supabase)
+const activeLives = new Map(); // liveId → { hostId, hostName, startedAt, viewers: Set }
+
+// ── POST /api/live/start ────────────────────────────────────────
+app.post('/api/live/start', auth, async (req, res) => {
+  try {
+    const { title = 'En vivo' } = req.body;
+    const liveId = `live-${req.user.id}-${Date.now()}`;
+
+    activeLives.set(liveId, {
+      hostId: req.user.id,
+      hostName: req.user.full_name || 'Usuario',
+      title,
+      startedAt: new Date().toISOString(),
+      viewers: new Set(),
+    });
+
+    // Auto-limpiar después de 4 horas si no se cierra
+    setTimeout(() => activeLives.delete(liveId), 4 * 60 * 60 * 1000);
+
+    res.json({ liveId, title });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/live/:liveId/end ──────────────────────────────────
+app.post('/api/live/:liveId/end', auth, async (req, res) => {
+  try {
+    const { liveId } = req.params;
+    activeLives.delete(liveId);
+    res.json({ ended: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/live/active ────────────────────────────────────────
+// Lives activos de contactos — para indicadores en avatares
+app.get('/api/live/active', auth, async (req, res) => {
+  try {
+    const contactIds = await getUserContactIds(req.user.id);
+    const result = [];
+    for (const [liveId, live] of activeLives.entries()) {
+      if (contactIds.includes(live.hostId)) {
+        result.push({ live_id: liveId, host_id: live.hostId, host_name: live.hostName, started_at: live.startedAt, viewer_count: live.viewers.size });
+      }
+    }
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/live/:liveId/notify ──────────────────────────────
+// Envía push urgente a contactos cuando empieza un live
+app.post('/api/live/:liveId/notify', auth, async (req, res) => {
+  try {
+    const { liveId } = req.params;
+    const { hostName } = req.body;
+    const contactIds = await getUserContactIds(req.user.id);
+    if (!contactIds.length) return res.json({ sent: 0 });
+
+    const pushPayload = {
+      title: `🔴 ${hostName || 'Tu contacto'} está en vivo ahora`,
+      body: '¡Únete a la transmisión!',
+      data: { type: 'live_started', liveId, hostId: req.user.id },
+      channelId: 'egchat-calls', // canal de alta prioridad
+      priority: 'high',
+    };
+
+    const results = await Promise.allSettled(contactIds.map(uid => sendPushToUser(uid, pushPayload)));
+    const sent = results.filter(r => r.status === 'fulfilled').length;
+    res.json({ sent });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/live/:liveId/join ─────────────────────────────────
+// Un espectador se une al live
+app.post('/api/live/:liveId/join', auth, async (req, res) => {
+  try {
+    const { liveId } = req.params;
+    const live = activeLives.get(liveId);
+    if (!live) return res.status(404).json({ error: 'Live no encontrado o terminado' });
+    live.viewers.add(req.user.id);
+    res.json({ joined: true, viewerCount: live.viewers.size, hostId: live.hostId, hostName: live.hostName });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/live/:liveId/leave ────────────────────────────────
+app.post('/api/live/:liveId/leave', auth, async (req, res) => {
+  try {
+    const { liveId } = req.params;
+    const live = activeLives.get(liveId);
+    if (live) live.viewers.delete(req.user.id);
+    res.json({ left: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── #6: CANALES OFICIALES ───────────────────────────────────────────
 app.get('/api/channels', auth, async (req, res) => {
   try {
@@ -7529,7 +7727,7 @@ app.get('/api/djangue/my-list', auth, async (req, res) => {
 app.post('/api/djangue', auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { name, description, frequency, quota_amount, max_members, secretary_phone } = req.body;
+    const { name, description, frequency, quota_amount, max_members, secretary_phone, logo_url } = req.body;
 
     if (!name || !frequency || !quota_amount)
       return res.status(400).json({ message: 'name, frequency y quota_amount son requeridos' });
@@ -7554,6 +7752,7 @@ app.post('/api/djangue', auth, async (req, res) => {
         name, description, frequency,
         quota_amount: Number(quota_amount),
         max_members: max_members || 12,
+        logo_url: logo_url || null,
         owner_id: userId,
         secretary_id: secretaryId,
         current_turn: 1,
