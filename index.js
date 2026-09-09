@@ -2466,6 +2466,47 @@ app.delete('/api/contacts/:contactId', auth, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════
+// SYNC DE CONTACTOS DEL TELÉFONO
+// POST /api/contacts/sync
+// Body: { phones: string[] }  — lista de teléfonos normalizados de la agenda
+// Responde qué números tienen cuenta en EGChat
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/contacts/sync', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { phones } = req.body;
+
+    if (!Array.isArray(phones) || phones.length === 0) {
+      return res.json({ found: [] });
+    }
+
+    // Limitar a 500 números por llamada para no sobrecargar la BD
+    const batch = phones.slice(0, 500);
+
+    // Buscar qué números de la lista tienen cuenta en EGChat
+    const { data: matchedUsers, error } = await supabase
+      .from('users')
+      .select('id, phone, full_name, avatar_url')
+      .in('phone', batch)
+      .neq('id', userId); // Excluir al propio usuario
+
+    if (error) throw error;
+
+    const found = (matchedUsers || []).map(u => ({
+      phone:     u.phone,
+      user_id:   u.id,
+      full_name: u.full_name || 'Usuario',
+      avatar_url: u.avatar_url || null,
+    }));
+
+    res.json({ found, total: found.length });
+  } catch (e) {
+    console.error('Contact sync error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // Marcar contacto como favorito
 app.post('/api/contacts/:contactId/favorite', auth, async (req, res) => {  try {
     const { contactId } = req.params;
