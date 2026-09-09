@@ -545,6 +545,107 @@ app.put('/api/auth/profile', auth, async (req, res) => {
 app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'Sesión cerrada' }));
 
 // ══════════════════════════════════════════════════════════════════
+// PRIVACIDAD — última vez visto, foto, estado
+// PATCH /api/auth/privacy
+// Body: { last_seen_visibility, photo_visibility, status_visibility }
+// Valores: 'todos' | 'contactos' | 'nadie'
+// ══════════════════════════════════════════════════════════════════
+app.patch('/api/auth/privacy', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { last_seen_visibility, photo_visibility, status_visibility } = req.body;
+
+    const updates = {};
+    if (last_seen_visibility !== undefined) {
+      const valid = ['todos', 'contactos', 'nadie'];
+      if (!valid.includes(last_seen_visibility)) {
+        return res.status(400).json({ message: 'Valor inválido para last_seen_visibility' });
+      }
+      updates.last_seen_visibility = last_seen_visibility;
+    }
+    if (photo_visibility !== undefined) {
+      const valid = ['todos', 'contactos', 'nadie'];
+      if (!valid.includes(photo_visibility)) {
+        return res.status(400).json({ message: 'Valor inválido para photo_visibility' });
+      }
+      updates.photo_visibility = photo_visibility;
+    }
+    if (status_visibility !== undefined) {
+      const valid = ['todos', 'contactos', 'nadie'];
+      if (!valid.includes(status_visibility)) {
+        return res.status(400).json({ message: 'Valor inválido para status_visibility' });
+      }
+      updates.status_visibility = status_visibility;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ message: 'No se proporcionaron campos para actualizar' });
+    }
+
+    const { data, error } = await supabase
+      .from('users')
+      .update(updates)
+      .eq('id', userId)
+      .select('id, last_seen_visibility, photo_visibility, status_visibility')
+      .single();
+
+    if (error) throw error;
+    res.json({ ok: true, privacy: data });
+  } catch (e) {
+    console.error('Privacy update error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Obtener configuración de privacidad del usuario actual
+app.get('/api/auth/privacy', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('last_seen_visibility, photo_visibility, status_visibility')
+      .eq('id', req.user.id)
+      .single();
+    if (error) throw error;
+    res.json({
+      last_seen_visibility:  data?.last_seen_visibility  || 'todos',
+      photo_visibility:      data?.photo_visibility      || 'todos',
+      status_visibility:     data?.status_visibility     || 'todos',
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// CONFIRMACIONES DE LECTURA — activar/desactivar ticks azules
+// PATCH /api/auth/read-receipts
+// Body: { read_receipts_enabled: boolean }
+// ══════════════════════════════════════════════════════════════════
+app.patch('/api/auth/read-receipts', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { read_receipts_enabled } = req.body;
+
+    if (typeof read_receipts_enabled !== 'boolean') {
+      return res.status(400).json({ message: 'read_receipts_enabled debe ser boolean' });
+    }
+
+    const { data, error } = await supabase
+      .from('users')
+      .update({ read_receipts_enabled })
+      .eq('id', userId)
+      .select('id, read_receipts_enabled')
+      .single();
+
+    if (error) throw error;
+    res.json({ ok: true, read_receipts_enabled: data?.read_receipts_enabled });
+  } catch (e) {
+    console.error('Read receipts update error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════
 // SESIONES MULTI-DISPOSITIVO
 // Registro, heartbeat, listado y revocación de sesiones activas.
 // Permite al usuario ver todos sus dispositivos conectados (como
