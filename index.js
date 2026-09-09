@@ -521,7 +521,7 @@ app.get('/api/auth/me', auth, async (req, res) => {
     });
   }
   const { data: user } = await supabase
-    .from('users').select('id, phone, full_name, avatar_url, created_at').eq('id', req.user.id).single();
+    .from('users').select('id, phone, full_name, avatar_url, created_at, last_seen_visibility, photo_visibility, status_visibility, read_receipts_enabled').eq('id', req.user.id).single();
   if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
   res.json({ ...user, app_version: APP_VERSION });
 });
