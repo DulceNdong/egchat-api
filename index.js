@@ -6858,6 +6858,11 @@ app.post('/api/admin/run-migration', async (req, res) => {
     `ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS voice_transcript TEXT`,
     `ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS forwarded_from TEXT`,
     `ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ`,
+    // Privacidad y preferencias de usuario
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_visibility VARCHAR(20) DEFAULT 'todos'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_visibility VARCHAR(20) DEFAULT 'todos'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS status_visibility VARCHAR(20) DEFAULT 'todos'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS read_receipts_enabled BOOLEAN DEFAULT TRUE`,
     `CREATE TABLE IF NOT EXISTS story_reactions (id UUID DEFAULT gen_random_uuid() PRIMARY KEY, story_id UUID NOT NULL, user_id UUID REFERENCES users(id) ON DELETE CASCADE, emoji VARCHAR(10) NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(story_id, user_id))`,
     `ALTER TABLE djangue_notifications ADD COLUMN IF NOT EXISTS sent BOOLEAN DEFAULT FALSE`,
     `ALTER TABLE djangue_notifications ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ`,
