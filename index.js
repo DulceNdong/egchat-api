@@ -2467,8 +2467,7 @@ app.delete('/api/contacts/:contactId', auth, async (req, res) => {
 });
 
 // Marcar contacto como favorito
-app.post('/api/contacts/:contactId/favorite', auth, async (req, res) => {
-  try {
+app.post('/api/contacts/:contactId/favorite', auth, async (req, res) => {  try {
     const { contactId } = req.params;
 
     const { data: contact, error } = await supabase
