@@ -530,9 +530,25 @@ app.get('/api/auth/me', auth, async (req, res) => {
 app.put('/api/auth/profile', auth, async (req, res) => {
   try {
     const { full_name, avatar_url, banner_url } = req.body;
+
+    // Sanear URLs: rechazar rutas locales (file://) que no son accesibles para otros usuarios
+    const safeUrl = (url) => {
+      if (!url) return url; // null/undefined → no cambiar
+      if (typeof url !== 'string') return null;
+      // Solo aceptar URLs públicas https:// o http://
+      if (url.startsWith('https://') || url.startsWith('http://')) return url;
+      return undefined; // ignorar file://, base64, rutas relativas, etc.
+    };
+
+    const updates = { full_name };
+    const safeAvatar = safeUrl(avatar_url);
+    const safeBanner = safeUrl(banner_url);
+    if (safeAvatar !== undefined) updates.avatar_url = safeAvatar;
+    if (safeBanner  !== undefined) updates.banner_url  = safeBanner;
+
     const { data: user, error } = await supabase
       .from('users')
-      .update({ full_name, avatar_url, banner_url })
+      .update(updates)
       .eq('id', req.user.id)
       .select('id, phone, full_name, avatar_url, banner_url')
       .single();
@@ -1357,6 +1373,7 @@ const normalizeChatParticipant = (part = {}) => {
     full_name: part.full_name || user.full_name || '',
     phone: part.phone || user.phone || '',
     avatar_url: part.avatar_url || user.avatar_url || '',
+    banner_url: part.banner_url || user.banner_url || null,
     user,
     users: user,
   };
@@ -1401,7 +1418,7 @@ app.get('/api/chats', auth, async (req, res) => {
 
     const [{ data: participants }, { data: messages }] = await Promise.all([
       supabase.from('chat_participants')
-        .select('chat_id, user_id, users(id, phone, full_name, avatar_url)')
+        .select('chat_id, user_id, users(id, phone, full_name, avatar_url, banner_url)')
         .in('chat_id', chatIds),
       supabase.from('messages')
         .select('id, text, type, created_at, sender_id, chat_id')
@@ -2233,7 +2250,7 @@ app.get('/api/contacts', auth, async (req, res) => {
     const userIds = contacts.map(c => c.contact_user_id).filter(Boolean);
     const { data: users } = await supabase
       .from('users')
-      .select('id, phone, full_name, avatar_url')
+      .select('id, phone, full_name, avatar_url, banner_url')
       .in('id', userIds);
 
     const usersMap = (users || []).reduce((acc, u) => { acc[u.id] = u; return acc; }, {});
@@ -2244,6 +2261,7 @@ app.get('/api/contacts', auth, async (req, res) => {
       name: contact.nickname || usersMap[contact.contact_user_id]?.full_name || 'Sin nombre',
       phone: usersMap[contact.contact_user_id]?.phone || '',
       avatar_url: usersMap[contact.contact_user_id]?.avatar_url || '',
+      banner_url: usersMap[contact.contact_user_id]?.banner_url || null,
       is_blocked: contact.is_blocked,
       is_favorite: contact.is_favorite,
       created_at: contact.created_at,
@@ -2501,7 +2519,7 @@ app.get('/api/contacts/favorites', auth, async (req, res) => {
     const userIds = contacts.map(c => c.contact_user_id).filter(Boolean);
     const { data: users } = await supabase
       .from('users')
-      .select('id, phone, full_name, avatar_url')
+      .select('id, phone, full_name, avatar_url, banner_url')
       .in('id', userIds);
     const usersMap = (users || []).reduce((acc, u) => { acc[u.id] = u; return acc; }, {});
 
@@ -2510,6 +2528,7 @@ app.get('/api/contacts/favorites', auth, async (req, res) => {
       name: c.nickname || usersMap[c.contact_user_id]?.full_name || 'Sin nombre',
       phone: usersMap[c.contact_user_id]?.phone || '',
       avatar_url: usersMap[c.contact_user_id]?.avatar_url || '',
+      banner_url: usersMap[c.contact_user_id]?.banner_url || null,
       is_favorite: true,
       contact_user_id: c.contact_user_id,
       user: usersMap[c.contact_user_id] || null
@@ -8945,6 +8964,11 @@ app.post('/api/djangue/:id/ensure-chat', auth, async (req, res) => {
     const memberIds = (members || []).map(m => m.user_id);
     if (!memberIds.includes(userId)) memberIds.push(userId);
 
+    // Obtener logo del djangue para usarlo como avatar del chat
+    const { data: groupFull } = await supabase
+      .from('djangue_groups').select('logo_url').eq('id', groupId).single();
+    const logoUrl = groupFull?.logo_url || null;
+
     // Crear el grupo de chat
     const { data: chatGroup, error: chatErr } = await supabase
       .from('chats')
@@ -8952,6 +8976,7 @@ app.post('/api/djangue/:id/ensure-chat', auth, async (req, res) => {
         type: 'group',
         name: `💰 ${group.name}`,
         created_by: userId,
+        avatar_url: logoUrl,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
@@ -9110,6 +9135,13 @@ app.patch('/api/djangue/:id', auth, async (req, res) => {
     const { data: updated, error } = await supabase
       .from('djangue_groups').update(updates).eq('id', groupId).select().single();
     if (error) throw error;
+
+    // Si se actualizó el logo, propagar a avatar_url del chat vinculado
+    if (logo_url !== undefined && updated.chat_group_id) {
+      await supabase.from('chats')
+        .update({ avatar_url: logo_url })
+        .eq('id', updated.chat_group_id);
+    }
 
     res.json({ ...updated, can_modify_financial: canModifyFinancial });
   } catch (e) {
