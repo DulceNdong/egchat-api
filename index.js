@@ -8183,6 +8183,223 @@ app.post('/api/push/register-expo-token', auth, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════
+// RUTAS NUEVAS — VoIP, Notify, Feedback, Activity
+// ══════════════════════════════════════════════════════════════════
+
+// ── POST /api/push/register-voip-token ────────────────────────────
+// PushKit (iOS) sube aquí su token VoIP para recibir llamadas
+app.post('/api/push/register-voip-token', auth, async (req, res) => {
+  try {
+    const { voipToken } = req.body;
+    if (!voipToken) return res.status(400).json({ message: 'Token VoIP requerido' });
+
+    await supabase.from('voip_push_tokens').upsert({
+      user_id: req.user.id,
+      token: voipToken,
+      platform: 'ios',
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'user_id' });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/moments/:momentId/notify ────────────────────────────
+// Envía push a todos los contactos cuando se publica un Moment
+app.post('/api/moments/:momentId/notify', auth, async (req, res) => {
+  try {
+    const { momentId } = req.params;
+    const { authorName, preview } = req.body;
+
+    // Obtener IDs de contactos del autor
+    const { data: contacts } = await supabase
+      .from('contacts')
+      .select('contact_user_id')
+      .eq('user_id', req.user.id)
+      .eq('status', 'accepted');
+
+    if (!contacts || contacts.length === 0) return res.json({ ok: true, sent: 0 });
+
+    const payload = {
+      title: `${authorName || 'Alguien'} publicó un Moment`,
+      body: preview || 'Ha publicado algo nuevo',
+      notificationType: 'moment',
+      momentId,
+      authorId: req.user.id,
+    };
+
+    await Promise.allSettled(
+      contacts.map(c => sendPushToUser(c.contact_user_id, payload))
+    );
+
+    res.json({ ok: true, sent: contacts.length });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/stories/:storyId/notify ────────────────────────────
+// Envía push a contactos cuando se publica un Estado/Story
+app.post('/api/stories/:storyId/notify', auth, async (req, res) => {
+  try {
+    const { storyId } = req.params;
+    const { authorName } = req.body;
+
+    const { data: contacts } = await supabase
+      .from('contacts')
+      .select('contact_user_id')
+      .eq('user_id', req.user.id)
+      .eq('status', 'accepted');
+
+    if (!contacts || contacts.length === 0) return res.json({ ok: true, sent: 0 });
+
+    const payload = {
+      title: `${authorName || 'Alguien'} publicó un estado`,
+      body: 'Toca para verlo antes de que desaparezca',
+      notificationType: 'story',
+      storyId,
+      authorId: req.user.id,
+    };
+
+    await Promise.allSettled(
+      contacts.map(c => sendPushToUser(c.contact_user_id, payload))
+    );
+
+    res.json({ ok: true, sent: contacts.length });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/live/:liveId/notify ─────────────────────────────────
+// Envía push urgente a contactos cuando el usuario inicia un Live
+app.post('/api/live/:liveId/notify', auth, async (req, res) => {
+  try {
+    const { liveId } = req.params;
+    const { hostName } = req.body;
+
+    const { data: contacts } = await supabase
+      .from('contacts')
+      .select('contact_user_id')
+      .eq('user_id', req.user.id)
+      .eq('status', 'accepted');
+
+    if (!contacts || contacts.length === 0) return res.json({ ok: true, sent: 0 });
+
+    const payload = {
+      title: `🔴 ${hostName || 'Alguien'} está en vivo`,
+      body: 'Únete ahora a la transmisión en directo',
+      notificationType: 'live',
+      liveId,
+      hostId: req.user.id,
+      priority: 'high',
+    };
+
+    await Promise.allSettled(
+      contacts.map(c => sendPushToUser(c.contact_user_id, payload))
+    );
+
+    res.json({ ok: true, sent: contacts.length });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/feedback ────────────────────────────────────────────
+// Recibe comentarios, sugerencias y reportes de bugs desde la app
+app.post('/api/feedback', auth, async (req, res) => {
+  try {
+    const { category, message } = req.body;
+    if (!message || message.trim().length < 3) {
+      return res.status(400).json({ message: 'El comentario es demasiado corto' });
+    }
+
+    // Guardar en tabla notifications como tipo 'feedback' para revisión interna
+    await supabase.from('notifications').insert({
+      user_id: req.user.id,
+      type: 'feedback',
+      title: `[${category || 'Feedback'}] de ${req.user.phone || req.user.id}`,
+      message: message.trim(),
+      read: false,
+    }).catch(() => {}); // si la tabla no tiene este tipo, ignorar
+
+    // Log en consola del servidor para revisión rápida
+    console.log(`[FEEDBACK] user=${req.user.id} cat=${category}: ${message.substring(0, 100)}`);
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── GET /api/auth/activity ────────────────────────────────────────
+// Devuelve el historial de actividad reciente del usuario autenticado
+app.get('/api/auth/activity', auth, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20;
+
+    // Intentar primero la tabla dedicada
+    const { data: logs, error } = await supabase
+      .from('user_activity_log')
+      .select('id, type, action, description, timestamp')
+      .eq('user_id', req.user.id)
+      .order('timestamp', { ascending: false })
+      .limit(limit);
+
+    if (!error && logs && logs.length > 0) {
+      return res.json(logs);
+    }
+
+    // Fallback: construir actividad desde sesiones + transacciones
+    const activity = [];
+
+    // Últimas sesiones
+    const { data: sessions } = await supabase
+      .from('user_sessions')
+      .select('id, device_name, device_type, created_at, last_seen')
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false })
+      .limit(5);
+
+    (sessions || []).forEach(s => {
+      activity.push({
+        id: `session_${s.id}`,
+        type: 'login',
+        action: `Inicio de sesión`,
+        description: s.device_name || s.device_type || 'Dispositivo desconocido',
+        timestamp: s.created_at,
+      });
+    });
+
+    // Últimas transacciones
+    const { data: txns } = await supabase
+      .from('transactions')
+      .select('id, type, amount, currency, created_at, description')
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    (txns || []).forEach(t => {
+      activity.push({
+        id: `txn_${t.id}`,
+        type: 'transaction',
+        action: t.type === 'transfer_sent' ? 'Transferencia enviada' : 'Transferencia recibida',
+        description: `${t.amount?.toLocaleString()} ${t.currency || 'XAF'}${t.description ? ' — ' + t.description : ''}`,
+        timestamp: t.created_at,
+      });
+    });
+
+    // Ordenar por fecha y devolver
+    activity.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    res.json(activity.slice(0, limit));
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 module.exports = app;
 
 
