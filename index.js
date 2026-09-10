@@ -5272,9 +5272,22 @@ app.post('/api/chats/:chatId/read', auth, async (req, res) => {
 // Perfil público de un usuario
 app.get('/api/users/:userId', auth, async (req, res) => {
   try {
-    const { data } = await supabase.from('users').select('id, phone, full_name, avatar_url, created_at').eq('id', req.params.userId).single();
+    const { data } = await supabase
+      .from('users')
+      .select('id, phone, full_name, avatar_url, created_at, online_status, last_seen, last_seen_visibility, read_receipts_enabled')
+      .eq('id', req.params.userId)
+      .single();
     if (!data) return res.status(404).json({ message: 'Usuario no encontrado' });
-    res.json(data);
+
+    // Respetar la privacidad del usuario consultado:
+    // Si last_seen_visibility = 'nadie', ocultamos last_seen y online_status
+    const visibility = data.last_seen_visibility || 'todos';
+    const result = { ...data };
+    if (visibility === 'nadie') {
+      result.last_seen = null;
+      result.online_status = false;
+    }
+    res.json(result);
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
