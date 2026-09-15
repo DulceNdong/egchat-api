@@ -9194,6 +9194,453 @@ app.post('/api/upload/djangue-logo', auth, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════
+// ADMIN AUTH — Dashboard KYC (email + password → JWT admin)
+// Tabla: admin_users (migración 008_kyc_aml_complete.sql)
+// ══════════════════════════════════════════════════════════════════
+
+app.post('/auth/admin/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password)
+      return res.status(400).json({ error: 'MISSING_FIELDS', message: 'email y password son requeridos' });
+
+    if (!supabase)
+      return res.status(503).json({ error: 'DB_UNAVAILABLE', message: 'Base de datos no disponible' });
+
+    const { data: admin, error } = await supabase
+      .from('admin_users')
+      .select('*')
+      .eq('email', email.trim().toLowerCase())
+      .eq('is_active', true)
+      .maybeSingle();
+
+    if (error || !admin)
+      return res.status(401).json({ error: 'INVALID_CREDENTIALS', message: 'Email o contraseña incorrectos' });
+
+    const ok = await bcrypt.compare(password, admin.password_hash);
+    if (!ok)
+      return res.status(401).json({ error: 'INVALID_CREDENTIALS', message: 'Email o contraseña incorrectos' });
+
+    await supabase.from('admin_users').update({ last_login: new Date().toISOString() }).eq('id', admin.id);
+
+    const token = jwt.sign(
+      { id: admin.id, email: admin.email, role: admin.role, entity: admin.entity, type: 'admin' },
+      JWT_SECRET,
+      { expiresIn: '8h' }
+    );
+
+    return res.json({
+      access_token: token,
+      token_type:   'bearer',
+      expires_in:   8 * 3600,
+      admin_id:     admin.id,
+      role:         admin.role,
+      entity:       admin.entity,
+    });
+  } catch (e) {
+    console.error('[Admin login error]', e.message);
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+app.get('/auth/admin/me', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'NO_TOKEN', message: 'Token requerido' });
+
+    let payload;
+    try { payload = verifyToken(token); } catch {
+      return res.status(401).json({ error: 'INVALID_TOKEN', message: 'Token inválido o expirado' });
+    }
+
+    if (payload.type !== 'admin')
+      return res.status(403).json({ error: 'FORBIDDEN', message: 'Token de usuario no válido aquí' });
+
+    if (!supabase)
+      return res.json({ id: payload.id, email: payload.email, role: payload.role, entity: payload.entity, is_active: true, last_login: null });
+
+    const { data: admin } = await supabase
+      .from('admin_users')
+      .select('id, email, role, entity, is_active, last_login')
+      .eq('id', payload.id)
+      .maybeSingle();
+
+    if (!admin)
+      return res.status(401).json({ error: 'ADMIN_NOT_FOUND', message: 'Admin no encontrado' });
+
+    res.json(admin);
+  } catch (e) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+app.post('/auth/admin/logout', (req, res) => {
+  res.status(204).end();
+});
+
+// ── Estadísticas KYC para el dashboard ───────────────────────────
+app.get('/admin/kyc/stats', async (req, res) => {
+  try {
+    if (!supabase) return res.json({ total_applications:0, pending_review:0, approved_today:0, rejected_today:0, avg_risk_score:0, high_risk_count:0, screening_hits_unreviewed:0, sars_overdue:0 });
+
+    const today = new Date(); today.setHours(0,0,0,0);
+
+    const [total, pending, approvedToday, rejectedToday, highRisk] = await Promise.all([
+      supabase.from('kyc_verifications').select('id', { count: 'exact', head: true }),
+      supabase.from('kyc_verifications').select('id', { count: 'exact', head: true })
+        .in('status', ['submitted','PENDING_REVIEW','under_review','MANUAL_REVIEW']),
+      supabase.from('kyc_verifications').select('id', { count: 'exact', head: true })
+        .in('status', ['approved','APPROVED','AUTO_APPROVED'])
+        .gte('reviewed_at', today.toISOString()),
+      supabase.from('kyc_verifications').select('id', { count: 'exact', head: true })
+        .in('status', ['rejected','REJECTED'])
+        .gte('reviewed_at', today.toISOString()),
+      supabase.from('kyc_verifications').select('id', { count: 'exact', head: true })
+        .in('risk_level', ['high','HIGH']),
+    ]);
+
+    // SAR vencidos (>72h sin enviar)
+    const deadlineCutoff = new Date(Date.now() - 72 * 3600 * 1000).toISOString();
+    const { count: sarOverdue } = await supabase
+      .from('suspicious_activity_reports')
+      .select('id', { count: 'exact', head: true })
+      .not('status', 'in', '("SENT_TO_ANIF","ACKNOWLEDGED","CLOSED")')
+      .lt('detected_at', deadlineCutoff)
+      .catch(() => ({ count: 0 }));
+
+    res.json({
+      total_applications:        total.count        ?? 0,
+      pending_review:            pending.count      ?? 0,
+      approved_today:            approvedToday.count ?? 0,
+      rejected_today:            rejectedToday.count ?? 0,
+      avg_risk_score:            0,
+      high_risk_count:           highRisk.count     ?? 0,
+      screening_hits_unreviewed: 0,
+      sars_overdue:              sarOverdue         ?? 0,
+    });
+  } catch (e) {
+    console.error('[KYC stats error]', e.message);
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+// ── Lista KYC pendientes (paginada) ──────────────────────────────
+app.get('/admin/kyc/pending', async (req, res) => {
+  try {
+    if (!supabase) return res.json({ items:[], total:0, page:1, page_size:20, pages:0 });
+
+    const page      = parseInt(req.query.page) || 1;
+    const pageSize  = parseInt(req.query.page_size) || 20;
+    const status    = req.query.status;
+    const riskLevel = req.query.risk_level;
+
+    const defaultStatuses = ['submitted','PENDING_REVIEW','under_review','MANUAL_REVIEW',
+                              'IN_PROGRESS','AUTO_APPROVED','APPROVED','approved',
+                              'REJECTED','rejected','BLOCKED','PENDING_INFO','draft'];
+    const statuses = status ? [status] : defaultStatuses;
+
+    let query = supabase
+      .from('kyc_verifications')
+      .select(`id, session_id, status, risk_level, risk_score, bank_decision,
+               submitted_at, created_at, full_name, nationality, doc_type,
+               users:user_id (id, phone, status)`,
+              { count: 'exact' })
+      .in('status', statuses)
+      .order('submitted_at', { ascending: true, nullsFirst: false })
+      .range((page - 1) * pageSize, page * pageSize - 1);
+
+    if (riskLevel) query = query.eq('risk_level', riskLevel.toLowerCase());
+
+    const { data, count, error } = await query;
+    if (error) throw error;
+
+    const items = (data || []).map(a => ({
+      application_id:   a.id,
+      session_id:       a.session_id,
+      status:           a.status,
+      risk_level:       a.risk_level || 'low',
+      risk_score:       a.risk_score || 0,
+      bank_decision:    a.bank_decision,
+      submitted_at:     a.submitted_at,
+      created_at:       a.created_at,
+      user_phone:       a.users?.phone,
+      user_status:      a.users?.status,
+      full_name:        a.full_name,
+      nationality:      a.nationality,
+      document_type:    a.doc_type,
+      ocr_confidence:   null,
+      face_match_score: null,
+      liveness_passed:  null,
+      screening_hits:   0,
+    }));
+
+    res.json({
+      items,
+      total:     count || 0,
+      page,
+      page_size: pageSize,
+      pages:     Math.ceil((count || 0) / pageSize),
+    });
+  } catch (e) {
+    console.error('[KYC pending error]', e.message);
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+// ── Detalle KYC (para el dashboard) ──────────────────────────────
+app.get('/api/v1/admin/kyc/:id', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
+
+    const { data: app, error } = await supabase
+      .from('kyc_verifications')
+      .select(`*, users:user_id (id, phone, status)`)
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (error || !app) return res.status(404).json({ error: 'NOT_FOUND', message: 'Solicitud KYC no encontrada' });
+
+    const { data: pd } = await supabase
+      .from('kyc_personal_data')
+      .select('*')
+      .eq('application_id', req.params.id)
+      .maybeSingle().catch(() => ({ data: null }));
+
+    const { data: screening } = await supabase
+      .from('kyc_screening_results')
+      .select('*')
+      .eq('application_id', req.params.id)
+      .catch(() => ({ data: [] }));
+
+    res.json({
+      id:               app.id,
+      session_id:       app.session_id,
+      status:           app.status,
+      risk_level:       app.risk_level || 'low',
+      risk_score:       app.risk_score || 0,
+      bank_decision:    app.bank_decision,
+      bank_notes:       app.bank_notes,
+      bank_decision_at: app.bank_decision_at,
+      rejection_reason: app.rejection_reason,
+      reviewer_notes:   app.reviewer_notes,
+      reviewed_at:      app.reviewed_at,
+      submitted_at:     app.submitted_at,
+      created_at:       app.created_at,
+      user_id:          app.user_id,
+      user_phone:       app.users?.phone,
+      full_name:        pd?.full_name   || app.full_name,
+      nationality:      pd?.nationality || app.nationality,
+      birth_date:       pd?.date_of_birth || app.birth_date,
+      profession:       pd?.profession,
+      source_of_funds:  pd?.source_of_funds,
+      politically_exposed: pd?.politically_exposed,
+      doc_type:         app.doc_type,
+      doc_number:       app.doc_number,
+      doc_front_url:    app.doc_front_url ? '[CIFRADO]' : null,
+      doc_back_url:     app.doc_back_url  ? '[CIFRADO]' : null,
+      selfie_url:       app.selfie_url    ? '[CIFRADO]' : null,
+      ocr_confidence:   null,
+      face_match_score: null,
+      liveness_passed:  null,
+      screening_results: (screening || []).map(s => ({
+        id:             s.id,
+        screening_type: s.screening_type,
+        provider:       s.provider || 'internal',
+        match_found:    s.match_found,
+        match_score:    s.match_score,
+        match_details:  s.match_details || {},
+        reviewed:       s.reviewed || false,
+        false_positive: s.false_positive,
+      })),
+    });
+  } catch (e) {
+    console.error('[KYC detail error]', e.message);
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+// ── Audit trail KYC ──────────────────────────────────────────────
+app.get('/api/v1/admin/kyc/:id/audit', async (req, res) => {
+  try {
+    if (!supabase) return res.json({ application_id: req.params.id, total_entries: 0, audit_trail: [] });
+
+    const { data } = await supabase
+      .from('kyc_audit_log')
+      .select('*')
+      .eq('application_id', req.params.id)
+      .order('created_at', { ascending: true })
+      .catch(() => ({ data: [] }));
+
+    res.json({
+      application_id: req.params.id,
+      total_entries: (data || []).length,
+      audit_trail: (data || []).map(e => ({
+        id:             e.id,
+        action:         e.action,
+        performed_by:   e.performed_by,
+        performed_role: e.performed_role,
+        details:        e.details || {},
+        ip_address:     e.ip_address,
+        created_at:     e.created_at,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+// ── Acciones KYC (aprobar, rechazar, bloquear, request-info) ─────
+app.post('/api/v1/admin/kyc/:id/approve', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
+    const now = new Date().toISOString();
+    await supabase.from('kyc_verifications').update({ status: 'APPROVED', reviewed_at: now, reviewer_notes: req.body.notes || null }).eq('id', req.params.id);
+    const { data: app } = await supabase.from('kyc_verifications').select('user_id').eq('id', req.params.id).maybeSingle();
+    if (app) await supabase.from('users').update({ wallet_kyc_status: 'approved', status: 'ACTIVE', wallet_kyc_reviewed_at: now }).eq('id', app.user_id);
+    res.json({ success: true, application_id: req.params.id, new_status: 'APPROVED', message: 'Solicitud aprobada' });
+  } catch (e) { res.status(500).json({ error: 'SERVER_ERROR', message: e.message }); }
+});
+
+app.post('/api/v1/admin/kyc/:id/reject', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
+    const { reason, notes } = req.body;
+    if (!reason) return res.status(400).json({ error: 'REASON_REQUIRED', message: 'reason es obligatorio' });
+    const now = new Date().toISOString();
+    await supabase.from('kyc_verifications').update({ status: 'REJECTED', rejection_reason: reason, reviewer_notes: notes || null, reviewed_at: now }).eq('id', req.params.id);
+    const { data: app } = await supabase.from('kyc_verifications').select('user_id').eq('id', req.params.id).maybeSingle();
+    if (app) await supabase.from('users').update({ wallet_kyc_status: 'rejected', wallet_kyc_reject_reason: reason }).eq('id', app.user_id);
+    res.json({ success: true, application_id: req.params.id, new_status: 'REJECTED', message: 'Solicitud rechazada' });
+  } catch (e) { res.status(500).json({ error: 'SERVER_ERROR', message: e.message }); }
+});
+
+app.post('/api/v1/admin/kyc/:id/request-info', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
+    const { message } = req.body;
+    if (!message) return res.status(400).json({ error: 'MESSAGE_REQUIRED' });
+    await supabase.from('kyc_verifications').update({ status: 'PENDING_INFO', reviewer_notes: message, reviewed_at: new Date().toISOString() }).eq('id', req.params.id);
+    res.json({ success: true, application_id: req.params.id, new_status: 'PENDING_INFO', message: 'Información solicitada al usuario' });
+  } catch (e) { res.status(500).json({ error: 'SERVER_ERROR', message: e.message }); }
+});
+
+app.post('/api/v1/admin/kyc/:id/block', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
+    const { reason } = req.body;
+    if (!reason) return res.status(400).json({ error: 'REASON_REQUIRED' });
+    const now = new Date().toISOString();
+    await supabase.from('kyc_verifications').update({ status: 'BLOCKED', rejection_reason: reason, reviewed_at: now }).eq('id', req.params.id);
+    const { data: app } = await supabase.from('kyc_verifications').select('user_id').eq('id', req.params.id).maybeSingle();
+    if (app) await supabase.from('users').update({ wallet_kyc_status: 'suspended', status: 'BLOCKED' }).eq('id', app.user_id);
+    res.json({ success: true, application_id: req.params.id, new_status: 'BLOCKED', message: 'Solicitud bloqueada' });
+  } catch (e) { res.status(500).json({ error: 'SERVER_ERROR', message: e.message }); }
+});
+
+// ── AML — Transacciones flaggeadas ────────────────────────────────
+app.get('/aml/transactions/flagged', async (req, res) => {
+  try {
+    if (!supabase) return res.json({ items: [], total: 0, page: 1, page_size: 20 });
+    const page     = parseInt(req.query.page) || 1;
+    const pageSize = parseInt(req.query.page_size) || 20;
+    const reviewed = req.query.reviewed;
+    const flagType = req.query.flag_type;
+
+    let query = supabase.from('transactions')
+      .select('id, user_id, type, amount, currency, flag_type, flag_reason, flagged_at, aml_reviewed, created_at', { count: 'exact' })
+      .eq('flagged', true)
+      .order('flagged_at', { ascending: false })
+      .range((page-1)*pageSize, page*pageSize - 1);
+
+    if (reviewed !== undefined) query = query.eq('aml_reviewed', reviewed === 'true');
+    if (flagType) query = query.eq('flag_type', flagType);
+
+    const { data, count } = await query.catch(() => ({ data: [], count: 0 }));
+    res.json({ items: data || [], total: count || 0, page, page_size: pageSize });
+  } catch (e) { res.status(500).json({ error: 'SERVER_ERROR', message: e.message }); }
+});
+
+app.post('/aml/transactions/:id/review', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
+    await supabase.from('transactions').update({ aml_reviewed: true, aml_notes: req.body.notes || null, aml_reviewed_at: new Date().toISOString() }).eq('id', req.params.id);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'SERVER_ERROR', message: e.message }); }
+});
+
+// ── SAR ───────────────────────────────────────────────────────────
+app.get('/aml/sar', async (req, res) => {
+  try {
+    if (!supabase) return res.json({ items: [], total: 0, page: 1, page_size: 20 });
+    const page     = parseInt(req.query.page) || 1;
+    const pageSize = parseInt(req.query.page_size) || 20;
+    const status   = req.query.status;
+    const overdue  = req.query.overdue_only === 'true';
+
+    let query = supabase.from('suspicious_activity_reports')
+      .select('*', { count: 'exact' })
+      .order('detected_at', { ascending: true })
+      .range((page-1)*pageSize, page*pageSize - 1);
+
+    if (status) query = query.eq('status', status);
+    if (overdue) query = query.lt('detected_at', new Date(Date.now() - 72*3600*1000).toISOString())
+                              .not('status', 'in', '("SENT_TO_ANIF","ACKNOWLEDGED","CLOSED")');
+
+    const { data, count } = await query.catch(() => ({ data: [], count: 0 }));
+    const now = Date.now();
+    const items = (data || []).map(s => ({
+      ...s,
+      deadline_at: new Date(new Date(s.detected_at).getTime() + 72*3600*1000).toISOString(),
+      overdue: !['SENT_TO_ANIF','ACKNOWLEDGED','CLOSED'].includes(s.status) &&
+               new Date(s.detected_at).getTime() + 72*3600*1000 < now,
+    }));
+    res.json({ items, total: count || 0, page, page_size: pageSize });
+  } catch (e) { res.status(500).json({ error: 'SERVER_ERROR', message: e.message }); }
+});
+
+app.post('/aml/sar', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
+    const { data, error } = await supabase.from('suspicious_activity_reports')
+      .insert({ ...req.body, status: 'DRAFT', detected_at: new Date().toISOString() })
+      .select().maybeSingle();
+    if (error) throw error;
+    res.status(201).json({ ...data, deadline_at: new Date(new Date(data.detected_at).getTime() + 72*3600*1000).toISOString(), overdue: false });
+  } catch (e) { res.status(500).json({ error: 'SERVER_ERROR', message: e.message }); }
+});
+
+app.get('/aml/sar/:id', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
+    const { data } = await supabase.from('suspicious_activity_reports').select('*').eq('id', req.params.id).maybeSingle();
+    if (!data) return res.status(404).json({ error: 'NOT_FOUND' });
+    res.json({ ...data, deadline_at: new Date(new Date(data.detected_at).getTime() + 72*3600*1000).toISOString(), overdue: !['SENT_TO_ANIF','ACKNOWLEDGED','CLOSED'].includes(data.status) && new Date(data.detected_at).getTime() + 72*3600*1000 < Date.now() });
+  } catch (e) { res.status(500).json({ error: 'SERVER_ERROR', message: e.message }); }
+});
+
+app.put('/aml/sar/:id', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
+    const { data } = await supabase.from('suspicious_activity_reports').update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().maybeSingle();
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: 'SERVER_ERROR', message: e.message }); }
+});
+
+app.post('/aml/sar/:id/send', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
+    const ref = 'ANIF-' + Date.now().toString(36).toUpperCase();
+    await supabase.from('suspicious_activity_reports').update({ status: 'SENT_TO_ANIF', anif_reference: ref, sent_at: new Date().toISOString() }).eq('id', req.params.id);
+    res.json({ success: true, sar_id: req.params.id, anif_reference: ref, message: 'SAR enviado a la ANIF. Referencia: ' + ref });
+  } catch (e) { res.status(500).json({ error: 'SERVER_ERROR', message: e.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// FIN ENDPOINTS DASHBOARD KYC
+// ══════════════════════════════════════════════════════════════════
+
 module.exports = app;
 
 
