@@ -7003,6 +7003,22 @@ app.post('/api/admin/run-migration', async (req, res) => {
 const djangueRoutes = require('./djangueRoutes');
 app.use('/api', djangueRoutes);
 
+// ── KYC Routes ──────────────────────────────────────────────────────
+const kycRoutes = require('./kyc/kycRoutes');
+app.use('/api/kyc', kycRoutes);
+
+// ── AML Routes ──────────────────────────────────────────────────────
+const amlRoutes = require('./routes/aml');
+app.use('/api/aml', amlRoutes);
+
+// ── Admin Auth Routes (login + 2FA + stats) ─────────────────────────
+const adminAuthRoutes = require('./routes/adminAuth');
+app.use('/api/admin', adminAuthRoutes);
+
+// ── Updates server (Tauri auto-update) ──────────────────────────────
+const updatesRoutes = require('./routes/updates');
+app.use('/updates', updatesRoutes);
+
 if (require.main === module) {
   app.listen(PORT, async () => {
     console.log(`\n😎 EGCHAT API + Supabase en http://localhost:${PORT}`);
