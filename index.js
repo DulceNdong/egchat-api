@@ -13,6 +13,15 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// ── RENDER: abrir puerto inmediatamente para pasar el port scan ───────────────
+// Render mata el proceso si no detecta un puerto abierto en 60s.
+// Con un archivo grande como este, el parse puede tardar. Abrimos el puerto
+// aquí y lo cerramos/reabrimos al final cuando todo está listo.
+const _earlyServer = app.listen(PORT, () => {
+  console.log(`[startup] Puerto ${PORT} abierto (early bind para Render)`);
+});
+
 const JWT_SECRET = process.env.JWT_SECRET || 'EGchat2025!xK9mP3nQ7rL2vW8tY4uJ6hF1bN5cA0dE_prod_secret';
 const JWT_SECRET_FALLBACK = 'EGchat2025!xK9mP3nQ7rL2vW8tY4uJ6hF1bN5cA0dE_prod_secret';
 console.log('JWT_SECRET source:', process.env.JWT_SECRET ? 'environment' : 'fallback');
