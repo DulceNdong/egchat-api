@@ -7029,8 +7029,10 @@ const updatesRoutes = require('./routes/updates');
 app.use('/updates', updatesRoutes);
 
 if (require.main === module) {
-  app.listen(PORT, async () => {
-    console.log(`\n😎 EGCHAT API + Supabase en http://localhost:${PORT}`);
+  // El puerto ya está abierto desde el early bind arriba.
+  // Solo iniciamos schedulers y mostramos el log de confirmación.
+  _earlyServer.on('listening', () => {});
+  console.log(`\n😎 EGCHAT API + Supabase en http://localhost:${PORT}`);
     console.log(`   Supabase: ${process.env.SUPABASE_URL ? '✅ Conectado' : '❌ Sin configurar'}`);
     startGovNewsScheduler();
     console.log(`   Auth:   POST /api/auth/register | /api/auth/login`);
