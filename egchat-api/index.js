@@ -144,6 +144,8 @@ const authFromQuery = (req, res, next) => {
   }
 };
 
+const authenticateToken = auth;
+
 const emitToUser = (userId, payload) => {
   const key = String(userId);
   const streams = chatStreams.get(key);
@@ -9829,6 +9831,5 @@ app.post('/aml/sar/:id/send', async (req, res) => {
 // ══════════════════════════════════════════════════════════════════
 
 module.exports = app;
-
 
 
