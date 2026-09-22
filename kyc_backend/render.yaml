@@ -1,0 +1,33 @@
+# ══════════════════════════════════════════════════════════════════
+# Render.com deployment — EGChat KYC/AML Backend
+# Servicio separado del Render API principal de EGChat (egchat-api-xlxj)
+# ══════════════════════════════════════════════════════════════════
+services:
+  - type: web
+    name: egchat-kyc-api
+    runtime: docker
+    dockerfilePath: ./server/kyc_backend/Dockerfile
+    dockerContext: ./server/kyc_backend
+    plan: starter           # $7/mes — cambia a standard para producción
+    region: frankfurt       # Más cercano a Guinea Ecuatorial
+    branch: mobile          # rama del repo
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: DATABASE_URL
+        sync: false         # Configurar manualmente en Render dashboard
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ENCRYPTION_KEY
+        sync: false         # Generar y configurar manualmente
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: BANGE_WEBHOOK_SECRET
+        generateValue: true
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "false"

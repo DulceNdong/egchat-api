@@ -1,0 +1,55 @@
+services:
+  api:
+    build:
+      context: ./egchat-api
+      dockerfile: Dockerfile
+    container_name: egchat-api-local
+    restart: unless-stopped
+    ports:
+      - "5000:10000"
+    env_file:
+      - ./.env
+    environment:
+      NODE_ENV: development
+      PORT: 10000
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://egchat:egchat_dev@postgres:5432/egchat
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: egchat-postgres-local
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: egchat
+      POSTGRES_PASSWORD: egchat_dev
+      POSTGRES_DB: egchat
+    ports:
+      - "5433:5432"
+    volumes:
+      - egchat_pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U egchat -d egchat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: egchat-redis-local
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  egchat_pgdata:

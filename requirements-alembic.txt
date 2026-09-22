@@ -1,0 +1,7 @@
+# Dependencias mínimas para ejecutar las migraciones Alembic
+# Instalar con: pip install -r requirements-alembic.txt
+
+alembic==1.13.1
+SQLAlchemy==2.0.30
+psycopg2-binary==2.9.9   # driver PostgreSQL
+python-dotenv==1.0.1     # leer .env en desarrollo local
