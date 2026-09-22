@@ -12,8 +12,20 @@ const bcrypt = require('bcryptjs');
 const { createClient } = require('@supabase/supabase-js');
 const { createAuditLogger } = require('./middleware/auditLogger');
 
+let sentry = null;
+if (process.env.SENTRY_DSN) {
+  try {
+    sentry = require('@sentry/node');
+    sentry.init({ dsn: process.env.SENTRY_DSN, tracesSampleRate: Number(process.env.SENTRY_TRACES_SAMPLE_RATE || 0.05) });
+    console.log('[Sentry] Error tracking activado');
+  } catch (error) {
+    console.warn('[Sentry] SENTRY_DSN configurado pero @sentry/node no está instalado:', error.message);
+  }
+}
+
 const app = express();
 const PORT = process.env.PORT || 5000;
+if (sentry?.Handlers?.requestHandler) app.use(sentry.Handlers.requestHandler());
 const JWT_SECRET = process.env.JWT_SECRET || 'EGchat2025!xK9mP3nQ7rL2vW8tY4uJ6hF1bN5cA0dE_prod_secret';
 const JWT_SECRET_FALLBACK = 'EGchat2025!xK9mP3nQ7rL2vW8tY4uJ6hF1bN5cA0dE_prod_secret';
 console.log('JWT_SECRET source:', process.env.JWT_SECRET ? 'environment' : 'fallback');

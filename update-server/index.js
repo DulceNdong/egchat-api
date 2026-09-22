@@ -20,6 +20,14 @@ function resolveTargetCandidates(target) {
   return [...new Map(pairs.map((pair) => [pair.join('/'), pair])).values()];
 }
 
+
+function appendUpdateAudit(releasesDir, entry) {
+  const auditDir = path.join(releasesDir, '_audit');
+  fs.mkdirSync(auditDir, { recursive: true });
+  const line = JSON.stringify({ ...entry, timestamp: new Date().toISOString() }) + '\n';
+  fs.appendFileSync(path.join(auditDir, 'updates.jsonl'), line);
+}
+
 function createUpdateServer({ releasesDir = path.join(__dirname, '..', 'releases') } = {}) {
   const router = express.Router();
 
@@ -45,6 +53,25 @@ function createUpdateServer({ releasesDir = path.join(__dirname, '..', 'releases
     if (!fs.existsSync(manifestPath)) return res.status(404).json({ error: 'NO_UPDATE', message: 'No hay actualización para esta plataforma' });
     res.setHeader('Cache-Control', 'no-cache');
     res.sendFile(manifestPath);
+  });
+
+  router.post('/updates/audit', (req, res) => {
+    const body = req.body || {};
+    appendUpdateAudit(releasesDir, {
+      app: body.app || 'unknown',
+      fromVersion: body.fromVersion || null,
+      toVersion: body.toVersion || null,
+      status: body.status || 'unknown',
+      actor: body.actor || req.get('user-agent') || 'unknown',
+      ip: req.ip,
+    });
+    res.json({ ok: true });
+  });
+
+  router.get('/updates/audit/log', (req, res) => {
+    const auditPath = path.join(releasesDir, '_audit', 'updates.jsonl');
+    if (!fs.existsSync(auditPath)) return res.type('text/plain').send('');
+    res.type('text/plain').sendFile(auditPath);
   });
 
   router.use('/downloads', express.static(releasesDir, {
