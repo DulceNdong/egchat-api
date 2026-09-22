@@ -10,6 +10,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { createClient } = require('@supabase/supabase-js');
+const { createAuditLogger } = require('../middleware/auditLogger');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -106,6 +107,7 @@ app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle preflight for all routes
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
+app.use(createAuditLogger({ supabase }));
 
 // --- Middleware auth --------------------------------------------------
 const parseBearerToken = (header) => {
@@ -576,6 +578,9 @@ app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'Sesión ce
 // El PIN se almacena como SHA-256 en la columna pin_hash de users.
 
 const crypto = require('crypto');
+const KYCProviderFactory = require('./kyc/KYCProviderFactory');
+const { calculateRiskScore } = require('./kyc/KYCScoringEngine');
+const kycProviderFactory = new KYCProviderFactory();
 const hashPin = (pin) => crypto.createHash('sha256').update(String(pin)).digest('hex');
 
 app.get('/api/auth/has-pin', auth, async (req, res) => {
@@ -7405,17 +7410,24 @@ app.post('/api/kyc/application/:id/document', authenticateToken, async (req, res
   const { side, image_data, document_type } = req.body;
   if (!image_data) return res.status(400).json({ error: 'image_data requerida' });
   try {
+    const storedImageUrl = `stored:${side}:${Date.now()}`;
+    const ocr = await kycProviderFactory.withFallback('ocrDocument', {
+      documentType: document_type,
+      imageUrl: storedImageUrl,
+      side,
+      applicationId: id,
+    });
     const { error } = await supabase
       .from('kyc_documents')
       .upsert({
         application_id: id,
         document_type,
-        [`${side}_image_url`]: `stored:${side}:${Date.now()}`,
-        ocr_confidence: 0,
-        ocr_raw_data: {},
+        [`${side}_image_url`]: storedImageUrl,
+        ocr_confidence: ocr.confidence,
+        ocr_raw_data: ocr,
       }, { onConflict: 'application_id' });
     if (error) throw error;
-    res.json({ ok: true, ocrData: {} });
+    res.json({ ok: true, ocrData: ocr.extracted || {}, confidence: ocr.confidence, provider: ocr.provider });
   } catch (err) {
     console.error('[KYC] uploadDocument:', err.message);
     res.status(500).json({ error: 'Error al subir documento' });
@@ -7428,21 +7440,94 @@ app.post('/api/kyc/application/:id/biometric', authenticateToken, async (req, re
   const { selfie_data } = req.body;
   if (!selfie_data) return res.status(400).json({ error: 'selfie_data requerida' });
   try {
+    const [faceMatch, liveness] = await Promise.all([
+      kycProviderFactory.withFallback('faceMatch', { applicationId: id, selfieData: selfie_data }),
+      kycProviderFactory.withFallback('liveness', { applicationId: id, selfieData: selfie_data }),
+    ]);
     const { error } = await supabase
       .from('kyc_documents')
       .update({
         selfie_url:       `stored:selfie:${Date.now()}`,
-        face_match_score: 0.95,
-        liveness_passed:  true,
-        liveness_score:   0.95,
+        face_match_score: faceMatch.faceMatchScore,
+        liveness_passed:  liveness.passed,
+        liveness_score:   liveness.livenessScore,
         verified_at:      new Date().toISOString(),
       })
       .eq('application_id', id);
     if (error) throw error;
-    res.json({ livenessPassesd: true, faceMatchScore: 0.95 });
+    res.json({ livenessPassed: liveness.passed, faceMatchScore: faceMatch.faceMatchScore, provider: faceMatch.provider });
   } catch (err) {
     console.error('[KYC] biometric:', err.message);
     res.status(500).json({ error: 'Error al verificar biometría' });
+  }
+});
+
+// POST /api/kyc/application/:id/screening — Sanctions + PEP básico
+app.post('/api/kyc/application/:id/screening', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const userId = req.user.id;
+  try {
+    const { data: application, error: appError } = await supabase
+      .from('kyc_verifications')
+      .select('id, user_id, risk_score')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (appError) throw appError;
+    if (!application) return res.status(404).json({ error: 'Solicitud KYC no encontrada' });
+
+    const payload = req.body || {};
+    const fullName = payload.full_name || payload.fullName || '';
+    const providerResult = await kycProviderFactory.withFallback('screenSanctions', {
+      fullName,
+      nationality: payload.nationality,
+      applicationId: id,
+    });
+    const screeningResults = [
+      {
+        application_id: id,
+        screening_type: 'SANCTIONS',
+        provider: providerResult.provider,
+        match_found: providerResult.sanctionsHit,
+        match_score: providerResult.sanctionsHit ? 1 : 0,
+        match_details: { full_name: fullName, source: providerResult.provider, duration_ms: providerResult.duration_ms },
+        reviewed: false,
+      },
+      {
+        application_id: id,
+        screening_type: 'PEP',
+        provider: providerResult.provider,
+        match_found: providerResult.pepHit,
+        match_score: providerResult.pepHit ? 1 : 0,
+        match_details: { full_name: fullName, source: providerResult.provider, duration_ms: providerResult.duration_ms },
+        reviewed: false,
+      },
+    ];
+
+    await supabase
+      .from('kyc_screening_results')
+      .insert(screeningResults)
+      .catch(() => ({ error: null }));
+
+    const riskScore = Math.max(Number(application.risk_score || 0), 15);
+    await supabase
+      .from('kyc_verifications')
+      .update({ risk_score: riskScore, risk_level: 'low', updated_at: new Date().toISOString() })
+      .eq('id', id);
+
+    res.json({
+      ok: true,
+      applicationId: id,
+      riskScore,
+      riskLevel: 'low',
+      sanctionsHit: providerResult.sanctionsHit,
+      pepHit: providerResult.pepHit,
+      results: screeningResults.map(({ application_id, ...item }) => item),
+    });
+  } catch (err) {
+    console.error('[KYC] screening:', err.message);
+    res.status(500).json({ error: 'Error al ejecutar screening KYC' });
   }
 });
 
@@ -7451,11 +7536,61 @@ app.post('/api/kyc/application/:id/submit', authenticateToken, async (req, res) 
   const { id } = req.params;
   const userId = req.user.id;
   try {
+    const [{ data: personal }, { data: document }, { data: screening }] = await Promise.all([
+      supabase.from('kyc_personal_data').select('*').eq('application_id', id).maybeSingle().catch(() => ({ data: null })),
+      supabase.from('kyc_documents').select('*').eq('application_id', id).maybeSingle().catch(() => ({ data: null })),
+      supabase.from('kyc_screening_results').select('*').eq('application_id', id).catch(() => ({ data: [] })),
+    ]);
+
+    const scoring = calculateRiskScore({
+      personal: personal || {},
+      document: document || {},
+      biometric: document || {},
+      screening: screening || [],
+    });
+
+    const submittedAt = new Date().toISOString();
+    const updatePayload = {
+      status: scoring.decision,
+      risk_score: scoring.score,
+      risk_level: scoring.riskLevel,
+      submitted_at: submittedAt,
+      updated_at: submittedAt,
+    };
+
     await supabase
       .from('kyc_verifications')
-      .update({ status: 'PENDING_REVIEW', submitted_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .update(updatePayload)
       .eq('id', id);
-    res.json({ ok: true, status: 'PENDING_REVIEW', score: 75, decision: 'MANUAL_REVIEW' });
+
+    if (scoring.decision === 'AUTO_APPROVED') {
+      await supabase
+        .from('users')
+        .update({ wallet_kyc_status: 'approved', wallet_kyc_reviewed_at: submittedAt })
+        .eq('id', userId)
+        .catch(() => ({ error: null }));
+    }
+
+    await supabase
+      .from('kyc_audit_log')
+      .insert({
+        application_id: id,
+        action: 'KYC_AUTO_SCORED',
+        performed_by: userId,
+        performed_role: 'user',
+        details: scoring,
+        ip_address: req.ip,
+      })
+      .catch(() => ({ error: null }));
+
+    res.json({
+      ok: true,
+      status: scoring.decision,
+      score: scoring.score,
+      riskLevel: scoring.riskLevel,
+      decision: scoring.decision,
+      reasons: scoring.reasons,
+    });
   } catch (err) {
     console.error('[KYC] submit:', err.message);
     res.status(500).json({ error: 'Error al enviar solicitud KYC' });
@@ -9826,10 +9961,202 @@ app.post('/aml/sar/:id/send', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'SERVER_ERROR', message: e.message }); }
 });
 
+// ── Seguridad/Kiro: helpers admin, 2FA, AML /api y export auditoría ─
+const getAdminTokenPayload = (req) => {
+  const token = parseBearerToken(req.headers.authorization);
+  if (!token) return null;
+  try {
+    const payload = verifyToken(token);
+    return payload?.type === 'admin' ? payload : null;
+  } catch {
+    return null;
+  }
+};
+
+const requireAdminToken = (req, res, next) => {
+  const admin = getAdminTokenPayload(req);
+  if (!admin) return res.status(401).json({ error: 'NO_ADMIN_TOKEN', message: 'Token admin requerido' });
+  req.admin = admin;
+  next();
+};
+
+const base32Alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const toBase32 = (buffer) => {
+  let bits = '';
+  let out = '';
+  for (const byte of buffer) bits += byte.toString(2).padStart(8, '0');
+  for (let i = 0; i < bits.length; i += 5) {
+    const chunk = bits.slice(i, i + 5).padEnd(5, '0');
+    out += base32Alphabet[parseInt(chunk, 2)];
+  }
+  return out;
+};
+
+const fromBase32 = (secret) => {
+  const clean = String(secret || '').replace(/=+$/g, '').replace(/\s+/g, '').toUpperCase();
+  let bits = '';
+  for (const char of clean) {
+    const val = base32Alphabet.indexOf(char);
+    if (val >= 0) bits += val.toString(2).padStart(5, '0');
+  }
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.slice(i, i + 8), 2));
+  return Buffer.from(bytes);
+};
+
+const totpCode = (secret, step = Math.floor(Date.now() / 30000)) => {
+  const key = fromBase32(secret);
+  const msg = Buffer.alloc(8);
+  msg.writeUInt32BE(Math.floor(step / 0x100000000), 0);
+  msg.writeUInt32BE(step & 0xffffffff, 4);
+  const hmac = crypto.createHmac('sha1', key).update(msg).digest();
+  const offset = hmac[hmac.length - 1] & 0xf;
+  const binary = ((hmac[offset] & 0x7f) << 24) | (hmac[offset + 1] << 16) | (hmac[offset + 2] << 8) | hmac[offset + 3];
+  return String(binary % 1000000).padStart(6, '0');
+};
+
+const verifyTotp = (secret, code) => {
+  const normalized = String(code || '').replace(/\s+/g, '');
+  const currentStep = Math.floor(Date.now() / 30000);
+  return [-1, 0, 1].some((offset) => totpCode(secret, currentStep + offset) === normalized);
+};
+
+app.post('/api/admin/2fa/setup', requireAdminToken, async (req, res) => {
+  try {
+    const secret = toBase32(crypto.randomBytes(20));
+    const issuer = encodeURIComponent('EGCHAT');
+    const label = encodeURIComponent(req.admin.email || req.admin.id || 'admin');
+    const otpauthUrl = `otpauth://totp/${issuer}:${label}?secret=${secret}&issuer=${issuer}&digits=6&period=30`;
+
+    await supabase
+      .from('admin_users')
+      .update({ two_factor_secret: secret, two_factor_enabled: false })
+      .eq('id', req.admin.id)
+      .catch(() => ({ error: null }));
+
+    res.json({ secret, otpauthUrl, manualEntryKey: secret });
+  } catch (e) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+app.post('/api/admin/2fa/verify', requireAdminToken, async (req, res) => {
+  try {
+    const code = req.body?.code;
+    let secret = req.body?.secret;
+
+    if (!secret && supabase) {
+      const { data } = await supabase
+        .from('admin_users')
+        .select('two_factor_secret')
+        .eq('id', req.admin.id)
+        .maybeSingle()
+        .catch(() => ({ data: null }));
+      secret = data?.two_factor_secret;
+    }
+
+    if (!secret) return res.status(400).json({ error: 'SECRET_REQUIRED', message: 'No hay secreto 2FA configurado' });
+    const verified = verifyTotp(secret, code);
+    if (!verified) return res.status(400).json({ verified: false, error: 'INVALID_CODE', message: 'Código 2FA inválido' });
+
+    await supabase
+      .from('admin_users')
+      .update({ two_factor_enabled: true, two_factor_verified_at: new Date().toISOString() })
+      .eq('id', req.admin.id)
+      .catch(() => ({ error: null }));
+
+    res.json({ verified: true });
+  } catch (e) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+app.get('/api/aml/alerts', requireAdminToken, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const pageSize = parseInt(req.query.page_size) || 20;
+
+    const { data, count } = await supabase
+      .from('kyc_screening_results')
+      .select('*', { count: 'exact' })
+      .eq('match_found', true)
+      .eq('reviewed', false)
+      .order('created_at', { ascending: false })
+      .range((page - 1) * pageSize, page * pageSize - 1)
+      .catch(() => ({ data: [], count: 0 }));
+
+    res.json({ items: data || [], total: count || 0, page, page_size: pageSize });
+  } catch (e) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+app.get('/api/aml/sar', requireAdminToken, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const pageSize = parseInt(req.query.page_size) || 20;
+    const status = req.query.status;
+    let query = supabase
+      .from('suspicious_activity_reports')
+      .select('*', { count: 'exact' })
+      .order('detected_at', { ascending: true })
+      .range((page - 1) * pageSize, page * pageSize - 1);
+    if (status) query = query.eq('status', status);
+    const { data, count } = await query.catch(() => ({ data: [], count: 0 }));
+    res.json({ items: data || [], total: count || 0, page, page_size: pageSize });
+  } catch (e) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+app.post('/api/aml/sar', requireAdminToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('suspicious_activity_reports')
+      .insert({ ...req.body, status: req.body?.status || 'DRAFT', detected_at: new Date().toISOString() })
+      .select()
+      .maybeSingle();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+app.get('/api/audit/export', requireAdminToken, async (req, res) => {
+  try {
+    const format = String(req.query.format || 'json').toLowerCase();
+    const from = req.query.from || req.query.start_date;
+    const to = req.query.to || req.query.end_date;
+    let query = supabase
+      .from('kyc_audit_log')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(5000);
+
+    if (from) query = query.gte('created_at', from);
+    if (to) query = query.lte('created_at', to);
+
+    const { data } = await query.catch(() => ({ data: [] }));
+    const rows = data || [];
+
+    if (format === 'csv') {
+      const columns = ['id', 'application_id', 'action', 'performed_by', 'performed_role', 'ip_address', 'created_at'];
+      const escapeCsv = (value) => `"${String(value ?? '').replace(/"/g, '""')}"`;
+      const csv = [columns.join(','), ...rows.map((row) => columns.map((col) => escapeCsv(row[col])).join(','))].join('\n');
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="egchat-kyc-audit.csv"');
+      return res.send(csv);
+    }
+
+    res.json({ items: rows, total: rows.length });
+  } catch (e) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════
 // FIN ENDPOINTS DASHBOARD KYC
 // ══════════════════════════════════════════════════════════════════
 
 module.exports = app;
-
-
