@@ -7380,6 +7380,18 @@ app.post('/api/kyc/application', authenticateToken, async (req, res) => {
   try {
     const userId = await resolveKycUserId(req);
     const sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+    // Si ya existe una aplicación activa para este usuario, devolverla
+    const { data: existing } = await supabase
+      .from('kyc_verifications')
+      .select('id, session_id, status')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (existing) {
+      return res.json({ applicationId: existing.id, sessionId: existing.session_id });
+    }
+
     const { data, error } = await supabase
       .from('kyc_verifications')
       .insert({ user_id: userId, status: 'draft', session_id: sessionId })
@@ -7421,6 +7433,13 @@ app.put('/api/kyc/application/:id/personal', authenticateToken, async (req, res)
   try {
     const userId = await resolveKycUserId(req);
     await ensureKycApplicationOwner(id, userId);
+    // Normalizar marital_status (quitar caracteres especiales del check constraint)
+    const maritalMap = {
+      'Soltero/a': 'single', 'Casado/a': 'married',
+      'Divorciado/a': 'divorced', 'Viudo/a': 'widowed',
+    };
+    const normalizedMarital = maritalMap[d.marital_status] ?? d.marital_status ?? null;
+
     const { error: upsertErr } = await supabase
       .from('kyc_personal_data')
       .upsert({
@@ -7430,7 +7449,7 @@ app.put('/api/kyc/application/:id/personal', authenticateToken, async (req, res)
         place_of_birth:  d.place_of_birth,
         nationality:     d.nationality,
         sex:             d.sex,
-        marital_status:  d.marital_status,
+        marital_status:  normalizedMarital,
         address:         d.address,
         city:            d.city,
         province:        d.province,
