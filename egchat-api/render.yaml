@@ -3,13 +3,11 @@ services:
     name: egchat-api
     env: node
     plan: free
-    buildCommand: npm install --production && echo "BUILD_ID=2.5.9-$(date +%s)"
+    buildCommand: npm install
     startCommand: node index.js
-    healthCheckPath: /health
+    healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV
         value: production
-      - key: PORT
-        value: 10000
       - key: APP_VERSION
-        value: "2.5.8"
+        value: "2.6.4"

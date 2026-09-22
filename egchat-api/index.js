@@ -10,7 +10,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { createClient } = require('@supabase/supabase-js');
-const { createAuditLogger } = require('../middleware/auditLogger');
+const { createAuditLogger } = require('./middleware/auditLogger');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
