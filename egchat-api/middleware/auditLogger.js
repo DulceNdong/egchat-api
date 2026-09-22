@@ -19,6 +19,7 @@ function createAuditLogger({ supabase, sensitivePaths = [/\/api\/kyc\//, /\/api\
           },
           ip_address: req.ip,
         })
+        .then(() => {})
         .catch(() => {});
     });
 
