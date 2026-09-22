@@ -7433,12 +7433,14 @@ app.put('/api/kyc/application/:id/personal', authenticateToken, async (req, res)
   try {
     const userId = await resolveKycUserId(req);
     await ensureKycApplicationOwner(id, userId);
-    // Normalizar marital_status (quitar caracteres especiales del check constraint)
+    // Normalizar marital_status al formato que acepta el check constraint
     const maritalMap = {
-      'Soltero/a': 'single', 'Casado/a': 'married',
-      'Divorciado/a': 'divorced', 'Viudo/a': 'widowed',
+      'Soltero/a': 'SINGLE', 'Casado/a': 'MARRIED',
+      'Divorciado/a': 'DIVORCED', 'Viudo/a': 'WIDOWED',
+      'single': 'SINGLE', 'married': 'MARRIED',
+      'divorced': 'DIVORCED', 'widowed': 'WIDOWED',
     };
-    const normalizedMarital = maritalMap[d.marital_status] ?? d.marital_status ?? null;
+    const normalizedMarital = maritalMap[d.marital_status] ?? (d.marital_status ? d.marital_status.toUpperCase() : null);
 
     const { error: upsertErr } = await supabase
       .from('kyc_personal_data')
