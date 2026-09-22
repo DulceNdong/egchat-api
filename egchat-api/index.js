@@ -7322,10 +7322,63 @@ require('./adminRoutes')(app, supabase, JWT_SECRET);
 // KYC ROUTES — multi-step (usando Supabase directamente)
 // ══════════════════════════════════════════════════════════════════
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+async function resolveKycUserId(req) {
+  const tokenUserId = String(req.user?.id || '').trim();
+
+  // Si el ID del token es un UUID válido, usarlo directamente
+  if (UUID_RE.test(tokenUserId)) return tokenUserId;
+
+  // Si no es UUID, buscar por teléfono en la BD
+  const phone = String(req.user?.phone || '').trim();
+  if (phone) {
+    const { data: byPhone } = await supabase
+      .from('users')
+      .select('id')
+      .eq('phone', phone)
+      .maybeSingle();
+    if (byPhone?.id && UUID_RE.test(byPhone.id)) return byPhone.id;
+  }
+
+  // Último recurso: si el ID no es UUID pero existe en la BD como texto, buscarlo
+  if (tokenUserId) {
+    const { data: byId } = await supabase
+      .from('users')
+      .select('id')
+      .eq('id', tokenUserId)
+      .maybeSingle();
+    if (byId?.id) return byId.id;
+  }
+
+  // Si llegamos aquí, el usuario no existe — devolver el ID del token tal cual
+  // para que Supabase lo rechace con un error claro
+  if (tokenUserId) return tokenUserId;
+
+  const err = new Error('Usuario KYC inválido: token sin ID ni teléfono');
+  err.status = 401;
+  throw err;
+}
+
+async function ensureKycApplicationOwner(applicationId, userId) {
+  const { data, error } = await supabase
+    .from('kyc_verifications')
+    .select('id')
+    .eq('id', applicationId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) {
+    const err = new Error('Solicitud KYC no encontrada para este usuario');
+    err.status = 404;
+    throw err;
+  }
+}
+
 // POST /api/kyc/application — Crear aplicación
 app.post('/api/kyc/application', authenticateToken, async (req, res) => {
-  const userId = req.user.id;
   try {
+    const userId = await resolveKycUserId(req);
     const sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     const { data, error } = await supabase
       .from('kyc_verifications')
@@ -7336,14 +7389,14 @@ app.post('/api/kyc/application', authenticateToken, async (req, res) => {
     res.json({ applicationId: data.id, sessionId: data.session_id });
   } catch (err) {
     console.error('[KYC] createApplication:', err.message);
-    res.status(500).json({ error: 'Error al crear aplicación KYC' });
+    res.status(err.status || 500).json({ error: 'Error al crear aplicación KYC', detail: err.message });
   }
 });
 
 // GET /api/kyc/application/active — Aplicación activa del usuario
 app.get('/api/kyc/application/active', authenticateToken, async (req, res) => {
-  const userId = req.user.id;
   try {
+    const userId = await resolveKycUserId(req);
     const { data, error } = await supabase
       .from('kyc_verifications')
       .select('id, session_id, status')
@@ -7357,7 +7410,7 @@ app.get('/api/kyc/application/active', authenticateToken, async (req, res) => {
     res.json({ applicationId: data.id, sessionId: data.session_id, status: data.status, currentStep: 1 });
   } catch (err) {
     console.error('[KYC] getActive:', err.message);
-    res.status(500).json({ error: 'Error al obtener aplicación activa' });
+    res.status(err.status || 500).json({ error: 'Error al obtener aplicación activa', detail: err.message });
   }
 });
 
@@ -7366,6 +7419,8 @@ app.put('/api/kyc/application/:id/personal', authenticateToken, async (req, res)
   const { id } = req.params;
   const d = req.body;
   try {
+    const userId = await resolveKycUserId(req);
+    await ensureKycApplicationOwner(id, userId);
     const { error: upsertErr } = await supabase
       .from('kyc_personal_data')
       .upsert({
@@ -7390,7 +7445,7 @@ app.put('/api/kyc/application/:id/personal', authenticateToken, async (req, res)
     res.json({ ok: true });
   } catch (err) {
     console.error('[KYC] savePersonal:', err.message);
-    res.status(500).json({ error: 'Error al guardar datos personales' });
+    res.status(err.status || 500).json({ error: 'Error al guardar datos personales', detail: err.message });
   }
 });
 
