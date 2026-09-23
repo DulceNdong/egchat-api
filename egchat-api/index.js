@@ -7701,15 +7701,33 @@ app.post('/api/kyc/application', authenticateToken, async (req, res) => {
     const userId = await resolveKycUserId(req);
     const sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
-    // Si ya existe una aplicación activa para este usuario, devolverla
-    const { data: existing } = await supabase
+    // Si ya existe una aplicación para este usuario, reutilizarla.
+    // Producción aún conserva UNIQUE(user_id), así que nunca debemos insertar
+    // una segunda fila para el mismo usuario.
+    const { data: existing, error: existingError } = await supabase
       .from('kyc_verifications')
       .select('id, session_id, status')
       .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
+    if (existingError) throw existingError;
 
     if (existing) {
-      return res.json({ applicationId: existing.id, sessionId: existing.session_id });
+      let existingSessionId = existing.session_id;
+      if (!existingSessionId) {
+        existingSessionId = sessionId;
+        await supabase
+          .from('kyc_verifications')
+          .update({ session_id: existingSessionId, updated_at: new Date().toISOString() })
+          .eq('id', existing.id);
+      }
+      return res.json({
+        applicationId: existing.id,
+        sessionId: existingSessionId,
+        reused: true,
+        status: existing.status,
+      });
     }
 
     const { data, error } = await supabase
