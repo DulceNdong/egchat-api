@@ -2881,6 +2881,215 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
   }
 });
 
+// ── Pending transfer — el dinero queda retenido hasta que el receptor acepte ──
+// POST /api/wallet/transfer/pending  — remitente envía, dinero se retiene
+app.post('/api/wallet/transfer/pending', auth, async (req, res) => {
+  const { to, amount, concept } = req.body;
+  if (!to || !amount || amount <= 0)
+    return res.status(400).json({ message: 'Destinatario y monto requeridos' });
+  if (amount > 10_000_000)
+    return res.status(400).json({ message: 'Monto máximo: 10,000,000 XAF' });
+
+  try {
+    // Obtener/crear wallet del remitente
+    let { data: senderWallet } = await supabase
+      .from('wallets').select('balance').eq('user_id', req.user.id).maybeSingle();
+    if (!senderWallet) {
+      const { data: nw } = await supabase
+        .from('wallets').insert({ user_id: req.user.id, balance: 0, currency: 'XAF' })
+        .select('balance').single();
+      senderWallet = nw;
+    }
+    if (!senderWallet || amount > senderWallet.balance)
+      return res.status(400).json({ message: 'Saldo insuficiente' });
+
+    // Resolver receptor
+    let recipientId = null;
+    let recipientName = to;
+    if (/^[0-9a-f-]{36}$/i.test(to)) {
+      const { data: u } = await supabase.from('users').select('id, full_name').eq('id', to).maybeSingle();
+      if (u) { recipientId = u.id; recipientName = u.full_name; }
+    }
+    if (!recipientId) {
+      const cleanPhone = to.replace(/[^0-9+]/g, '');
+      const { data: u } = await supabase.from('users').select('id, full_name').eq('phone', cleanPhone).maybeSingle();
+      if (u) { recipientId = u.id; recipientName = u.full_name; }
+    }
+    if (recipientId === req.user.id)
+      return res.status(400).json({ message: 'No puedes transferirte dinero a ti mismo' });
+    if (!recipientId)
+      return res.status(404).json({ message: 'Destinatario no encontrado en EGCHAT' });
+
+    // Retener el dinero: descontar del remitente ahora
+    const newSenderBalance = senderWallet.balance - amount;
+    await supabase.from('wallets').update({ balance: newSenderBalance }).eq('user_id', req.user.id);
+
+    // Crear registro pending
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // 24h
+    const { data: pending, error: pendingErr } = await supabase
+      .from('pending_transfers')
+      .insert({
+        sender_id:    req.user.id,
+        recipient_id: recipientId,
+        amount,
+        concept:      concept || null,
+        status:       'pending',
+        expires_at:   expiresAt,
+        created_at:   new Date().toISOString(),
+      })
+      .select('id').single();
+    if (pendingErr) throw pendingErr;
+
+    // Registrar hold en transacciones del remitente
+    await supabase.from('transactions').insert({
+      user_id:    req.user.id,
+      type:       'hold',
+      amount:     -amount,
+      method:     'EGCHAT',
+      reference:  `Pendiente: ${recipientName}${concept ? ' · ' + concept : ''}`,
+      status:     'pending',
+      created_at: new Date().toISOString(),
+    });
+
+    // Obtener nombre del remitente
+    const { data: senderUser } = await supabase
+      .from('users').select('full_name, phone').eq('id', req.user.id).maybeSingle();
+    const senderDisplayName = senderUser?.full_name || senderUser?.phone || 'Usuario';
+
+    // Notificar al receptor vía SSE
+    emitToUser(String(recipientId), {
+      type:         'transfer_pending',
+      transferId:   pending.id,
+      amount,
+      senderName:   senderDisplayName,
+      concept:      concept || null,
+      expiresAt,
+      ts:           Date.now(),
+    });
+
+    // Notificar al remitente su nuevo saldo
+    emitToUser(String(req.user.id), {
+      type:    'wallet_updated',
+      balance: newSenderBalance,
+      ts:      Date.now(),
+    });
+
+    res.json({
+      success:    true,
+      transferId: pending.id,
+      balance:    newSenderBalance,
+      recipient:  recipientName,
+      message:    'Transferencia enviada. Esperando aceptación del receptor.',
+    });
+  } catch (e) {
+    console.error('POST /api/wallet/transfer/pending error:', e);
+    res.status(500).json({ message: e.message || 'Error al procesar la transferencia' });
+  }
+});
+
+// POST /api/wallet/transfer/accept/:id — receptor acepta
+app.post('/api/wallet/transfer/accept/:id', auth, async (req, res) => {
+  try {
+    const { data: transfer } = await supabase
+      .from('pending_transfers')
+      .select('*').eq('id', req.params.id).eq('recipient_id', req.user.id).maybeSingle();
+
+    if (!transfer) return res.status(404).json({ message: 'Transferencia no encontrada' });
+    if (transfer.status !== 'pending') return res.status(400).json({ message: `Transferencia ya ${transfer.status}` });
+    if (new Date(transfer.expires_at) < new Date())
+      return res.status(400).json({ message: 'La transferencia ha expirado' });
+
+    // Acreditar al receptor
+    let { data: recipientWallet } = await supabase
+      .from('wallets').select('balance').eq('user_id', req.user.id).maybeSingle();
+    if (recipientWallet) {
+      await supabase.from('wallets')
+        .update({ balance: recipientWallet.balance + transfer.amount })
+        .eq('user_id', req.user.id);
+    } else {
+      await supabase.from('wallets')
+        .insert({ user_id: req.user.id, balance: transfer.amount, currency: 'XAF' });
+      recipientWallet = { balance: 0 };
+    }
+    const newRecipientBalance = (recipientWallet.balance || 0) + transfer.amount;
+
+    // Marcar como completada
+    await supabase.from('pending_transfers')
+      .update({ status: 'completed', completed_at: new Date().toISOString() })
+      .eq('id', transfer.id);
+
+    // Transacciones finales
+    await supabase.from('transactions').insert([
+      {
+        user_id: transfer.sender_id, type: 'transfer_sent',
+        amount: -transfer.amount, method: 'EGCHAT',
+        reference: `Transferencia aceptada por receptor`, status: 'completed',
+        created_at: new Date().toISOString(),
+      },
+      {
+        user_id: req.user.id, type: 'transfer_received',
+        amount: transfer.amount, method: 'EGCHAT',
+        reference: `Transferencia recibida${transfer.concept ? ' · ' + transfer.concept : ''}`,
+        status: 'completed', created_at: new Date().toISOString(),
+      },
+    ]);
+    // Marcar el hold anterior como completado
+    await supabase.from('transactions')
+      .update({ status: 'completed' })
+      .eq('user_id', transfer.sender_id).eq('type', 'hold').eq('status', 'pending');
+
+    // Notificar a ambos
+    emitToUser(String(transfer.sender_id), { type: 'transfer_accepted', transferId: transfer.id, amount: transfer.amount, ts: Date.now() });
+    emitToUser(String(req.user.id),        { type: 'wallet_updated', balance: newRecipientBalance, ts: Date.now() });
+
+    res.json({ success: true, balance: newRecipientBalance, message: 'Transferencia aceptada' });
+  } catch (e) {
+    console.error('POST /api/wallet/transfer/accept error:', e);
+    res.status(500).json({ message: e.message || 'Error al aceptar la transferencia' });
+  }
+});
+
+// POST /api/wallet/transfer/cancel/:id — receptor cancela (devuelve dinero al remitente)
+app.post('/api/wallet/transfer/cancel/:id', auth, async (req, res) => {
+  try {
+    const { data: transfer } = await supabase
+      .from('pending_transfers')
+      .select('*').eq('id', req.params.id)
+      .or(`recipient_id.eq.${req.user.id},sender_id.eq.${req.user.id}`)
+      .maybeSingle();
+
+    if (!transfer) return res.status(404).json({ message: 'Transferencia no encontrada' });
+    if (transfer.status !== 'pending') return res.status(400).json({ message: `Transferencia ya ${transfer.status}` });
+
+    // Devolver dinero al remitente
+    const { data: senderWallet } = await supabase
+      .from('wallets').select('balance').eq('user_id', transfer.sender_id).maybeSingle();
+    const newSenderBalance = (senderWallet?.balance || 0) + transfer.amount;
+    await supabase.from('wallets').update({ balance: newSenderBalance }).eq('user_id', transfer.sender_id);
+
+    // Marcar como cancelada
+    await supabase.from('pending_transfers')
+      .update({ status: 'cancelled', completed_at: new Date().toISOString() })
+      .eq('id', transfer.id);
+
+    // Cancelar el hold
+    await supabase.from('transactions')
+      .update({ status: 'cancelled' })
+      .eq('user_id', transfer.sender_id).eq('type', 'hold').eq('status', 'pending');
+
+    // Notificar al remitente que le devolvieron el dinero
+    emitToUser(String(transfer.sender_id), {
+      type: 'transfer_cancelled', transferId: transfer.id, amount: transfer.amount,
+      balance: newSenderBalance, ts: Date.now(),
+    });
+
+    res.json({ success: true, message: 'Transferencia cancelada. El dinero ha sido devuelto.' });
+  } catch (e) {
+    console.error('POST /api/wallet/transfer/cancel error:', e);
+    res.status(500).json({ message: e.message || 'Error al cancelar la transferencia' });
+  }
+});
+
 app.post('/api/wallet/recharge-code', auth, async (req, res) => {
   const { code } = req.body;
   if (!code || code.replace(/-/g, '').length !== 16)
