@@ -7505,16 +7505,38 @@ app.post('/api/kyc/application/:id/document', authenticateToken, async (req, res
       side,
       applicationId: id,
     });
-    const { error } = await supabase
+
+    // Try update first (row already exists); if no row updated, insert a new one.
+    // Avoids ON CONFLICT which requires a unique constraint on application_id.
+    const updateFields = {
+      [`${side}_image_url`]: storedImageUrl,
+      ocr_confidence: ocr.confidence,
+      ocr_raw_data: ocr,
+      updated_at: new Date().toISOString(),
+    };
+    const { data: existing } = await supabase
       .from('kyc_documents')
-      .upsert({
-        application_id: id,
-        document_type,
-        [`${side}_image_url`]: storedImageUrl,
-        ocr_confidence: ocr.confidence,
-        ocr_raw_data: ocr,
-      }, { onConflict: 'application_id' });
-    if (error) throw error;
+      .select('id')
+      .eq('application_id', id)
+      .maybeSingle();
+
+    if (existing) {
+      const { error: updErr } = await supabase
+        .from('kyc_documents')
+        .update(updateFields)
+        .eq('application_id', id);
+      if (updErr) throw updErr;
+    } else {
+      const { error: insErr } = await supabase
+        .from('kyc_documents')
+        .insert({
+          application_id: id,
+          document_type,
+          ...updateFields,
+        });
+      if (insErr) throw insErr;
+    }
+
     res.json({ ok: true, ocrData: ocr.extracted || {}, confidence: ocr.confidence, provider: ocr.provider });
   } catch (err) {
     console.error('[KYC] uploadDocument:', err.message);
@@ -7593,10 +7615,11 @@ app.post('/api/kyc/application/:id/screening', authenticateToken, async (req, re
       },
     ];
 
-    await supabase
+    // Supabase v2: no .catch() on builder — use await and ignore error
+    const { error: screenInsertErr } = await supabase
       .from('kyc_screening_results')
-      .insert(screeningResults)
-      .catch(() => ({ error: null }));
+      .insert(screeningResults);
+    if (screenInsertErr) console.warn('[KYC] screening insert (non-fatal):', screenInsertErr.message);
 
     const riskScore = Math.max(Number(application.risk_score || 0), 15);
     await supabase
@@ -7624,26 +7647,31 @@ app.post('/api/kyc/application/:id/submit', authenticateToken, async (req, res) 
   const { id } = req.params;
   const userId = req.user.id;
   try {
-    const [{ data: personal }, { data: document }, { data: screening }] = await Promise.all([
-      supabase.from('kyc_personal_data').select('*').eq('application_id', id).maybeSingle().catch(() => ({ data: null })),
-      supabase.from('kyc_documents').select('*').eq('application_id', id).maybeSingle().catch(() => ({ data: null })),
-      supabase.from('kyc_screening_results').select('*').eq('application_id', id).catch(() => ({ data: [] })),
+    // Supabase v2: no .catch() on builder — fetch each with await and fall back on error
+    const [personalRes, documentRes, screeningRes] = await Promise.all([
+      supabase.from('kyc_personal_data').select('*').eq('application_id', id).maybeSingle(),
+      supabase.from('kyc_documents').select('*').eq('application_id', id).maybeSingle(),
+      supabase.from('kyc_screening_results').select('*').eq('application_id', id),
     ]);
 
+    const personal  = personalRes.data  || {};
+    const document  = documentRes.data  || {};
+    const screening = screeningRes.data || [];
+
     const scoring = calculateRiskScore({
-      personal: personal || {},
-      document: document || {},
-      biometric: document || {},
-      screening: screening || [],
+      personal,
+      document,
+      biometric: document,
+      screening,
     });
 
     const submittedAt = new Date().toISOString();
     const updatePayload = {
-      status: scoring.decision,
-      risk_score: scoring.score,
-      risk_level: scoring.riskLevel,
+      status:       scoring.decision,
+      risk_score:   scoring.score,
+      risk_level:   scoring.riskLevel,
       submitted_at: submittedAt,
-      updated_at: submittedAt,
+      updated_at:   submittedAt,
     };
 
     await supabase
@@ -7652,32 +7680,32 @@ app.post('/api/kyc/application/:id/submit', authenticateToken, async (req, res) 
       .eq('id', id);
 
     if (scoring.decision === 'AUTO_APPROVED') {
-      await supabase
+      const { error: userUpdateErr } = await supabase
         .from('users')
         .update({ wallet_kyc_status: 'approved', wallet_kyc_reviewed_at: submittedAt })
-        .eq('id', userId)
-        .catch(() => ({ error: null }));
+        .eq('id', userId);
+      if (userUpdateErr) console.warn('[KYC] submit user update (non-fatal):', userUpdateErr.message);
     }
 
-    await supabase
+    const { error: auditErr } = await supabase
       .from('kyc_audit_log')
       .insert({
         application_id: id,
-        action: 'KYC_AUTO_SCORED',
-        performed_by: userId,
+        action:         'KYC_AUTO_SCORED',
+        performed_by:   userId,
         performed_role: 'user',
-        details: scoring,
-        ip_address: req.ip,
-      })
-      .catch(() => ({ error: null }));
+        details:        scoring,
+        ip_address:     req.ip,
+      });
+    if (auditErr) console.warn('[KYC] submit audit log (non-fatal):', auditErr.message);
 
     res.json({
-      ok: true,
-      status: scoring.decision,
-      score: scoring.score,
+      ok:        true,
+      status:    scoring.decision,
+      score:     scoring.score,
       riskLevel: scoring.riskLevel,
-      decision: scoring.decision,
-      reasons: scoring.reasons,
+      decision:  scoring.decision,
+      reasons:   scoring.reasons,
     });
   } catch (err) {
     console.error('[KYC] submit:', err.message);
