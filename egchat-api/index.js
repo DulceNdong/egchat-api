@@ -7376,6 +7376,326 @@ async function ensureKycApplicationOwner(applicationId, userId) {
 }
 
 // POST /api/kyc/application — Crear aplicación
+// ══════════════════════════════════════════════════════════════════
+// KYC — Flujo legado (kyc.ts / kycAPI) — upload FormData + submit JSON
+// ══════════════════════════════════════════════════════════════════
+
+// POST /api/kyc/upload — Subir imagen de documento o selfie (FormData multipart)
+// Usado por kycAPI.uploadDocument() desde la app nativa (flujo kyc.ts / kyc-step-2)
+app.post('/api/kyc/upload', authenticateToken, async (req, res) => {
+  try {
+    const rawContentType = req.headers['content-type'] || '';
+    if (!rawContentType.includes('multipart/form-data')) {
+      return res.status(400).json({ error: 'Se requiere multipart/form-data' });
+    }
+
+    const busboy = require('busboy');
+    const bb = busboy({ headers: req.headers, limits: { fileSize: 15 * 1024 * 1024, files: 1 } });
+
+    const fileData = await new Promise((resolve, reject) => {
+      let fileBuffer = null;
+      let fileMime = 'image/jpeg';
+      let fileOrigName = `doc_${Date.now()}.jpg`;
+      let docType = 'doc_front';
+
+      bb.on('file', (_fieldname, file, info) => {
+        const { filename, mimeType } = info;
+        fileOrigName = filename || fileOrigName;
+        fileMime = mimeType || fileMime;
+        const chunks = [];
+        file.on('data', d => chunks.push(d));
+        file.on('end', () => { fileBuffer = Buffer.concat(chunks); });
+      });
+      bb.on('field', (name, val) => {
+        if (name === 'doc_type') docType = val;
+      });
+      bb.on('close', () => resolve({ buffer: fileBuffer, mime: fileMime, name: fileOrigName, docType }));
+      bb.on('error', reject);
+      req.pipe(bb);
+    });
+
+    if (!fileData.buffer || fileData.buffer.length === 0) {
+      return res.status(400).json({ error: 'Archivo vacío o no recibido' });
+    }
+
+    // Determinar extensión
+    const ext = fileData.mime?.includes('png') ? 'png' : 'jpg';
+    // Mapear doc_type a nombre de carpeta
+    const sideMap = { doc_front: 'front', doc_back: 'back', selfie: 'selfie' };
+    const side = sideMap[fileData.docType] || fileData.docType;
+    const storagePath = `kyc/${req.user.id}/legacy/${side}_${Date.now()}.${ext}`;
+
+    const { error: uploadErr } = await supabase.storage
+      .from('chat-files')
+      .upload(storagePath, fileData.buffer, { contentType: fileData.mime, upsert: true });
+
+    if (uploadErr) {
+      console.error('[KYC upload] Storage error:', uploadErr.message);
+      return res.status(500).json({ error: 'Error al subir imagen: ' + uploadErr.message });
+    }
+
+    const { data: urlData } = supabase.storage.from('chat-files').getPublicUrl(storagePath);
+    const publicUrl = urlData?.publicUrl;
+    if (!publicUrl) return res.status(500).json({ error: 'No se pudo generar URL pública' });
+
+    res.json({ success: true, url: publicUrl, path: storagePath });
+  } catch (err) {
+    console.error('[KYC upload] Error:', err.message);
+    res.status(500).json({ error: 'Error al subir documento: ' + err.message });
+  }
+});
+
+// GET /api/kyc/draft — Obtener borrador guardado
+app.get('/api/kyc/draft', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { data } = await supabase
+      .from('kyc_verifications')
+      .select('id, full_name, birth_date, nationality, doc_type, doc_number, doc_front_url, doc_back_url, selfie_url')
+      .eq('user_id', userId)
+      .in('status', ['draft', 'IN_PROGRESS'])
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    res.json({ draft: data || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/kyc/draft — Guardar borrador
+app.post('/api/kyc/draft', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const d = req.body;
+    // Buscar aplicación existente o crear nueva
+    const { data: existing } = await supabase
+      .from('kyc_verifications')
+      .select('id')
+      .eq('user_id', userId)
+      .in('status', ['draft', 'IN_PROGRESS'])
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (existing) {
+      await supabase.from('kyc_verifications')
+        .update({ full_name: d.full_name, birth_date: d.birth_date, nationality: d.nationality,
+                  doc_type: d.doc_type, doc_number: d.doc_number, updated_at: new Date().toISOString() })
+        .eq('id', existing.id);
+      return res.json({ success: true, kyc_id: existing.id });
+    }
+
+    const sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const { data, error } = await supabase.from('kyc_verifications')
+      .insert({ user_id: userId, status: 'draft', session_id: sessionId,
+                full_name: d.full_name, birth_date: d.birth_date, nationality: d.nationality,
+                doc_type: d.doc_type, doc_number: d.doc_number })
+      .select('id').single();
+    if (error) throw error;
+    res.json({ success: true, kyc_id: data.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/kyc/submit — Envío final del KYC (flujo legado kyc.ts)
+app.post('/api/kyc/submit', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const d = req.body;
+
+    const now = new Date().toISOString();
+    const sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+    // Calcular score de riesgo básico
+    const riskScore = 15; // bajo por defecto — revisión manual activada
+    const decision  = 'MANUAL_REVIEW';
+
+    // Buscar aplicación existente o crear
+    const { data: existing } = await supabase
+      .from('kyc_verifications')
+      .select('id')
+      .eq('user_id', userId)
+      .not('status', 'in', '("APPROVED","approved","REJECTED","rejected","BLOCKED")')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    let appId;
+    if (existing) {
+      appId = existing.id;
+      await supabase.from('kyc_verifications').update({
+        status:        decision,
+        submitted_at:  now,
+        updated_at:    now,
+        full_name:     d.full_name,
+        birth_date:    d.birth_date,
+        nationality:   d.nationality,
+        doc_type:      d.doc_type,
+        doc_number:    d.doc_number,
+        doc_front_url: d.doc_front_url,
+        doc_back_url:  d.doc_back_url  || null,
+        selfie_url:    d.selfie_url,
+        risk_score:    riskScore,
+      }).eq('id', appId);
+    } else {
+      const { data: created, error } = await supabase.from('kyc_verifications').insert({
+        user_id:       userId,
+        session_id:    sessionId,
+        status:        decision,
+        submitted_at:  now,
+        full_name:     d.full_name,
+        birth_date:    d.birth_date,
+        nationality:   d.nationality,
+        doc_type:      d.doc_type,
+        doc_number:    d.doc_number,
+        doc_front_url: d.doc_front_url,
+        doc_back_url:  d.doc_back_url  || null,
+        selfie_url:    d.selfie_url,
+        risk_score:    riskScore,
+      }).select('id').single();
+      if (error) throw error;
+      appId = created.id;
+    }
+
+    // Guardar también en kyc_documents para que el admin pueda verlos
+    const { data: existingDoc } = await supabase
+      .from('kyc_documents')
+      .select('id')
+      .eq('application_id', appId)
+      .maybeSingle();
+
+    const docFields = {
+      front_image_url: d.doc_front_url || null,
+      back_image_url:  d.doc_back_url  || null,
+      selfie_url:      d.selfie_url    || null,
+      document_type:   d.doc_type      || null,
+      updated_at:      now,
+    };
+    if (existingDoc) {
+      await supabase.from('kyc_documents').update(docFields).eq('application_id', appId);
+    } else {
+      await supabase.from('kyc_documents').insert({ application_id: appId, ...docFields });
+    }
+
+    // Actualizar wallet_kyc_status a 'pending'
+    await supabase.from('users')
+      .update({ wallet_kyc_status: 'pending' })
+      .eq('id', userId);
+
+    res.json({ success: true, kyc_id: appId, kyc_status: 'pending', message: 'Solicitud enviada correctamente' });
+  } catch (err) {
+    console.error('[KYC submit]', err.message);
+    res.status(500).json({ error: 'Error al enviar solicitud KYC: ' + err.message });
+  }
+});
+
+// POST /api/kyc/resubmit — Reintento tras rechazo
+app.post('/api/kyc/resubmit', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const now = new Date().toISOString();
+    const { error } = await supabase.from('kyc_verifications')
+      .update({ status: 'draft', updated_at: now, rejection_reason: null })
+      .eq('user_id', userId)
+      .in('status', ['REJECTED', 'rejected', 'PENDING_INFO']);
+    if (error) throw error;
+    await supabase.from('users').update({ wallet_kyc_status: 'none' }).eq('id', userId);
+    res.json({ success: true, message: 'Puedes volver a enviar tu solicitud' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/kyc/status — Estado KYC del usuario autenticado
+// Devuelve wallet_kyc_status de la tabla users + registro KYC activo.
+// Este es el endpoint que usa la app nativa para decidir si mostrar el monedero.
+app.get('/api/kyc/status', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    if (!userId) return res.status(401).json({ error: 'UNAUTHORIZED' });
+
+    // 1. Leer wallet_kyc_status directamente de la tabla users
+    const { data: user, error: userErr } = await supabase
+      .from('users')
+      .select('id, wallet_kyc_status')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (userErr || !user) {
+      return res.json({
+        kyc_status:        'none',
+        kyc_record:        null,
+        rejection_reason:  null,
+        wallet_enabled:    false,
+      });
+    }
+
+    // Mapear wallet_kyc_status → kyc_status (formato que espera la app)
+    const walletStatus = user.wallet_kyc_status || 'none';
+    // 'approved' → 'approved', 'rejected' → 'rejected', 'suspended' → 'suspended'
+    // 'pending'  → 'pending',  null/none  → buscar en kyc_verifications
+    let kycStatus = walletStatus;
+
+    // 2. Si el wallet no tiene estado claro, consultar kyc_verifications
+    if (!walletStatus || walletStatus === 'none') {
+      const { data: kyc } = await supabase
+        .from('kyc_verifications')
+        .select('id, status, rejection_reason, submitted_at')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (kyc) {
+        // Mapear estados del proceso KYC → estados del monedero
+        const s = kyc.status || '';
+        if (['APPROVED', 'AUTO_APPROVED', 'approved'].includes(s))             kycStatus = 'approved';
+        else if (['REJECTED', 'rejected'].includes(s))                          kycStatus = 'rejected';
+        else if (['BLOCKED'].includes(s))                                       kycStatus = 'suspended';
+        else if (['submitted', 'PENDING_REVIEW', 'under_review',
+                  'MANUAL_REVIEW', 'IN_PROGRESS'].includes(s))                  kycStatus = 'pending';
+        else if (['draft'].includes(s))                                         kycStatus = 'none';
+
+        return res.json({
+          kyc_status:       kycStatus,
+          kyc_record:       { id: kyc.id, status: kyc.status, submitted_at: kyc.submitted_at },
+          rejection_reason: kyc.rejection_reason || null,
+          wallet_enabled:   kycStatus === 'approved',
+        });
+      }
+
+      // Sin registro KYC en absoluto
+      return res.json({
+        kyc_status:       'none',
+        kyc_record:       null,
+        rejection_reason: null,
+        wallet_enabled:   false,
+      });
+    }
+
+    // 3. Tiene wallet_kyc_status → devolver directamente
+    const { data: kyc } = await supabase
+      .from('kyc_verifications')
+      .select('id, status, rejection_reason, submitted_at')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    res.json({
+      kyc_status:       kycStatus,
+      kyc_record:       kyc ? { id: kyc.id, status: kyc.status, submitted_at: kyc.submitted_at } : null,
+      rejection_reason: kyc?.rejection_reason || null,
+      wallet_enabled:   kycStatus === 'approved',
+    });
+  } catch (err) {
+    console.error('[KYC] getStatus:', err.message);
+    res.status(500).json({ error: 'Error al obtener estado KYC' });
+  }
+});
+
 app.post('/api/kyc/application', authenticateToken, async (req, res) => {
   try {
     const userId = await resolveKycUserId(req);
@@ -7498,7 +7818,27 @@ app.post('/api/kyc/application/:id/document', authenticateToken, async (req, res
   const { side, image_data, document_type } = req.body;
   if (!image_data) return res.status(400).json({ error: 'image_data requerida' });
   try {
-    const storedImageUrl = `stored:${side}:${Date.now()}`;
+    // Subir imagen real a Supabase Storage
+    let storedImageUrl = `stored:${side}:${Date.now()}`;
+    try {
+      const base64Data = image_data.replace(/^data:image\/[a-z]+;base64,/, '');
+      const imageBuffer = Buffer.from(base64Data, 'base64');
+      const ext = image_data.startsWith('data:image/png') ? 'png' : 'jpg';
+      const storagePath = `kyc/${req.user.id}/${id}/${side}_${Date.now()}.${ext}`;
+      const { error: uploadErr } = await supabase.storage
+        .from('chat-files')
+        .upload(storagePath, imageBuffer, {
+          contentType: `image/${ext}`,
+          upsert: true,
+        });
+      if (!uploadErr) {
+        const { data: urlData } = supabase.storage.from('chat-files').getPublicUrl(storagePath);
+        if (urlData?.publicUrl) storedImageUrl = urlData.publicUrl;
+      }
+    } catch (storageErr) {
+      console.warn('[KYC] Storage upload failed (non-fatal):', storageErr.message);
+    }
+
     const ocr = await kycProviderFactory.withFallback('ocrDocument', {
       documentType: document_type,
       imageUrl: storedImageUrl,
@@ -7506,8 +7846,7 @@ app.post('/api/kyc/application/:id/document', authenticateToken, async (req, res
       applicationId: id,
     });
 
-    // Try update first (row already exists); if no row updated, insert a new one.
-    // Avoids ON CONFLICT which requires a unique constraint on application_id.
+    // Try update first; if no row exists, insert.
     const updateFields = {
       [`${side}_image_url`]: storedImageUrl,
       ocr_confidence: ocr.confidence,
@@ -7554,10 +7893,29 @@ app.post('/api/kyc/application/:id/biometric', authenticateToken, async (req, re
       kycProviderFactory.withFallback('faceMatch', { applicationId: id, selfieData: selfie_data }),
       kycProviderFactory.withFallback('liveness', { applicationId: id, selfieData: selfie_data }),
     ]);
+
+    // Subir selfie real a Supabase Storage
+    let selfieStoredUrl = `stored:selfie:${Date.now()}`;
+    try {
+      const base64Data = selfie_data.replace(/^data:image\/[a-z]+;base64,/, '');
+      const imageBuffer = Buffer.from(base64Data, 'base64');
+      const ext = selfie_data.startsWith('data:image/png') ? 'png' : 'jpg';
+      const storagePath = `kyc/${req.user.id}/${id}/selfie_${Date.now()}.${ext}`;
+      const { error: uploadErr } = await supabase.storage
+        .from('chat-files')
+        .upload(storagePath, imageBuffer, { contentType: `image/${ext}`, upsert: true });
+      if (!uploadErr) {
+        const { data: urlData } = supabase.storage.from('chat-files').getPublicUrl(storagePath);
+        if (urlData?.publicUrl) selfieStoredUrl = urlData.publicUrl;
+      }
+    } catch (storageErr) {
+      console.warn('[KYC] Selfie storage upload failed (non-fatal):', storageErr.message);
+    }
+
     const { error } = await supabase
       .from('kyc_documents')
       .update({
-        selfie_url:       `stored:selfie:${Date.now()}`,
+        selfie_url:       selfieStoredUrl,
         face_match_score: faceMatch.faceMatchScore,
         liveness_passed:  liveness.passed,
         liveness_score:   liveness.livenessScore,
@@ -9836,7 +10194,7 @@ app.get('/api/v1/admin/kyc/:id', async (req, res) => {
 
     const { data: app, error } = await supabase
       .from('kyc_verifications')
-      .select(`*, users:user_id (id, phone, status)`)
+      .select(`*, users:user_id (id, phone, status, avatar_url, wallet_kyc_status)`)
       .eq('id', req.params.id)
       .maybeSingle();
 
@@ -9876,6 +10234,7 @@ app.get('/api/v1/admin/kyc/:id', async (req, res) => {
       created_at:       app.created_at,
       user_id:          app.user_id,
       user_phone:       app.users?.phone,
+      avatar_url:       app.users?.avatar_url || null,
       wallet_kyc_status: app.users?.wallet_kyc_status || null,
       full_name:        pd?.full_name        || app.full_name,
       nationality:      pd?.nationality      || app.nationality,
@@ -9895,10 +10254,18 @@ app.get('/api/v1/admin/kyc/:id', async (req, res) => {
       ocr_confidence:   doc?.ocr_confidence  || null,
       face_match_score: doc?.face_match_score || null,
       liveness_passed:  doc?.liveness_passed  ?? null,
-      // URLs cifradas (no se exponen)
+      // Disponibilidad de imágenes (para el visor)
       has_front_doc:    !!(doc?.front_image_url || app.doc_front_url),
       has_back_doc:     !!(doc?.back_image_url  || app.doc_back_url),
       has_selfie:       !!(doc?.selfie_url       || app.selfie_url),
+      // URLs reales (si existen — para signed-url endpoint)
+      // Busca en kyc_documents primero, luego en kyc_verifications (flujo legado)
+      doc_front_url:    doc?.front_image_url?.startsWith('http') ? doc.front_image_url
+                        : app.doc_front_url?.startsWith?.('http') ? app.doc_front_url : null,
+      doc_back_url:     doc?.back_image_url?.startsWith('http')  ? doc.back_image_url
+                        : app.doc_back_url?.startsWith?.('http')  ? app.doc_back_url  : null,
+      selfie_url:       doc?.selfie_url?.startsWith('http')      ? doc.selfie_url
+                        : app.selfie_url?.startsWith?.('http')    ? app.selfie_url    : null,
       screening_results: screening.map(s => ({
         id:             s.id,
         screening_type: s.screening_type,
@@ -9940,6 +10307,51 @@ app.get('/api/v1/admin/kyc/:id/audit', async (req, res) => {
         created_at:     e.created_at,
       })),
     });
+  } catch (e) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+// ── Signed URL para ver documentos KYC en el admin ───────────────
+// GET /api/v1/kyc/docs/:applicationId/signed-url?doc_type=front|back|selfie
+app.get('/api/v1/kyc/docs/:applicationId/signed-url', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
+    const { applicationId } = req.params;
+    const docType = req.query.doc_type; // front | back | selfie
+
+    const fieldMap = { front: 'front_image_url', back: 'back_image_url', selfie: 'selfie_url' };
+    const field = fieldMap[docType];
+    if (!field) return res.status(400).json({ error: 'doc_type inválido' });
+
+    // 1. Buscar en kyc_documents (flujo nuevo — JSON base64 subido a Storage)
+    const { data: doc } = await supabase
+      .from('kyc_documents')
+      .select(field)
+      .eq('application_id', applicationId)
+      .maybeSingle();
+
+    let rawUrl = doc?.[field];
+
+    // 2. Si no hay en kyc_documents, buscar en kyc_verifications (flujo legado — FormData)
+    if (!rawUrl || !rawUrl.startsWith('http')) {
+      const legacyFieldMap = { front: 'doc_front_url', back: 'doc_back_url', selfie: 'selfie_url' };
+      const legacyField = legacyFieldMap[docType];
+      const { data: ver } = await supabase
+        .from('kyc_verifications')
+        .select(legacyField)
+        .eq('id', applicationId)
+        .maybeSingle();
+      rawUrl = ver?.[legacyField];
+    }
+
+    // Si es una URL real de Supabase Storage, devolverla directamente
+    if (rawUrl && rawUrl.startsWith('http')) {
+      return res.json({ url: rawUrl, expires_in: 300 });
+    }
+
+    // Sin imagen disponible
+    return res.status(404).json({ error: 'Imagen no disponible', url: null });
   } catch (e) {
     res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
   }

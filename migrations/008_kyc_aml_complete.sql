@@ -391,6 +391,29 @@ CREATE TRIGGER trg_sar_updated_at
   BEFORE UPDATE ON suspicious_activity_reports
   FOR EACH ROW EXECUTE FUNCTION fn_egchat_set_updated_at();
 
+-- Añadir columnas que pueden faltar si la tabla ya existía sin ellas
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS application_id UUID REFERENCES kyc_verifications(id) ON DELETE SET NULL;
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS transaction_id UUID;
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS transaction_ids UUID[] DEFAULT '{}';
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS reported_by UUID REFERENCES admin_users(id) ON DELETE SET NULL;
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS report_type TEXT NOT NULL DEFAULT 'SAR';
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS suspicious_reason TEXT;
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS indicators JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS subject_name TEXT;
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS subject_id_type TEXT;
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS subject_id_num TEXT;
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS amount NUMERIC(15,2);
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS amount_involved NUMERIC(15,2);
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'XAF';
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS anif_reference TEXT;
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS anif_response JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS sif_payload JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE suspicious_activity_reports ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS idx_sar_status ON suspicious_activity_reports(status);
 CREATE INDEX IF NOT EXISTS idx_sar_user ON suspicious_activity_reports(user_id) WHERE user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_sar_application ON suspicious_activity_reports(application_id) WHERE application_id IS NOT NULL;
