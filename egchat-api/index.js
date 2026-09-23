@@ -7821,9 +7821,23 @@ app.post('/api/kyc/application/:id/document', authenticateToken, async (req, res
     // Subir imagen real a Supabase Storage
     let storedImageUrl = `stored:${side}:${Date.now()}`;
     try {
-      const base64Data = image_data.replace(/^data:image\/[a-z]+;base64,/, '');
+      // La app envía image_data en formato: "v1:checksum8:BASE64REAL"
+      // o en crudo "data:image/jpeg;base64,BASE64REAL"
+      // Extraer el base64 puro en cualquiera de los dos casos
+      let base64Data = image_data;
+      if (base64Data.startsWith('v1:')) {
+        // Formato nativo: v1:checksum8chars:BASE64REAL
+        // El formato es v1:8chars_checksum:rest
+        const thirdColon = base64Data.indexOf(':', 3);
+        base64Data = thirdColon !== -1 ? base64Data.slice(thirdColon + 1) : base64Data.slice(12);
+      } else {
+        // Formato data URI: data:image/jpeg;base64,BASE64REAL
+        base64Data = base64Data.replace(/^data:image\/[a-z]+;base64,/, '');
+      }
+
       const imageBuffer = Buffer.from(base64Data, 'base64');
-      const ext = image_data.startsWith('data:image/png') ? 'png' : 'jpg';
+      if (imageBuffer.length < 100) throw new Error('Imagen vacía o inválida');
+      const ext = 'jpg'; // siempre JPG desde la app
       const storagePath = `kyc/${req.user.id}/${id}/${side}_${Date.now()}.${ext}`;
       const { error: uploadErr } = await supabase.storage
         .from('chat-files')
@@ -7834,6 +7848,8 @@ app.post('/api/kyc/application/:id/document', authenticateToken, async (req, res
       if (!uploadErr) {
         const { data: urlData } = supabase.storage.from('chat-files').getPublicUrl(storagePath);
         if (urlData?.publicUrl) storedImageUrl = urlData.publicUrl;
+      } else {
+        console.warn('[KYC] Storage upload error (non-fatal):', uploadErr.message);
       }
     } catch (storageErr) {
       console.warn('[KYC] Storage upload failed (non-fatal):', storageErr.message);
@@ -7897,16 +7913,25 @@ app.post('/api/kyc/application/:id/biometric', authenticateToken, async (req, re
     // Subir selfie real a Supabase Storage
     let selfieStoredUrl = `stored:selfie:${Date.now()}`;
     try {
-      const base64Data = selfie_data.replace(/^data:image\/[a-z]+;base64,/, '');
+      // Mismo formato v1:checksum8:BASE64REAL o data URI
+      let base64Data = selfie_data;
+      if (base64Data.startsWith('v1:')) {
+        const thirdColon = base64Data.indexOf(':', 3);
+        base64Data = thirdColon !== -1 ? base64Data.slice(thirdColon + 1) : base64Data.slice(12);
+      } else {
+        base64Data = base64Data.replace(/^data:image\/[a-z]+;base64,/, '');
+      }
       const imageBuffer = Buffer.from(base64Data, 'base64');
-      const ext = selfie_data.startsWith('data:image/png') ? 'png' : 'jpg';
-      const storagePath = `kyc/${req.user.id}/${id}/selfie_${Date.now()}.${ext}`;
+      if (imageBuffer.length < 100) throw new Error('Selfie vacía o inválida');
+      const storagePath = `kyc/${req.user.id}/${id}/selfie_${Date.now()}.jpg`;
       const { error: uploadErr } = await supabase.storage
         .from('chat-files')
-        .upload(storagePath, imageBuffer, { contentType: `image/${ext}`, upsert: true });
+        .upload(storagePath, imageBuffer, { contentType: 'image/jpeg', upsert: true });
       if (!uploadErr) {
         const { data: urlData } = supabase.storage.from('chat-files').getPublicUrl(storagePath);
         if (urlData?.publicUrl) selfieStoredUrl = urlData.publicUrl;
+      } else {
+        console.warn('[KYC] Selfie storage error (non-fatal):', uploadErr.message);
       }
     } catch (storageErr) {
       console.warn('[KYC] Selfie storage upload failed (non-fatal):', storageErr.message);
