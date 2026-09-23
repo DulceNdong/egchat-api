@@ -10357,6 +10357,101 @@ app.get('/api/v1/kyc/docs/:applicationId/signed-url', async (req, res) => {
   }
 });
 
+// ── Upload manual de documento desde el admin panel ──────────────
+// POST /api/v1/admin/kyc/:id/upload-doc?doc_type=front|back|selfie
+// Permite al compliance officer subir los documentos físicamente
+app.post('/api/v1/admin/kyc/:id/upload-doc', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
+    const { id } = req.params;
+    const docType = req.query.doc_type; // front | back | selfie
+    if (!['front', 'back', 'selfie'].includes(docType)) {
+      return res.status(400).json({ error: 'doc_type debe ser front, back o selfie' });
+    }
+
+    const rawContentType = req.headers['content-type'] || '';
+    if (!rawContentType.includes('multipart/form-data')) {
+      return res.status(400).json({ error: 'Se requiere multipart/form-data' });
+    }
+
+    const busboy = require('busboy');
+    const bb = busboy({ headers: req.headers, limits: { fileSize: 20 * 1024 * 1024, files: 1 } });
+
+    const fileData = await new Promise((resolve, reject) => {
+      let fileBuffer = null;
+      let fileMime = 'image/jpeg';
+      bb.on('file', (_f, file, info) => {
+        fileMime = info.mimeType || fileMime;
+        const chunks = [];
+        file.on('data', d => chunks.push(d));
+        file.on('end', () => { fileBuffer = Buffer.concat(chunks); });
+      });
+      bb.on('close', () => resolve({ buffer: fileBuffer, mime: fileMime }));
+      bb.on('error', reject);
+      req.pipe(bb);
+    });
+
+    if (!fileData.buffer || fileData.buffer.length === 0) {
+      return res.status(400).json({ error: 'Archivo vacío' });
+    }
+
+    // Obtener user_id de la aplicación
+    const { data: app } = await supabase
+      .from('kyc_verifications')
+      .select('user_id')
+      .eq('id', id)
+      .maybeSingle();
+    if (!app) return res.status(404).json({ error: 'Aplicación no encontrada' });
+
+    const ext = fileData.mime?.includes('png') ? 'png'
+              : fileData.mime?.includes('pdf') ? 'pdf' : 'jpg';
+    const storagePath = `kyc/${app.user_id}/admin/${docType}_${Date.now()}.${ext}`;
+
+    const { error: uploadErr } = await supabase.storage
+      .from('chat-files')
+      .upload(storagePath, fileData.buffer, { contentType: fileData.mime, upsert: true });
+
+    if (uploadErr) return res.status(500).json({ error: 'Error Storage: ' + uploadErr.message });
+
+    const { data: urlData } = supabase.storage.from('chat-files').getPublicUrl(storagePath);
+    const publicUrl = urlData?.publicUrl;
+    if (!publicUrl) return res.status(500).json({ error: 'No se pudo generar URL' });
+
+    // Guardar en kyc_documents
+    const fieldMap = { front: 'front_image_url', back: 'back_image_url', selfie: 'selfie_url' };
+    const field = fieldMap[docType];
+
+    const { data: existingDoc } = await supabase
+      .from('kyc_documents')
+      .select('id')
+      .eq('application_id', id)
+      .maybeSingle();
+
+    if (existingDoc) {
+      await supabase.from('kyc_documents')
+        .update({ [field]: publicUrl, updated_at: new Date().toISOString() })
+        .eq('application_id', id);
+    } else {
+      await supabase.from('kyc_documents')
+        .insert({ application_id: id, [field]: publicUrl });
+    }
+
+    // Registrar en audit log
+    await supabase.from('kyc_audit_log').insert({
+      application_id: id,
+      action:         `ADMIN_UPLOAD_${docType.toUpperCase()}`,
+      performed_by:   'admin',
+      performed_role: 'COMPLIANCE_OFFICER',
+      details:        { doc_type: docType, url: publicUrl },
+    }).catch(() => {});
+
+    res.json({ success: true, url: publicUrl, doc_type: docType });
+  } catch (err) {
+    console.error('[Admin upload-doc]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Acciones KYC (aprobar, rechazar, bloquear, request-info) ─────
 app.post('/api/v1/admin/kyc/:id/approve', async (req, res) => {
   try {
