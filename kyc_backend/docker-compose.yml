@@ -1,0 +1,54 @@
+# ══════════════════════════════════════════════════════════════════
+# Docker Compose — desarrollo local con hot-reload
+# Para producción: usar Dockerfile directamente o plataforma PaaS
+# ══════════════════════════════════════════════════════════════════
+version: "3.9"
+
+services:
+  kyc-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder   # stage builder para desarrollo con deps instaladas
+    image: egchat-kyc-api:dev
+    container_name: egchat-kyc-api
+    restart: unless-stopped
+    ports:
+      - "8001:8000"    # puerto 8001 local → 8000 interno (no colisiona con Render API 5000)
+    volumes:
+      # Hot-reload: montar código fuente
+      - ./app:/app/app:ro
+    env_file:
+      - .env
+    environment:
+      - DEBUG=true
+      - ENVIRONMENT=development
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --log-level debug
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ── Base de datos local (solo desarrollo sin Supabase) ──────────
+  # Comentar si usas Supabase directamente
+  # db:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_USER: egchat
+  #     POSTGRES_PASSWORD: egchat_dev
+  #     POSTGRES_DB: egchat_kyc
+  #   ports:
+  #     - "5433:5432"
+  #   volumes:
+  #     - pgdata:/var/lib/postgresql/data
+  #     - ../migrations:/docker-entrypoint-initdb.d:ro
+
+# volumes:
+#   pgdata:
