@@ -9743,12 +9743,12 @@ app.get('/admin/kyc/stats', async (req, res) => {
 
     // SAR vencidos (>72h sin enviar)
     const deadlineCutoff = new Date(Date.now() - 72 * 3600 * 1000).toISOString();
-    const { count: sarOverdue } = await supabase
+    const sarRes = await supabase
       .from('suspicious_activity_reports')
       .select('id', { count: 'exact', head: true })
       .not('status', 'in', '("SENT_TO_ANIF","ACKNOWLEDGED","CLOSED")')
-      .lt('detected_at', deadlineCutoff)
-      .catch(() => ({ count: 0 }));
+      .lt('detected_at', deadlineCutoff);
+    const sarOverdue = sarRes.count ?? 0;
 
     res.json({
       total_applications:        total.count        ?? 0,
@@ -9842,20 +9842,26 @@ app.get('/api/v1/admin/kyc/:id', async (req, res) => {
 
     if (error || !app) return res.status(404).json({ error: 'NOT_FOUND', message: 'Solicitud KYC no encontrada' });
 
-    const { data: pd } = await supabase
-      .from('kyc_personal_data')
-      .select('*')
-      .eq('application_id', req.params.id)
-      .maybeSingle().catch(() => ({ data: null }));
+    // Supabase v2: no .catch() on builder — use await + fallback on error
+    const [pdRes, docRes, screeningRes] = await Promise.all([
+      supabase.from('kyc_personal_data').select('*').eq('application_id', req.params.id).maybeSingle(),
+      supabase.from('kyc_documents').select('*').eq('application_id', req.params.id).maybeSingle(),
+      supabase.from('kyc_screening_results').select('*').eq('application_id', req.params.id),
+    ]);
 
-    const { data: screening } = await supabase
-      .from('kyc_screening_results')
-      .select('*')
-      .eq('application_id', req.params.id)
-      .catch(() => ({ data: [] }));
+    const pd        = pdRes.data        || null;
+    const doc       = docRes.data       || null;
+    const screening = screeningRes.data || [];
+
+    // Calcular días hasta expiración del documento
+    const docExpiry     = pd?.doc_expiry_date || doc?.doc_expiry_date || null;
+    const daysToExpiry  = docExpiry
+      ? Math.ceil((new Date(docExpiry) - new Date()) / (1000 * 60 * 60 * 24))
+      : null;
 
     res.json({
       id:               app.id,
+      application_id:   app.id,
       session_id:       app.session_id,
       status:           app.status,
       risk_level:       app.risk_level || 'low',
@@ -9870,21 +9876,30 @@ app.get('/api/v1/admin/kyc/:id', async (req, res) => {
       created_at:       app.created_at,
       user_id:          app.user_id,
       user_phone:       app.users?.phone,
-      full_name:        pd?.full_name   || app.full_name,
-      nationality:      pd?.nationality || app.nationality,
-      birth_date:       pd?.date_of_birth || app.birth_date,
-      profession:       pd?.profession,
-      source_of_funds:  pd?.source_of_funds,
-      politically_exposed: pd?.politically_exposed,
-      doc_type:         app.doc_type,
-      doc_number:       app.doc_number,
-      doc_front_url:    app.doc_front_url ? '[CIFRADO]' : null,
-      doc_back_url:     app.doc_back_url  ? '[CIFRADO]' : null,
-      selfie_url:       app.selfie_url    ? '[CIFRADO]' : null,
-      ocr_confidence:   null,
-      face_match_score: null,
-      liveness_passed:  null,
-      screening_results: (screening || []).map(s => ({
+      wallet_kyc_status: app.users?.wallet_kyc_status || null,
+      full_name:        pd?.full_name        || app.full_name,
+      nationality:      pd?.nationality      || app.nationality,
+      birth_date:       pd?.date_of_birth    || app.birth_date,
+      profession:       pd?.profession       || null,
+      employer:         pd?.employer         || null,
+      monthly_income_range: pd?.monthly_income_range || null,
+      source_of_funds:  pd?.source_of_funds  || null,
+      politically_exposed: pd?.politically_exposed || false,
+      // Documento
+      doc_type:         pd?.doc_type         || app.doc_type         || doc?.document_type || null,
+      doc_number:       pd?.doc_number       || app.doc_number       || null,
+      doc_expiry_date:  docExpiry,
+      days_to_expiry:   daysToExpiry,
+      doc_expiry_warning: daysToExpiry !== null && daysToExpiry <= 90,
+      // Biometría (desde kyc_documents)
+      ocr_confidence:   doc?.ocr_confidence  || null,
+      face_match_score: doc?.face_match_score || null,
+      liveness_passed:  doc?.liveness_passed  ?? null,
+      // URLs cifradas (no se exponen)
+      has_front_doc:    !!(doc?.front_image_url || app.doc_front_url),
+      has_back_doc:     !!(doc?.back_image_url  || app.doc_back_url),
+      has_selfie:       !!(doc?.selfie_url       || app.selfie_url),
+      screening_results: screening.map(s => ({
         id:             s.id,
         screening_type: s.screening_type,
         provider:       s.provider || 'internal',
@@ -9910,8 +9925,7 @@ app.get('/api/v1/admin/kyc/:id/audit', async (req, res) => {
       .from('kyc_audit_log')
       .select('*')
       .eq('application_id', req.params.id)
-      .order('created_at', { ascending: true })
-      .catch(() => ({ data: [] }));
+      .order('created_at', { ascending: true });
 
     res.json({
       application_id: req.params.id,
