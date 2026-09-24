@@ -10395,7 +10395,8 @@ app.get('/admin/kyc/pending', async (req, res) => {
       .from('kyc_verifications')
       .select(`id, session_id, status, risk_level, risk_score, bank_decision,
                submitted_at, created_at, full_name, nationality, doc_type,
-               users:user_id (id, phone, status)`,
+               users:user_id (id, phone, status, full_name),
+               kyc_personal_data (full_name, nationality)`,
               { count: 'exact' })
       .in('status', statuses)
       .order('submitted_at', { ascending: true, nullsFirst: false })
@@ -10406,25 +10407,32 @@ app.get('/admin/kyc/pending', async (req, res) => {
     const { data, count, error } = await query;
     if (error) throw error;
 
-    const items = (data || []).map(a => ({
-      application_id:   a.id,
-      session_id:       a.session_id,
-      status:           a.status,
-      risk_level:       a.risk_level || 'low',
-      risk_score:       a.risk_score || 0,
-      bank_decision:    a.bank_decision,
-      submitted_at:     a.submitted_at,
-      created_at:       a.created_at,
-      user_phone:       a.users?.phone,
-      user_status:      a.users?.status,
-      full_name:        a.full_name,
-      nationality:      a.nationality,
-      document_type:    a.doc_type,
-      ocr_confidence:   null,
-      face_match_score: null,
-      liveness_passed:  null,
-      screening_hits:   0,
-    }));
+    const items = (data || []).map(a => {
+      // Prioridad del nombre: kyc_personal_data > kyc_verifications.full_name > users.full_name
+      const pd = Array.isArray(a.kyc_personal_data) ? a.kyc_personal_data[0] : a.kyc_personal_data;
+      const resolvedName = pd?.full_name || a.full_name || a.users?.full_name || null;
+      const resolvedNat  = pd?.nationality || a.nationality || null;
+
+      return {
+        application_id:   a.id,
+        session_id:       a.session_id,
+        status:           a.status,
+        risk_level:       a.risk_level || 'low',
+        risk_score:       a.risk_score || 0,
+        bank_decision:    a.bank_decision,
+        submitted_at:     a.submitted_at,
+        created_at:       a.created_at,
+        user_phone:       a.users?.phone,
+        user_status:      a.users?.status,
+        full_name:        resolvedName,
+        nationality:      resolvedNat,
+        document_type:    a.doc_type,
+        ocr_confidence:   null,
+        face_match_score: null,
+        liveness_passed:  null,
+        screening_hits:   0,
+      };
+    });
 
     res.json({
       items,
