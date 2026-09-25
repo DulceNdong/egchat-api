@@ -3038,9 +3038,23 @@ app.post('/api/wallet/transfer/accept/:id', auth, async (req, res) => {
       .update({ status: 'completed' })
       .eq('user_id', transfer.sender_id).eq('type', 'hold').eq('status', 'pending');
 
-    // Notificar a ambos
-    emitToUser(String(transfer.sender_id), { type: 'transfer_accepted', transferId: transfer.id, amount: transfer.amount, ts: Date.now() });
+    // Obtener nombre del receptor para el mensaje push
+    const { data: recipientUser } = await supabase
+      .from('users').select('full_name, phone').eq('id', req.user.id).maybeSingle();
+    const recipientName = recipientUser?.full_name || recipientUser?.phone || 'El receptor';
+
+    // Notificar a ambos por SSE (app abierta)
+    emitToUser(String(transfer.sender_id), { type: 'transfer_accepted', transferId: transfer.id, amount: transfer.amount, recipientName, ts: Date.now() });
     emitToUser(String(req.user.id),        { type: 'wallet_updated', balance: newRecipientBalance, ts: Date.now() });
+
+    // Push al remitente (app cerrada / en background)
+    sendPushToUser(String(transfer.sender_id), {
+      title: '✅ Transferencia aceptada',
+      body: `${recipientName} aceptó tu transferencia de ${transfer.amount.toLocaleString('fr-FR')} XAF`,
+      notificationType: 'transfer_accepted',
+      transferId: transfer.id,
+      amount: transfer.amount,
+    }).catch(() => {});
 
     res.json({ success: true, balance: newRecipientBalance, message: 'Transferencia aceptada' });
   } catch (e) {
@@ -3077,11 +3091,27 @@ app.post('/api/wallet/transfer/cancel/:id', auth, async (req, res) => {
       .update({ status: 'cancelled' })
       .eq('user_id', transfer.sender_id).eq('type', 'hold').eq('status', 'pending');
 
-    // Notificar al remitente que le devolvieron el dinero
+    // Notificar al remitente que le devolvieron el dinero (SSE + push)
+    // Obtener nombre de quien canceló (puede ser el receptor u otro usuario)
+    const { data: cancellerUser } = await supabase
+      .from('users').select('full_name, phone').eq('id', req.user.id).maybeSingle();
+    const cancellerName = cancellerUser?.full_name || cancellerUser?.phone || 'El receptor';
+
+    // SSE (app abierta)
     emitToUser(String(transfer.sender_id), {
       type: 'transfer_cancelled', transferId: transfer.id, amount: transfer.amount,
-      balance: newSenderBalance, ts: Date.now(),
+      balance: newSenderBalance, cancellerName, ts: Date.now(),
     });
+
+    // Push (app cerrada / en background)
+    sendPushToUser(String(transfer.sender_id), {
+      title: '❌ Transferencia rechazada',
+      body: `${cancellerName} rechazó tu transferencia de ${transfer.amount.toLocaleString('fr-FR')} XAF. El dinero fue devuelto a tu monedero.`,
+      notificationType: 'transfer_cancelled',
+      transferId: transfer.id,
+      amount: transfer.amount,
+      balance: newSenderBalance,
+    }).catch(() => {});
 
     res.json({ success: true, message: 'Transferencia cancelada. El dinero ha sido devuelto.' });
   } catch (e) {
