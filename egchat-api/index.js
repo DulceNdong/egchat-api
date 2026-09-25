@@ -3090,6 +3090,49 @@ app.post('/api/wallet/transfer/cancel/:id', auth, async (req, res) => {
   }
 });
 
+// GET /api/wallet/pending-transfers — lista transferencias pendientes del usuario
+// Devuelve tanto las que el usuario debe aceptar (incoming) como las que él envió (outgoing)
+app.get('/api/wallet/pending-transfers', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Obtener nombres de usuarios relacionados para mostrar
+    const { data: rows, error } = await supabase
+      .from('pending_transfers')
+      .select(`
+        id, sender_id, recipient_id, amount, concept, status, expires_at, created_at, completed_at,
+        sender:users!pending_transfers_sender_id_fkey(id, full_name, phone, avatar_url),
+        recipient:users!pending_transfers_recipient_id_fkey(id, full_name, phone, avatar_url)
+      `)
+      .or(`sender_id.eq.${userId},recipient_id.eq.${userId}`)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const now = new Date();
+    const transfers = (rows || []).map(t => ({
+      id:           t.id,
+      direction:    t.recipient_id === userId ? 'incoming' : 'outgoing',
+      amount:       t.amount,
+      concept:      t.concept,
+      status:       t.status,
+      expiresAt:    t.expires_at,
+      createdAt:    t.created_at,
+      isExpired:    new Date(t.expires_at) < now,
+      senderName:   t.sender?.full_name || t.sender?.phone || 'Usuario',
+      senderAvatar: t.sender?.avatar_url || null,
+      recipientName:   t.recipient?.full_name || t.recipient?.phone || 'Usuario',
+      recipientAvatar: t.recipient?.avatar_url || null,
+    }));
+
+    res.json({ transfers });
+  } catch (e) {
+    console.error('GET /api/wallet/pending-transfers error:', e);
+    res.status(500).json({ message: e.message || 'Error al obtener transferencias pendientes' });
+  }
+});
+
 app.post('/api/wallet/recharge-code', auth, async (req, res) => {
   const { code } = req.body;
   if (!code || code.replace(/-/g, '').length !== 16)
