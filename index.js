@@ -7013,20 +7013,36 @@ const djangueRoutes = require('./djangueRoutes');
 app.use('/api', djangueRoutes);
 
 // ── KYC Routes ──────────────────────────────────────────────────────
-const kycRoutes = require('./kyc/kycRoutes');
-app.use('/api/kyc', kycRoutes);
+try {
+  const kycRoutes = require('./egchat-api/kyc/kycRoutes');
+  app.use('/api/kyc', kycRoutes);
+} catch (e) {
+  console.log('[startup] kycRoutes no disponible:', e.message);
+}
 
 // ── AML Routes ──────────────────────────────────────────────────────
-const amlRoutes = require('./routes/aml');
-app.use('/api/aml', amlRoutes);
+try {
+  const amlRoutes = require('./routes/aml');
+  app.use('/api/aml', amlRoutes);
+} catch (e) {
+  console.log('[startup] amlRoutes no disponible:', e.message);
+}
 
 // ── Admin Auth Routes (login + 2FA + stats) ─────────────────────────
-const adminAuthRoutes = require('./routes/adminAuth');
-app.use('/api/admin', adminAuthRoutes);
+try {
+  const adminAuthRoutes = require('./routes/adminAuth');
+  app.use('/api/admin', adminAuthRoutes);
+} catch (e) {
+  console.log('[startup] adminAuthRoutes no disponible:', e.message);
+}
 
 // ── Updates server (Tauri auto-update) ──────────────────────────────
-const updatesRoutes = require('./routes/updates');
-app.use('/updates', updatesRoutes);
+try {
+  const updatesRoutes = require('./routes/updates');
+  app.use('/updates', updatesRoutes);
+} catch (e) {
+  console.log('[startup] updatesRoutes no disponible:', e.message);
+}
 
 if (require.main === module) {
   // El puerto ya está abierto desde el early bind arriba.
@@ -7084,28 +7100,27 @@ if (require.main === module) {
         }
       }
       console.log(`[migration] ✅ Completada: ${ok} OK, ${fail} skipped`);
+
+      // Crear tabla call_sessions si no existe
+      try {
+        await supabase.rpc('exec_sql', { sql: `
+          CREATE TABLE IF NOT EXISTS call_sessions (
+            call_id VARCHAR(100) PRIMARY KEY,
+            offer TEXT, answer TEXT,
+            caller_candidates TEXT DEFAULT '[]',
+            callee_candidates TEXT DEFAULT '[]',
+            type VARCHAR(10) DEFAULT 'audio',
+            caller_id TEXT NOT NULL,
+            target_user_id TEXT NOT NULL,
+            ended BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+          );
+        `}).catch(() => {});
+      } catch {}
     };
     setTimeout(runAutoMigration, 3000); // 3s después del arranque
-
-    // Crear tabla call_sessions si no existe
-    try {
-      await supabase.rpc('exec_sql', { sql: `
-        CREATE TABLE IF NOT EXISTS call_sessions (
-          call_id VARCHAR(100) PRIMARY KEY,
-          offer TEXT, answer TEXT,
-          caller_candidates TEXT DEFAULT '[]',
-          callee_candidates TEXT DEFAULT '[]',
-          type VARCHAR(10) DEFAULT 'audio',
-          caller_id TEXT NOT NULL,
-          target_user_id TEXT NOT NULL,
-          ended BOOLEAN DEFAULT FALSE,
-          created_at TIMESTAMPTZ DEFAULT NOW(),
-          updated_at TIMESTAMPTZ DEFAULT NOW()
-        );
-      `}).catch(() => {});
-    } catch {}
-  });
-  updateUserVersions();
+    updateUserVersions();
 }
 
 // ════════════════════════════════════════════════════════════════════
