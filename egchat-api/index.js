@@ -8119,56 +8119,52 @@ app.post('/api/kyc/application/:id/document', authenticateToken, async (req, res
   if (!image_data) return res.status(400).json({ error: 'image_data requerida' });
   try {
     // Subir imagen real a Supabase Storage
-    let storedImageUrl = `stored:${side}:${Date.now()}`;
+    let storedImageUrl = null;
     try {
-      // La app envía image_data en formato: "v1:checksum8:BASE64REAL"
-      // o en crudo "data:image/jpeg;base64,BASE64REAL"
-      // Extraer el base64 puro en cualquiera de los dos casos
       let base64Data = image_data;
       if (base64Data.startsWith('v1:')) {
-        // Formato nativo: v1:checksum8chars:BASE64REAL
-        // El formato es v1:8chars_checksum:rest
         const thirdColon = base64Data.indexOf(':', 3);
         base64Data = thirdColon !== -1 ? base64Data.slice(thirdColon + 1) : base64Data.slice(12);
       } else {
-        // Formato data URI: data:image/jpeg;base64,BASE64REAL
         base64Data = base64Data.replace(/^data:image\/[a-z]+;base64,/, '');
       }
-
       const imageBuffer = Buffer.from(base64Data, 'base64');
       if (imageBuffer.length < 100) throw new Error('Imagen vacía o inválida');
-      const ext = 'jpg'; // siempre JPG desde la app
-      const storagePath = `kyc/${req.user.id}/${id}/${side}_${Date.now()}.${ext}`;
+      const storagePath = `kyc/${req.user.id}/${id}/${side}_${Date.now()}.jpg`;
       const { error: uploadErr } = await supabase.storage
         .from('chat-files')
-        .upload(storagePath, imageBuffer, {
-          contentType: `image/${ext}`,
-          upsert: true,
-        });
+        .upload(storagePath, imageBuffer, { contentType: 'image/jpeg', upsert: true });
       if (!uploadErr) {
         const { data: urlData } = supabase.storage.from('chat-files').getPublicUrl(storagePath);
         if (urlData?.publicUrl) storedImageUrl = urlData.publicUrl;
       } else {
-        console.warn('[KYC] Storage upload error (non-fatal):', uploadErr.message);
+        console.warn('[KYC] Storage upload error:', uploadErr.message);
       }
     } catch (storageErr) {
-      console.warn('[KYC] Storage upload failed (non-fatal):', storageErr.message);
+      console.warn('[KYC] Storage upload failed:', storageErr.message);
     }
 
-    const ocr = await kycProviderFactory.withFallback('ocrDocument', {
-      documentType: document_type,
-      imageUrl: storedImageUrl,
-      side,
-      applicationId: id,
-    });
+    // OCR — opcional, no bloquea el flujo si falla
+    let ocrResult = { confidence: 0, provider: 'none', extracted: {} };
+    try {
+      ocrResult = await kycProviderFactory.withFallback('ocrDocument', {
+        documentType: document_type,
+        imageUrl: storedImageUrl || `stored:${side}:${Date.now()}`,
+        side,
+        applicationId: id,
+      });
+    } catch (ocrErr) {
+      console.warn('[KYC] OCR failed (non-fatal):', ocrErr.message);
+    }
 
-    // Try update first; if no row exists, insert.
+    // Guardar en kyc_documents (upsert)
     const updateFields = {
       [`${side}_image_url`]: storedImageUrl,
-      ocr_confidence: ocr.confidence,
-      ocr_raw_data: ocr,
+      ocr_confidence: ocrResult.confidence || 0,
+      ocr_raw_data: ocrResult,
       updated_at: new Date().toISOString(),
     };
+
     const { data: existing } = await supabase
       .from('kyc_documents')
       .select('id')
@@ -8180,25 +8176,20 @@ app.post('/api/kyc/application/:id/document', authenticateToken, async (req, res
         .from('kyc_documents')
         .update(updateFields)
         .eq('application_id', id);
-      if (updErr) throw updErr;
+      if (updErr) console.warn('[KYC] doc update error:', updErr.message);
     } else {
       const { error: insErr } = await supabase
         .from('kyc_documents')
-        .insert({
-          application_id: id,
-          document_type,
-          ...updateFields,
-        });
-      if (insErr) throw insErr;
+        .insert({ application_id: id, document_type: document_type || 'DNI', user_id: req.user.id, ...updateFields });
+      if (insErr) console.warn('[KYC] doc insert error:', insErr.message);
     }
 
-    res.json({ ok: true, ocrData: ocr.extracted || {}, confidence: ocr.confidence, provider: ocr.provider });
+    res.json({ ok: true, url: storedImageUrl, ocrData: ocrResult.extracted || {}, confidence: ocrResult.confidence || 0, provider: ocrResult.provider || 'none' });
   } catch (err) {
-    console.error('[KYC] uploadDocument:', err.message);
-    res.status(500).json({ error: 'Error al subir documento' });
+    console.error('[KYC] uploadDocument fatal:', err.message);
+    res.status(500).json({ error: 'Error al subir documento', details: err.message });
   }
 });
-
 // POST /api/kyc/application/:id/biometric — Selfie / face match
 app.post('/api/kyc/application/:id/biometric', authenticateToken, async (req, res) => {
   const { id } = req.params;
@@ -10655,30 +10646,69 @@ app.get('/api/v1/kyc/docs/:applicationId/signed-url', async (req, res) => {
 
     const fieldMap = { front: 'front_image_url', back: 'back_image_url', selfie: 'selfie_url' };
     const field = fieldMap[docType];
-    if (!field) return res.status(400).json({ error: 'doc_type inválido' });
+    if (!field) return res.status(400).json({ error: 'doc_type inválido. Usa: front, back o selfie' });
 
-    // 1. Buscar en kyc_documents (flujo nuevo — JSON base64 subido a Storage)
+    let rawUrl = null;
+
+    // 1. Buscar en kyc_documents (flujo app móvil v2 — POST /api/kyc/application/:id/document)
     const { data: doc } = await supabase
       .from('kyc_documents')
-      .select(field)
+      .select(`${field}, front_image_url, back_image_url, selfie_url`)
       .eq('application_id', applicationId)
       .maybeSingle();
 
-    let rawUrl = doc?.[field];
-
-    // 2. Si no hay en kyc_documents, buscar en kyc_verifications (flujo legado — FormData)
-    if (!rawUrl || !rawUrl.startsWith('http')) {
-      const legacyFieldMap = { front: 'doc_front_url', back: 'doc_back_url', selfie: 'selfie_url' };
-      const legacyField = legacyFieldMap[docType];
-      const { data: ver } = await supabase
-        .from('kyc_verifications')
-        .select(legacyField)
-        .eq('id', applicationId)
-        .maybeSingle();
-      rawUrl = ver?.[legacyField];
+    if (doc) {
+      rawUrl = doc[field];
+      // Si el campo específico está vacío, intentar con los alias
+      if (!rawUrl && docType === 'front')  rawUrl = doc.front_image_url;
+      if (!rawUrl && docType === 'back')   rawUrl = doc.back_image_url;
+      if (!rawUrl && docType === 'selfie') rawUrl = doc.selfie_url;
     }
 
-    // Si es una URL real de Supabase Storage, devolverla directamente
+    // 2. Si no hay en kyc_documents, buscar en kyc_verifications (flujo legado)
+    if (!rawUrl || rawUrl.startsWith('stored:') || rawUrl.startsWith('[CIFRADO]')) {
+      const legacyMap = { front: 'doc_front_url', back: 'doc_back_url', selfie: 'selfie_url' };
+      const { data: ver } = await supabase
+        .from('kyc_verifications')
+        .select(`${legacyMap[docType]}, doc_front_url, doc_back_url, selfie_url`)
+        .eq('id', applicationId)
+        .maybeSingle();
+      if (ver) {
+        rawUrl = ver[legacyMap[docType]] || ver.doc_front_url;
+      }
+    }
+
+    // 3. Buscar en chat-files Storage buscando por prefijo kyc/{userId}/{appId}
+    if (!rawUrl || rawUrl.startsWith('stored:') || rawUrl.startsWith('[CIFRADO]')) {
+      const sidePrefix = docType === 'selfie' ? 'selfie' : (docType === 'back' ? 'back' : 'front');
+      try {
+        // Obtener user_id del application
+        const { data: appData } = await supabase
+          .from('kyc_verifications')
+          .select('user_id')
+          .eq('id', applicationId)
+          .maybeSingle();
+
+        if (appData?.user_id) {
+          const prefix = `kyc/${appData.user_id}/${applicationId}/`;
+          const { data: files } = await supabase.storage.from('chat-files').list(prefix);
+          if (files && files.length > 0) {
+            // Encontrar el archivo que coincide con el tipo (front_, back_, selfie_)
+            const match = files
+              .filter(f => f.name.startsWith(sidePrefix))
+              .sort((a, b) => b.name.localeCompare(a.name))[0]; // más reciente
+            if (match) {
+              const { data: urlData } = supabase.storage.from('chat-files').getPublicUrl(`${prefix}${match.name}`);
+              if (urlData?.publicUrl) rawUrl = urlData.publicUrl;
+            }
+          }
+        }
+      } catch (listErr) {
+        console.warn('[KYC signed-url] Storage list error:', listErr.message);
+      }
+    }
+
+    // URL válida encontrada
     if (rawUrl && rawUrl.startsWith('http')) {
       return res.json({ url: rawUrl, expires_in: 300 });
     }
@@ -10686,6 +10716,7 @@ app.get('/api/v1/kyc/docs/:applicationId/signed-url', async (req, res) => {
     // Sin imagen disponible
     return res.status(404).json({ error: 'Imagen no disponible', url: null });
   } catch (e) {
+    console.error('[KYC signed-url error]', e.message);
     res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
   }
 });
@@ -11120,6 +11151,88 @@ app.get('/api/audit/export', requireAdminToken, async (req, res) => {
     }
 
     res.json({ items: rows, total: rows.length });
+  } catch (e) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+// ── Alertas de caducidad de documentos KYC ───────────────────────
+// GET /api/v1/kyc/expiry-alerts — lista usuarios con doc próximo a vencer
+app.get('/api/v1/kyc/expiry-alerts', async (req, res) => {
+  try {
+    if (!supabase) return res.json({ alerts: [] });
+    const days = parseInt(req.query.days) || 90; // alerta 90 días antes
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() + days);
+
+    const { data: docs } = await supabase
+      .from('kyc_documents')
+      .select('application_id, expiry_date, document_type, kyc_verifications:application_id(user_id, full_name, status)')
+      .not('expiry_date', 'is', null)
+      .lte('expiry_date', cutoff.toISOString().split('T')[0])
+      .gte('expiry_date', new Date().toISOString().split('T')[0]) // no vencidos ya
+      .catch(() => ({ data: [] }));
+
+    const alerts = (docs || []).map(d => {
+      const daysLeft = Math.round(
+        (new Date(d.expiry_date) - new Date()) / (1000 * 60 * 60 * 24)
+      );
+      return {
+        application_id: d.application_id,
+        user_id:        d.kyc_verifications?.user_id,
+        full_name:      d.kyc_verifications?.full_name,
+        kyc_status:     d.kyc_verifications?.status,
+        document_type:  d.document_type,
+        expiry_date:    d.expiry_date,
+        days_left:      daysLeft,
+        urgency:        daysLeft <= 15 ? 'critical' : daysLeft <= 30 ? 'high' : 'medium',
+      };
+    }).sort((a, b) => a.days_left - b.days_left);
+
+    res.json({ alerts, total: alerts.length });
+  } catch (e) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+// POST /api/v1/kyc/expiry-alerts/:userId/notify — enviar push al usuario
+app.post('/api/v1/kyc/expiry-alerts/:userId/notify', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { days_left, document_type } = req.body;
+    if (!supabase) return res.json({ sent: false });
+
+    // Obtener token push del usuario
+    const { data: tokenRow } = await supabase
+      .from('expo_push_tokens')
+      .select('token')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (!tokenRow?.token) return res.json({ sent: false, reason: 'No push token' });
+
+    const urgency  = days_left <= 15 ? 'URGENTE' : 'Aviso';
+    const title    = `${urgency}: Tu documento KYC caduca pronto`;
+    const body     = days_left <= 15
+      ? `⚠️ Tu ${document_type || 'documento'} caduca en ${days_left} días. Actualízalo ahora para seguir usando el monedero.`
+      : `📋 Tu ${document_type || 'documento'} caduca en ${days_left} días. Recuerda actualizarlo antes de que expire.`;
+
+    // Enviar push via Expo
+    const pushRes = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({
+        to:    tokenRow.token,
+        title,
+        body,
+        data:  { type: 'KYC_EXPIRY_ALERT', days_left, document_type },
+        sound: 'default',
+        priority: days_left <= 15 ? 'high' : 'normal',
+      }),
+    });
+
+    const pushData = await pushRes.json();
+    res.json({ sent: true, push_result: pushData });
   } catch (e) {
     res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
   }
