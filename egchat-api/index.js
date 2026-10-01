@@ -10536,7 +10536,8 @@ app.get('/api/v1/admin/kyc/:id', async (req, res) => {
     const screening = screeningRes.data || [];
 
     // Calcular días hasta expiración del documento
-    const docExpiry     = pd?.doc_expiry_date || doc?.doc_expiry_date || null;
+    // kyc_personal_data usa doc_expiry_date, kyc_documents usa expiry_date
+    const docExpiry = pd?.doc_expiry_date || doc?.expiry_date || doc?.doc_expiry_date || null;
     const daysToExpiry  = docExpiry
       ? Math.ceil((new Date(docExpiry) - new Date()) / (1000 * 60 * 60 * 24))
       : null;
