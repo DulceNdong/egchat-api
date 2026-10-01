@@ -8095,16 +8095,29 @@ app.put('/api/kyc/application/:id/financial', authenticateToken, async (req, res
   const { id } = req.params;
   const d = req.body;
   try {
+    const updatePd = {
+      profession:            d.profession,
+      employer:              d.employer || null,
+      monthly_income_range:  d.monthly_income_range,
+      source_of_funds:       d.source_of_funds || 'OTHER',
+    };
+    // Guardar fecha de expiración si viene
+    if (d.doc_expiry_date) updatePd.doc_expiry_date = d.doc_expiry_date;
+
     const { error } = await supabase
       .from('kyc_personal_data')
-      .update({
-        profession:            d.profession,
-        employer:              d.employer || null,
-        monthly_income_range:  d.monthly_income_range,
-        source_of_funds:       d.source_of_funds || 'OTHER',
-      })
+      .update(updatePd)
       .eq('application_id', id);
     if (error) throw error;
+
+    // También actualizar kyc_documents con la fecha de expiración si existe
+    if (d.doc_expiry_date) {
+      await supabase.from('kyc_documents')
+        .update({ expiry_date: d.doc_expiry_date })
+        .eq('application_id', id)
+        .catch(() => {});
+    }
+
     res.json({ ok: true });
   } catch (err) {
     console.error('[KYC] saveFinancial:', err.message);
