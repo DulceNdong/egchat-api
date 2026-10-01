@@ -38,7 +38,7 @@ const verifyToken = (token) => {
   }
   throw new Error('Token inválido o expirado');
 };
-const APP_VERSION = '2.6.5-FIX-FINANCIAL'; // fix financial+expiry+has_docs
+const APP_VERSION = '2.6.6-FIX-SOF-ARRAY'; // fix financial+expiry+has_docs
 const chatStreams = new Map();
 const dependencyCache = { timestamp: 0, result: null };
 
@@ -8096,10 +8096,13 @@ app.put('/api/kyc/application/:id/financial', authenticateToken, async (req, res
   const d = req.body;
   try {
     const updatePd = {
-      profession:            d.profession,
-      employer:              d.employer || null,
-      monthly_income_range:  d.monthly_income_range,
-      source_of_funds:       d.source_of_funds || 'OTHER',
+      profession:           d.profession || null,
+      employer:             d.employer   || null,
+      monthly_income_range: d.monthly_income_range || null,
+      // source_of_funds puede llegar como array o string — normalizar a string
+      source_of_funds: Array.isArray(d.source_of_funds)
+        ? (d.source_of_funds[0] || 'OTHER')
+        : (d.source_of_funds   || 'OTHER'),
     };
     // NOTA: doc_expiry_date NO existe en kyc_personal_data — se guarda en kyc_documents
 
