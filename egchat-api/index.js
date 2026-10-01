@@ -8101,8 +8101,7 @@ app.put('/api/kyc/application/:id/financial', authenticateToken, async (req, res
       monthly_income_range:  d.monthly_income_range,
       source_of_funds:       d.source_of_funds || 'OTHER',
     };
-    // Guardar fecha de expiración si viene
-    if (d.doc_expiry_date) updatePd.doc_expiry_date = d.doc_expiry_date;
+    // NOTA: doc_expiry_date NO existe en kyc_personal_data — se guarda en kyc_documents
 
     const { error } = await supabase
       .from('kyc_personal_data')
@@ -8110,12 +8109,26 @@ app.put('/api/kyc/application/:id/financial', authenticateToken, async (req, res
       .eq('application_id', id);
     if (error) throw error;
 
-    // También actualizar kyc_documents con la fecha de expiración si existe
+    // Guardar fecha de expiración en kyc_documents si viene
     if (d.doc_expiry_date) {
-      await supabase.from('kyc_documents')
-        .update({ expiry_date: d.doc_expiry_date })
+      const { data: docRow } = await supabase
+        .from('kyc_documents')
+        .select('id')
         .eq('application_id', id)
-        .catch(() => {});
+        .maybeSingle();
+
+      if (docRow) {
+        await supabase.from('kyc_documents')
+          .update({ expiry_date: d.doc_expiry_date })
+          .eq('application_id', id)
+          .catch(e => console.warn('[KYC] expiry update:', e.message));
+      } else {
+        // No hay documento aún — guardar en kyc_verifications como fallback
+        await supabase.from('kyc_verifications')
+          .update({ doc_expiry: d.doc_expiry_date })
+          .eq('id', id)
+          .catch(e => console.warn('[KYC] expiry fallback:', e.message));
+      }
     }
 
     res.json({ ok: true });
@@ -10525,6 +10538,19 @@ app.get('/admin/kyc/pending', async (req, res) => {
 });
 
 // ── Detalle KYC (para el dashboard) ──────────────────────────────
+// Helper: verificar si existe un archivo en Supabase Storage para un caso KYC
+async function checkStorageFile(supabase, userId, appId, side) {
+  if (!userId || !appId) return false;
+  try {
+    const prefix = `kyc/${userId}/${appId}/`;
+    const { data: files } = await supabase.storage.from('chat-files').list(prefix, { limit: 20 });
+    if (!files || !files.length) return false;
+    return files.some(f => f.name.startsWith(side));
+  } catch {
+    return false;
+  }
+}
+
 app.get('/api/v1/admin/kyc/:id', async (req, res) => {
   try {
     if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
@@ -10592,10 +10618,10 @@ app.get('/api/v1/admin/kyc/:id', async (req, res) => {
       ocr_confidence:   doc?.ocr_confidence  || null,
       face_match_score: doc?.face_match_score || null,
       liveness_passed:  doc?.liveness_passed  ?? null,
-      // Disponibilidad de imágenes (para el visor)
-      has_front_doc:    !!(doc?.front_image_url || app.doc_front_url),
-      has_back_doc:     !!(doc?.back_image_url  || app.doc_back_url),
-      has_selfie:       !!(doc?.selfie_url       || app.selfie_url),
+      // Disponibilidad de imágenes — busca en kyc_documents Y en Storage
+      has_front_doc:    !!(doc?.front_image_url || app.doc_front_url) || await checkStorageFile(supabase, app.user_id, req.params.id, 'front'),
+      has_back_doc:     !!(doc?.back_image_url  || app.doc_back_url)  || await checkStorageFile(supabase, app.user_id, req.params.id, 'back'),
+      has_selfie:       !!(doc?.selfie_url       || app.selfie_url)   || await checkStorageFile(supabase, app.user_id, req.params.id, 'selfie'),
       // URLs reales (si existen — para signed-url endpoint)
       // Busca en kyc_documents primero, luego en kyc_verifications (flujo legado)
       doc_front_url:    doc?.front_image_url?.startsWith('http') ? doc.front_image_url
