@@ -38,7 +38,7 @@ const verifyToken = (token) => {
   }
   throw new Error('Token inválido o expirado');
 };
-const APP_VERSION = '2.6.7-FIX-EXPIRY'; // fix financial+expiry+has_docs
+const APP_VERSION = '2.6.8-DEBUG-FINANCIAL'; // fix financial+expiry+has_docs
 const chatStreams = new Map();
 const dependencyCache = { timestamp: 0, result: null };
 
@@ -8136,8 +8136,8 @@ app.put('/api/kyc/application/:id/financial', authenticateToken, async (req, res
 
     res.json({ ok: true });
   } catch (err) {
-    console.error('[KYC] saveFinancial:', err.message);
-    res.status(500).json({ error: 'Error al guardar datos financieros' });
+    console.error('[KYC] saveFinancial:', err.message, err.stack?.split('\n')[1]);
+    res.status(500).json({ error: 'Error al guardar datos financieros', detail: err.message });
   }
 });
 
