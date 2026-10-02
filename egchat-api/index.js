@@ -38,7 +38,7 @@ const verifyToken = (token) => {
   }
   throw new Error('Token inválido o expirado');
 };
-const APP_VERSION = '2.7.0-DOC-FIELDS'; // fix financial+expiry+has_docs
+const APP_VERSION = '2.7.1-DOC-NUMBER'; // fix financial+expiry+has_docs
 const chatStreams = new Map();
 const dependencyCache = { timestamp: 0, result: null };
 
@@ -8195,6 +8195,10 @@ app.post('/api/kyc/application/:id/document', authenticateToken, async (req, res
       ocr_raw_data: ocrResult,
       updated_at: new Date().toISOString(),
     };
+    // Guardar número de documento si viene
+    if (d.document_number) updateFields.document_number = d.document_number;
+    // Guardar tipo de documento
+    if (d.document_type) updateFields.document_type = d.document_type.toUpperCase();
 
     const { data: existing } = await supabase
       .from('kyc_documents')
@@ -8213,6 +8217,15 @@ app.post('/api/kyc/application/:id/document', authenticateToken, async (req, res
         .from('kyc_documents')
         .insert({ application_id: id, document_type: document_type || 'DNI', user_id: req.user.id, ...updateFields });
       if (insErr) console.warn('[KYC] doc insert error:', insErr.message);
+    }
+
+    // Actualizar doc_number y doc_type en kyc_verifications si vienen
+    if (d.document_number || d.document_type) {
+      const verUpdate = {};
+      if (d.document_number) verUpdate.doc_number = d.document_number;
+      if (d.document_type)   verUpdate.doc_type   = d.document_type;
+      await supabase.from('kyc_verifications').update(verUpdate).eq('id', id)
+        .then(() => {}).catch(() => {});
     }
 
     res.json({ ok: true, url: storedImageUrl, ocrData: ocrResult.extracted || {}, confidence: ocrResult.confidence || 0, provider: ocrResult.provider || 'none' });
