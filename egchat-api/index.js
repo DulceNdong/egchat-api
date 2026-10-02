@@ -38,7 +38,7 @@ const verifyToken = (token) => {
   }
   throw new Error('Token inválido o expirado');
 };
-const APP_VERSION = '2.6.6-FIX-SOF-ARRAY'; // fix financial+expiry+has_docs
+const APP_VERSION = '2.6.7-FIX-EXPIRY'; // fix financial+expiry+has_docs
 const chatStreams = new Map();
 const dependencyCache = { timestamp: 0, result: null };
 
@@ -8112,25 +8112,25 @@ app.put('/api/kyc/application/:id/financial', authenticateToken, async (req, res
       .eq('application_id', id);
     if (error) throw error;
 
-    // Guardar fecha de expiración en kyc_documents si viene
+    // Guardar fecha de expiración directamente en kyc_verifications.doc_expiry (campo correcto)
     if (d.doc_expiry_date) {
+      // 1. Guardar en kyc_verifications (siempre existe)
+      await supabase.from('kyc_verifications')
+        .update({ doc_expiry: d.doc_expiry_date })
+        .eq('id', id)
+        .catch(e => console.warn('[KYC] expiry kycver:', e.message));
+
+      // 2. Si hay fila en kyc_documents, guardar también ahí (campo expiry_date)
       const { data: docRow } = await supabase
         .from('kyc_documents')
         .select('id')
         .eq('application_id', id)
         .maybeSingle();
-
       if (docRow) {
         await supabase.from('kyc_documents')
           .update({ expiry_date: d.doc_expiry_date })
           .eq('application_id', id)
-          .catch(e => console.warn('[KYC] expiry update:', e.message));
-      } else {
-        // No hay documento aún — guardar en kyc_verifications como fallback
-        await supabase.from('kyc_verifications')
-          .update({ doc_expiry: d.doc_expiry_date })
-          .eq('id', id)
-          .catch(e => console.warn('[KYC] expiry fallback:', e.message));
+          .catch(e => console.warn('[KYC] expiry docs:', e.message));
       }
     }
 
@@ -10578,8 +10578,8 @@ app.get('/api/v1/admin/kyc/:id', async (req, res) => {
     const screening = screeningRes.data || [];
 
     // Calcular días hasta expiración del documento
-    // kyc_personal_data usa doc_expiry_date, kyc_documents usa expiry_date
-    const docExpiry = pd?.doc_expiry_date || doc?.expiry_date || doc?.doc_expiry_date || null;
+    // kyc_verifications usa doc_expiry (DATE), kyc_documents usa expiry_date
+    const docExpiry = app.doc_expiry || doc?.expiry_date || null;
     const daysToExpiry  = docExpiry
       ? Math.ceil((new Date(docExpiry) - new Date()) / (1000 * 60 * 60 * 24))
       : null;
