@@ -1563,13 +1563,31 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
       const { data: sender } = await supabase
         .from('users').select('full_name').eq('id', req.user.id).single();
       const senderName = sender?.full_name || 'Alguien';
+      // Construir body descriptivo según el tipo de mensaje
+      const getMessageBody = (msg) => {
+        switch (msg.type) {
+          case 'text':   return msg.text || 'Nuevo mensaje';
+          case 'image':  return '📷 Foto';
+          case 'video':  return '🎥 Video';
+          case 'audio':  return '🎤 Mensaje de voz';
+          case 'file':   return `📄 ${msg.text || 'Documento'}`;
+          case 'sticker':return '😊 Sticker';
+          case 'gif':    return 'GIF';
+          case 'call':   return msg.text || '📞 Llamada';
+          case 'location': return '📍 Ubicación';
+          case 'contact':  return '👤 Contacto';
+          default:       return msg.text || 'Nuevo mensaje';
+        }
+      };
       const pushPayload = {
         title: senderName,
-        body: message.type === 'text' ? (message.text || 'Nuevo mensaje') : '📎 Archivo adjunto',
+        body: getMessageBody(message),
         icon: '/favicon.svg',
         tag: `chat-${chatId}`,
         url: '/',
         chatId,
+        messageType: message.type,
+        senderName,
       };
       await Promise.allSettled(otherUsers.map(uid => sendPushToUser(uid, pushPayload)));
     } catch {}
