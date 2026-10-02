@@ -38,7 +38,7 @@ const verifyToken = (token) => {
   }
   throw new Error('Token inválido o expirado');
 };
-const APP_VERSION = '2.7.1-DOC-NUMBER'; // fix financial+expiry+has_docs
+const APP_VERSION = '2.7.2-CORS-KYC-DASHBOARD'; // fix financial+expiry+has_docs
 const chatStreams = new Map();
 const dependencyCache = { timestamp: 0, result: null };
 
@@ -108,6 +108,7 @@ const corsOptions = {
     if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true);
     // Permitir cualquier subdominio de vercel.app (egchat-v2, egchat-app, etc.)
     if (/^https:\/\/egchat.*\.vercel\.app$/.test(origin)) return callback(null, true);
+    if (/^https:\/\/kyc-dashboard.*\.vercel\.app$/.test(origin)) return callback(null, true);
     return callback(new Error('CORS policy: origin not allowed'));
   },
   credentials: true,
