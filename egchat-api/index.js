@@ -38,7 +38,7 @@ const verifyToken = (token) => {
   }
   throw new Error('Token inválido o expirado');
 };
-const APP_VERSION = '2.6.9-FIX-CATCH'; // fix financial+expiry+has_docs
+const APP_VERSION = '2.7.0-DOC-FIELDS'; // fix financial+expiry+has_docs
 const chatStreams = new Map();
 const dependencyCache = { timestamp: 0, result: null };
 
@@ -11278,6 +11278,24 @@ app.post('/api/v1/kyc/expiry-alerts/:userId/notify', async (req, res) => {
 
     const pushData = await pushRes.json();
     res.json({ sent: true, push_result: pushData });
+  } catch (e) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+// PATCH /api/v1/admin/kyc/:id/doc-fields — actualizar tipo/número de documento
+app.patch('/api/v1/admin/kyc/:id/doc-fields', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'DB_UNAVAILABLE' });
+    const { id } = req.params;
+    const { doc_type, doc_number } = req.body;
+    const update = {};
+    if (doc_type)   update.doc_type   = doc_type;
+    if (doc_number) update.doc_number = doc_number;
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'Nada que actualizar' });
+    const { error } = await supabase.from('kyc_verifications').update(update).eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
   }
