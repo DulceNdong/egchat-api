@@ -38,7 +38,7 @@ const verifyToken = (token) => {
   }
   throw new Error('Token inválido o expirado');
 };
-const APP_VERSION = '2.6.8-DEBUG-FINANCIAL'; // fix financial+expiry+has_docs
+const APP_VERSION = '2.6.9-FIX-CATCH'; // fix financial+expiry+has_docs
 const chatStreams = new Map();
 const dependencyCache = { timestamp: 0, result: null };
 
@@ -8115,23 +8115,25 @@ app.put('/api/kyc/application/:id/financial', authenticateToken, async (req, res
     // Guardar fecha de expiración directamente en kyc_verifications.doc_expiry (campo correcto)
     if (d.doc_expiry_date) {
       // 1. Guardar en kyc_verifications (siempre existe)
-      await supabase.from('kyc_verifications')
-        .update({ doc_expiry: d.doc_expiry_date })
-        .eq('id', id)
-        .catch(e => console.warn('[KYC] expiry kycver:', e.message));
+      try {
+        await supabase.from('kyc_verifications')
+          .update({ doc_expiry: d.doc_expiry_date })
+          .eq('id', id);
+      } catch (e) { console.warn('[KYC] expiry kycver:', e.message); }
 
       // 2. Si hay fila en kyc_documents, guardar también ahí (campo expiry_date)
-      const { data: docRow } = await supabase
-        .from('kyc_documents')
-        .select('id')
-        .eq('application_id', id)
-        .maybeSingle();
-      if (docRow) {
-        await supabase.from('kyc_documents')
-          .update({ expiry_date: d.doc_expiry_date })
+      try {
+        const { data: docRow } = await supabase
+          .from('kyc_documents')
+          .select('id')
           .eq('application_id', id)
-          .catch(e => console.warn('[KYC] expiry docs:', e.message));
-      }
+          .maybeSingle();
+        if (docRow) {
+          await supabase.from('kyc_documents')
+            .update({ expiry_date: d.doc_expiry_date })
+            .eq('application_id', id);
+        }
+      } catch (e) { console.warn('[KYC] expiry docs:', e.message); }
     }
 
     res.json({ ok: true });
