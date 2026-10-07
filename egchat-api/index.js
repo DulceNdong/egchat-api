@@ -11354,10 +11354,6 @@ app.patch('/api/v1/admin/kyc/:id/doc-fields', async (req, res) => {
 // VoIP PUSH (APNs PushKit) — Llamadas iOS con app cerrada v2.8.0
 // ══════════════════════════════════════════════════════════════════
 
-const https = require('https');
-const crypto = require('crypto');
-const fs = require('fs');
-
 let _apnsJwt = null;
 let _apnsJwtTs = 0;
 
