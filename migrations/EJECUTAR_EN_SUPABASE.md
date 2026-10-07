@@ -62,3 +62,46 @@ Crea:
   ALTER TABLE djangue_penalties ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'wallet';
   ```
 - El INSERT de canales y stickers usa `ON CONFLICT DO NOTHING` — seguro ejecutar múltiples veces.
+
+---
+
+## Módulo Monetización (Dashboard Revenue)
+
+### PASO 4 — Tablas base de monetización
+**Archivo:** `010_monetizacion.sql`
+
+Crea:
+- `monetizacion_empresas` — empresas con cuota mensual + comisión 1.5%
+- `monetizacion_taxistas` — taxistas con documentación y comisión 5%
+- `monetizacion_taxista_viajes` — viajes con trigger de comisión
+- `monetizacion_taxista_horas` — horas activas
+- `monetizacion_barcos` + `monetizacion_billetes` — barcos con comisión 1%
+- `monetizacion_wallet_movimientos` — comisión 0.5% monedero
+- `monetizacion_resumen_mensual` — resumen por categoría y mes
+- `perfiles_financieros_usuarios` + `perfiles_financieros_negocios` — scores financieros
+- `historial_transacciones_usuarios` + `historial_transacciones_negocios`
+- Vistas: `v_ingresos_mensuales`, `v_taxistas_documentacion`
+- RLS policies para admin y usuarios
+- Datos demo: 7 empresas, 4 barcos, resúmenes 6 meses
+
+### PASO 5 — Tablas de revenue por servicios
+**Archivo:** `011_servicios_revenue.sql`
+
+Crea:
+- `revenue_servicios` — catálogo de 49 servicios en 15 categorías
+- `revenue_transacciones` — transacciones con trigger comisión 1.5%
+- `revenue_resumen_diario` — resumen diario por categoría
+- Vistas: `v_revenue_por_categoria`, `v_revenue_diario_30`, `v_top_servicios_mes`
+- Datos demo: 180 días de histórico por cada categoría
+
+### PASO 6 — Usuario admin del Portal Monetización
+**Archivo:** `012_admin_monetizacion.sql`
+
+Crea:
+- Amplía constraint `entity` en `admin_users` para incluir `MONETIZACION`
+- Inserta usuario admin:
+  - **Email:** `admin.monetizacion@egchat.gq`
+  - **Password:** `EGChat2026!$Admin`
+  - **Rol:** `MONETIZACION_ADMIN`
+
+**Dashboard:** http://localhost:5174 → 💰 Portal Monetización
