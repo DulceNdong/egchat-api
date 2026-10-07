@@ -5849,8 +5849,22 @@ app.post('/api/call/offer', auth, async (req, res) => {
           notificationType: 'incoming_call',
         };
 
-        // Enviar push inmediatamente — una sola vez
-        // (el SW tiene requireInteraction:true, la notificación no desaparece sola)
+        // 1️⃣ VoIP push (iOS PushKit) — despierta la app aunque esté cerrada
+        //    Se envía PRIMERO porque tiene latencia 0 y es el canal correcto para llamadas
+        try {
+          await sendVoipPushToUser({
+            targetUserId,
+            callId,
+            callerName,
+            callerAvatar: caller?.avatar_url || '',
+            callType: type || 'audio',
+            offer,
+          });
+        } catch (voipErr) {
+          console.warn('[VoIP] VoIP push failed:', voipErr.message);
+        }
+
+        // 2️⃣ Expo push — fallback para Android y iOS sin VoIP token
         await sendPushToUser(targetUserId, callPushPayload);
 
       } catch (pushErr) {
