@@ -8176,5 +8176,176 @@ app.post('/api/push/register-expo-token', auth, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════
+// VoIP PUSH (APNs PushKit) — Llamadas iOS con app cerrada
+// ══════════════════════════════════════════════════════════════════
+
+const https = require('https');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+// ── Generar JWT para APNs ─────────────────────────────────────────
+let _apnsJwt = null;
+let _apnsJwtTs = 0;
+
+function getApnsJwt() {
+  const now = Math.floor(Date.now() / 1000);
+  // Reusar JWT si tiene menos de 45 minutos (Apple requiere < 60min)
+  if (_apnsJwt && (now - _apnsJwtTs) < 45 * 60) return _apnsJwt;
+
+  const APNS_KEY_ID  = process.env.APNS_KEY_ID  || 'RCYN4AG5PM';
+  const APNS_TEAM_ID = process.env.APNS_TEAM_ID || 'XU6YD7ZJ2K';
+  const APNS_KEY_PATH = process.env.APNS_KEY_PATH || '/etc/secrets/AuthKey_RCYN4AG5PM.p8';
+
+  let privateKey;
+  try {
+    // En Render: montar el .p8 como secret file en /etc/secrets/
+    privateKey = fs.readFileSync(APNS_KEY_PATH, 'utf8');
+  } catch (e) {
+    // Fallback: variable de entorno con contenido del .p8
+    privateKey = process.env.APNS_PRIVATE_KEY || '';
+    if (!privateKey) {
+      console.error('[APNs] No se encontró la clave privada APNs. Configura APNS_PRIVATE_KEY en Render.');
+      return null;
+    }
+  }
+
+  const header  = Buffer.from(JSON.stringify({ alg: 'ES256', kid: APNS_KEY_ID })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ iss: APNS_TEAM_ID, iat: now })).toString('base64url');
+  const sigInput = `${header}.${payload}`;
+
+  const sign = crypto.createSign('SHA256');
+  sign.update(sigInput);
+  const sig = sign.sign({ key: privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url');
+
+  _apnsJwt = `${sigInput}.${sig}`;
+  _apnsJwtTs = now;
+  return _apnsJwt;
+}
+
+// ── Enviar VoIP push via APNs HTTP/2 ─────────────────────────────
+async function sendVoipPush({ deviceToken, payload }) {
+  return new Promise((resolve, reject) => {
+    const jwt = getApnsJwt();
+    if (!jwt) return reject(new Error('APNs JWT no disponible'));
+
+    const BUNDLE_ID = process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat';
+    const body = JSON.stringify(payload);
+
+    const options = {
+      hostname: 'api.push.apple.com',
+      port: 443,
+      path: `/3/device/${deviceToken}`,
+      method: 'POST',
+      headers: {
+        'authorization': `bearer ${jwt}`,
+        'apns-push-type': 'voip',
+        'apns-topic': `${BUNDLE_ID}.voip`,
+        'apns-priority': '10',
+        'apns-expiration': String(Math.floor(Date.now() / 1000) + 30),
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          resolve({ ok: true });
+        } else {
+          try { reject(new Error(`APNs ${res.statusCode}: ${JSON.parse(data).reason}`)); }
+          catch { reject(new Error(`APNs ${res.statusCode}: ${data}`)); }
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('APNs timeout')); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── POST /api/push/register-voip-token ───────────────────────────
+// La app iOS registra su token PushKit aquí al arrancar
+app.post('/api/push/register-voip-token', auth, async (req, res) => {
+  try {
+    const { voipToken } = req.body;
+    if (!voipToken || typeof voipToken !== 'string') {
+      return res.status(400).json({ message: 'voipToken requerido' });
+    }
+    await supabase.from('voip_push_tokens').upsert({
+      user_id: req.user.id,
+      token: voipToken,
+      platform: 'ios',
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'user_id' });
+    console.log(`[VoIP] Token registrado para user ${req.user.id}: ...${voipToken.slice(-8)}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[VoIP] register-voip-token error:', e.message);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/push/voip-call ──────────────────────────────────────
+// Envía VoIP push a un usuario específico (usado internamente y desde mobile)
+app.post('/api/push/voip-call', auth, async (req, res) => {
+  try {
+    const { targetUserId, callId, callerName, callerAvatar, callType, offer } = req.body;
+    if (!targetUserId || !callId) {
+      return res.status(400).json({ message: 'targetUserId y callId requeridos' });
+    }
+    const result = await sendVoipPushToUser({
+      targetUserId, callId, callerName, callerAvatar, callType, offer,
+    });
+    res.json(result);
+  } catch (e) {
+    console.error('[VoIP] voip-call error:', e.message);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── Helper: enviar VoIP push a un usuario ────────────────────────
+async function sendVoipPushToUser({ targetUserId, callId, callerName, callerAvatar, callType, offer }) {
+  const { data: tokens } = await supabase
+    .from('voip_push_tokens')
+    .select('token')
+    .eq('user_id', targetUserId);
+
+  if (!tokens || tokens.length === 0) {
+    console.log(`[VoIP] Sin token VoIP para user ${targetUserId} — usando Expo push como fallback`);
+    return { voipPushSent: false, expoPushSent: false };
+  }
+
+  const voipPayload = {
+    aps: {
+      'content-available': 1,
+    },
+    callId,
+    callerName: callerName || 'EGChat',
+    callerAvatar: callerAvatar || '',
+    callType: callType || 'audio',
+    offer: offer ? JSON.stringify(offer) : null,
+    targetUserId,
+  };
+
+  const results = await Promise.allSettled(
+    tokens.map(({ token }) => sendVoipPush({ deviceToken: token, payload: voipPayload }))
+  );
+
+  const sent = results.filter(r => r.status === 'fulfilled').length;
+  const failed = results.filter(r => r.status === 'rejected');
+  if (failed.length > 0) {
+    failed.forEach(f => console.warn('[VoIP] Push failed:', f.reason?.message));
+  }
+
+  console.log(`[VoIP] Sent ${sent}/${tokens.length} VoIP pushes para user ${targetUserId}`);
+  return { voipPushSent: sent > 0, expoPushSent: false };
+}
+
 module.exports = app;
 
