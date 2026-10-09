@@ -591,6 +591,8 @@ app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'Sesión ce
 // El PIN se almacena como SHA-256 en la columna pin_hash de users.
 
 const crypto = require('crypto');
+const fs = require('fs');
+const https = require('https');
 const KYCProviderFactory = require('./kyc/KYCProviderFactory');
 const { calculateRiskScore } = require('./kyc/KYCScoringEngine');
 const kycProviderFactory = new KYCProviderFactory();
@@ -6921,12 +6923,20 @@ const sendPushToUser = async (userId, payload) => {
     }
 
     // ── Expo Push (app movil nativa — funciona con telefono hibernado) ────
-    const { data: expoSubs } = await supabase
+    const { data: pushTokens } = await supabase
       .from('expo_push_tokens')
-      .select('token')
+      .select('token, platform')
       .eq('user_id', userId);
 
-    if (expoSubs && expoSubs.length > 0) {
+    const fcmSubs = (pushTokens || []).filter(sub => sub.platform === 'android' && !String(sub.token || '').startsWith('ExponentPushToken'));
+    const apnsSubs = (pushTokens || []).filter(sub => sub.platform === 'ios' && !String(sub.token || '').startsWith('ExponentPushToken'));
+    const expoSubs = (pushTokens || []).filter(sub => {
+      if (!String(sub.token || '').startsWith('ExponentPushToken')) return false;
+      // Para una llamada Android priorizamos el canal FCM data-only nativo.
+      return !isCall || !fcmSubs.length || sub.platform !== 'android';
+    });
+
+    if (expoSubs.length > 0) {
       const expoMessages = expoSubs.map(sub => ({
         to: sub.token,
         title: payload.title || 'EGChat',
@@ -6964,28 +6974,120 @@ const sendPushToUser = async (userId, payload) => {
         }
       }
     }
+
+    if (fcmSubs.length > 0) {
+      await sendFcmPushes(fcmSubs.map(sub => sub.token), payload);
+    }
+
+    if (apnsSubs.length > 0) {
+      await Promise.allSettled(apnsSubs.map(sub => sendApnsAlertPush(sub.token, payload)));
+    }
   } catch (e) {
     console.error('sendPushToUser error:', e.message);
   }
 };
 
+let firebaseMessaging = null;
+function getFirebaseMessaging() {
+  if (firebaseMessaging) return firebaseMessaging;
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!raw) return null;
+  try {
+    const admin = require('firebase-admin');
+    const credentials = JSON.parse(raw);
+    if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(credentials) });
+    firebaseMessaging = admin.messaging();
+    return firebaseMessaging;
+  } catch (error) {
+    console.error('[FCM] Credenciales inválidas:', error.message);
+    return null;
+  }
+}
+
+async function sendFcmPushes(tokens, payload) {
+  const messaging = getFirebaseMessaging();
+  if (!messaging) {
+    console.warn('[FCM] FIREBASE_SERVICE_ACCOUNT_JSON no configurado; no se puede entregar push directo Android.');
+    return { sent: 0, failed: tokens.length, configured: false };
+  }
+
+  const isCall = payload.notificationType === 'incoming_call';
+  const data = Object.entries(payload).reduce((result, [key, value]) => {
+    if (value !== undefined && value !== null) result[key] = typeof value === 'string' ? value : JSON.stringify(value);
+    return result;
+  }, {});
+
+  const results = await Promise.allSettled(tokens.map(token => messaging.send({
+    token,
+    data,
+    android: {
+      priority: isCall ? 'high' : 'normal',
+      ttl: isCall ? 120000 : 86400000,
+      ...(isCall ? {} : {
+        notification: {
+          channelId: 'egchat-messages',
+          sound: 'notification',
+          notificationPriority: 'PRIORITY_HIGH',
+        },
+      }),
+    },
+  })));
+  const failedTokens = results
+    .map((result, index) => ({ result, token: tokens[index] }))
+    .filter(({ result }) => result.status === 'rejected' && /registration-token-not-registered|invalid-registration-token/.test(String(result.reason?.code || '')))
+    .map(({ token }) => token);
+  if (failedTokens.length) await supabase.from('expo_push_tokens').delete().in('token', failedTokens);
+  return { sent: results.filter(result => result.status === 'fulfilled').length, failed: results.filter(result => result.status === 'rejected').length, configured: true };
+}
+
 // ── Registrar token Expo Push (app movil nativa) ──────────────────────────
 app.post('/api/push/register-expo-token', auth, async (req, res) => {
   try {
-    const { expoPushToken, platform } = req.body;
-    if (!expoPushToken || !expoPushToken.startsWith('ExponentPushToken[')) {
-      return res.status(400).json({ message: 'Token Expo invalido' });
+    const { expoPushToken, platform, tokenType } = req.body;
+    const token = expoPushToken || req.body.token;
+    if (!token || typeof token !== 'string' || token.length < 10) {
+      return res.status(400).json({ message: 'Token push inválido' });
     }
     await supabase.from('expo_push_tokens').upsert({
       user_id: req.user.id,
-      token: expoPushToken,
+      token,
       platform: platform || 'android',
       updated_at: new Date().toISOString(),
     }, { onConflict: 'token' });
-    res.json({ message: 'Token registrado' });
+    res.json({
+      message: 'Token registrado',
+      tokenType: tokenType || (token.startsWith('ExponentPushToken') ? 'expo' : platform === 'ios' ? 'apns' : 'fcm'),
+    });
   } catch (e) {
     console.error('Expo token register error:', e.message);
     res.status(500).json({ message: e.message });
+  }
+});
+
+// Estado de diagnóstico para el usuario autenticado. No entrega tokens ni secretos.
+app.get('/api/push/status', auth, async (req, res) => {
+  try {
+    const { data: tokens, error } = await supabase
+      .from('expo_push_tokens')
+      .select('platform, updated_at')
+      .eq('user_id', req.user.id);
+    if (error) throw error;
+    const { count: voipTokenCount, error: voipError } = await supabase
+      .from('voip_push_tokens')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', req.user.id);
+    res.json({
+      tokenCount: tokens?.length || 0,
+      platforms: [...new Set((tokens || []).map(token => token.platform || 'unknown'))],
+      voipTokenRegistered: !voipError && (voipTokenCount || 0) > 0,
+      delivery: {
+        fcmDirectConfigured: Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.FIREBASE_SERVICE_ACCOUNT),
+        apnsConfigured: Boolean(process.env.APNS_PRIVATE_KEY || process.env.APNS_KEY_PATH),
+        apnsBundleId: process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat',
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 });
 
@@ -9674,29 +9776,6 @@ app.post('/api/push/register', auth, async (req, res) => {
   }
 });
 
-// ── POST /api/push/register-expo-token — Alias para compatibilidad ─
-app.post('/api/push/register-expo-token', auth, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { expoPushToken } = req.body;
-
-    if (!expoPushToken || !Expo.isExpoPushToken(expoPushToken)) {
-      return res.status(400).json({ message: 'Token Expo Push inválido' });
-    }
-
-    // Insertar o actualizar token
-    await supabase.from('expo_push_tokens').upsert({
-      user_id: userId,
-      token: expoPushToken,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'user_id,token' });
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
 // ══════════════════════════════════════════════════════════════════
 // DJANGUE — Rutas faltantes (v2)
 // ══════════════════════════════════════════════════════════════════
@@ -11435,6 +11514,53 @@ async function sendVoipPush({ deviceToken, payload }) {
     req.setTimeout(10000, () => { req.destroy(); reject(new Error('APNs timeout')); });
     req.write(body);
     req.end();
+  });
+}
+
+function sendApnsAlertPush(deviceToken, payload) {
+  return new Promise((resolve, reject) => {
+    const jwt = getApnsJwt();
+    if (!jwt) return reject(new Error('APNs JWT no disponible'));
+    const bundleId = process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat';
+    const isCall = payload.notificationType === 'incoming_call';
+    const extra = Object.entries(payload).reduce((result, [key, value]) => {
+      if (value !== undefined && value !== null) result[key] = value;
+      return result;
+    }, {});
+    const body = JSON.stringify({
+      aps: {
+        alert: { title: payload.title || 'EGCHAT', body: payload.body || 'Nueva notificación' },
+        sound: isCall ? 'default' : 'notification.wav',
+        badge: isCall ? undefined : 1,
+        'content-available': 1,
+      },
+      ...extra,
+    });
+    const request = https.request({
+      hostname: 'api.push.apple.com',
+      port: 443,
+      path: `/3/device/${deviceToken}`,
+      method: 'POST',
+      headers: {
+        authorization: `bearer ${jwt}`,
+        'apns-push-type': 'alert',
+        'apns-topic': bundleId,
+        'apns-priority': '10',
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      },
+    }, response => {
+      let responseBody = '';
+      response.on('data', chunk => { responseBody += chunk; });
+      response.on('end', () => {
+        if (response.statusCode === 200) resolve({ ok: true });
+        else reject(new Error(`APNs ${response.statusCode}: ${responseBody}`));
+      });
+    });
+    request.on('error', reject);
+    request.setTimeout(10000, () => { request.destroy(); reject(new Error('APNs timeout')); });
+    request.write(body);
+    request.end();
   });
 }
 

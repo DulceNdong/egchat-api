@@ -5,9 +5,9 @@ services:
     plan: free
     buildCommand: npm install
     startCommand: node index.js
-    healthCheckPath: /api/health
+    healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
       - key: APP_VERSION
-        value: "2.6.4"
+        value: "2.8.0-calls-push"
