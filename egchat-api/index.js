@@ -11445,6 +11445,18 @@ app.patch('/api/v1/admin/kyc/:id/doc-fields', async (req, res) => {
 let _apnsJwt = null;
 let _apnsJwtTs = 0;
 
+async function withApnsEnvironmentFallback(send) {
+  try {
+    return await send('api.push.apple.com');
+  } catch (error) {
+    // Un token de una app instalada desde Xcode pertenece al sandbox, mientras
+    // TestFlight/App Store usan producción. Reintentar solo cuando APNs indica
+    // que el token no corresponde al entorno, nunca para ocultar otros fallos.
+    if (!/BadDeviceToken|DeviceTokenNotForTopic/.test(String(error?.message || error))) throw error;
+    return send('api.sandbox.push.apple.com');
+  }
+}
+
 function getApnsJwt() {
   const now = Math.floor(Date.now() / 1000);
   if (_apnsJwt && (now - _apnsJwtTs) < 45 * 60) return _apnsJwt;
@@ -11483,7 +11495,7 @@ function getApnsJwt() {
 }
 
 async function sendVoipPush({ deviceToken, payload }) {
-  return new Promise((resolve, reject) => {
+  return withApnsEnvironmentFallback(hostname => new Promise((resolve, reject) => {
     const jwt = getApnsJwt();
     if (!jwt) return reject(new Error('APNs JWT no disponible'));
 
@@ -11491,7 +11503,7 @@ async function sendVoipPush({ deviceToken, payload }) {
     const body = JSON.stringify(payload);
 
     const options = {
-      hostname: 'api.push.apple.com',
+      hostname,
       port: 443,
       path: `/3/device/${deviceToken}`,
       method: 'POST',
@@ -11523,11 +11535,11 @@ async function sendVoipPush({ deviceToken, payload }) {
     req.setTimeout(10000, () => { req.destroy(); reject(new Error('APNs timeout')); });
     req.write(body);
     req.end();
-  });
+  }));
 }
 
 function sendApnsAlertPush(deviceToken, payload) {
-  return new Promise((resolve, reject) => {
+  return withApnsEnvironmentFallback(hostname => new Promise((resolve, reject) => {
     const jwt = getApnsJwt();
     if (!jwt) return reject(new Error('APNs JWT no disponible'));
     const bundleId = process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat';
@@ -11546,7 +11558,7 @@ function sendApnsAlertPush(deviceToken, payload) {
       ...extra,
     });
     const request = https.request({
-      hostname: 'api.push.apple.com',
+      hostname,
       port: 443,
       path: `/3/device/${deviceToken}`,
       method: 'POST',
@@ -11570,7 +11582,7 @@ function sendApnsAlertPush(deviceToken, payload) {
     request.setTimeout(10000, () => { request.destroy(); reject(new Error('APNs timeout')); });
     request.write(body);
     request.end();
-  });
+  }));
 }
 
 async function sendVoipPushToUser({ targetUserId, callId, callerName, callerAvatar, callType, offer }) {
