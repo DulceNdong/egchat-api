@@ -6263,6 +6263,7 @@ app.post('/api/call/offer', auth, async (req, res) => {
           callerName,
           callType: type || 'audio',
           notificationType: 'incoming_call',
+          offer,
         };
 
         // 1️⃣ VoIP push (iOS PushKit) — despierta la app aunque esté cerrada
@@ -7020,6 +7021,12 @@ async function sendFcmPushes(tokens, payload) {
   const results = await Promise.allSettled(tokens.map(token => messaging.send({
     token,
     data,
+    ...(!isCall ? {
+      notification: {
+        title: payload.title || 'EGCHAT',
+        body: payload.body || 'Nuevo mensaje',
+      },
+    } : {}),
     android: {
       priority: isCall ? 'high' : 'normal',
       ttl: isCall ? 120000 : 86400000,
@@ -7028,6 +7035,8 @@ async function sendFcmPushes(tokens, payload) {
           channelId: 'egchat-messages',
           sound: 'notification',
           notificationPriority: 'PRIORITY_HIGH',
+          icon: 'notification_icon',
+          ...(payload.tag || payload.chatId ? { tag: String(payload.tag || payload.chatId) } : {}),
         },
       }),
     },
