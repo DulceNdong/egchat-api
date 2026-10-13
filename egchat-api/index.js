@@ -7058,15 +7058,22 @@ app.post('/api/push/register-expo-token', auth, async (req, res) => {
     if (!token || typeof token !== 'string' || token.length < 10) {
       return res.status(400).json({ message: 'Token push inválido' });
     }
-    await supabase.from('expo_push_tokens').upsert({
+    const resolvedPlatform = platform || 'android';
+    const resolvedType = tokenType || (token.startsWith('ExponentPushToken') ? 'expo' : resolvedPlatform === 'ios' ? 'apns' : 'fcm');
+    const { error: upsertError } = await supabase.from('expo_push_tokens').upsert({
       user_id: req.user.id,
       token,
-      platform: platform || 'android',
+      platform: resolvedPlatform,
       updated_at: new Date().toISOString(),
     }, { onConflict: 'token' });
+    if (upsertError) {
+      console.error(`[Push] Error guardando token (${resolvedType}/${resolvedPlatform}) para user ${req.user.id}:`, upsertError.message);
+    } else {
+      console.log(`[Push] Token registrado (${resolvedType}/${resolvedPlatform}) para user ${req.user.id}: ...${token.slice(-8)}`);
+    }
     res.json({
       message: 'Token registrado',
-      tokenType: tokenType || (token.startsWith('ExponentPushToken') ? 'expo' : platform === 'ios' ? 'apns' : 'fcm'),
+      tokenType: resolvedType,
     });
   } catch (e) {
     console.error('Expo token register error:', e.message);
