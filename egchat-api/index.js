@@ -6933,8 +6933,9 @@ const sendPushToUser = async (userId, payload) => {
     const apnsSubs = (pushTokens || []).filter(sub => sub.platform === 'ios' && !String(sub.token || '').startsWith('ExponentPushToken'));
     const expoSubs = (pushTokens || []).filter(sub => {
       if (!String(sub.token || '').startsWith('ExponentPushToken')) return false;
-      // Para una llamada Android priorizamos el canal FCM data-only nativo.
-      return !isCall || !fcmSubs.length || sub.platform !== 'android';
+      // Incluir siempre los tokens Expo — son el canal principal para todos los usuarios
+      // (fcmSubs nativos solo se usan si el usuario tiene token FCM nativo registrado)
+      return true;
     });
 
     if (expoSubs.length > 0) {
@@ -6944,7 +6945,7 @@ const sendPushToUser = async (userId, payload) => {
         body: payload.body || 'Nueva notificacion',
         sound: isCall ? 'default' : 'notification.wav',
         badge: 1,
-        channelId: isCall ? 'egchat-calls' : 'egchat-messages',
+        channelId: isCall ? 'egchat-calls-v2' : 'egchat-messages',
         priority: isCall ? 'high' : 'normal',
         data: payload,
         // Llamadas: TTL de 120s para dar tiempo a desbloquear el teléfono
