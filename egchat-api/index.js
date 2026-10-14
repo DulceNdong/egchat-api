@@ -6964,11 +6964,13 @@ const sendPushToUser = async (userId, payload) => {
             body: JSON.stringify(batch),
           });
           const result = await expoRes.json();
+          console.log(`[Push] Expo response status: ${expoRes.status}, tickets: ${JSON.stringify(result.data?.map(r => ({ status: r.status, error: r.details?.error })))}`);
           if (result.data) {
             const invalid = result.data
               .map((r, idx) => ({ r, token: batch[idx].to }))
               .filter(({ r }) => r.status === 'error' && r.details?.error === 'DeviceNotRegistered');
             if (invalid.length > 0) {
+              console.warn(`[Push] Tokens inválidos (DeviceNotRegistered): ${invalid.length}`);
               await Promise.allSettled(
                 invalid.map(({ token }) => supabase.from('expo_push_tokens').delete().eq('token', token))
               );
@@ -6985,7 +6987,12 @@ const sendPushToUser = async (userId, payload) => {
     }
 
     if (apnsSubs.length > 0) {
-      await Promise.allSettled(apnsSubs.map(sub => sendApnsAlertPush(sub.token, payload)));
+      console.log(`[Push] Enviando APNs directo a ${apnsSubs.length} tokens`);
+      const apnsResults = await Promise.allSettled(apnsSubs.map(sub => sendApnsAlertPush(sub.token, payload)));
+      apnsResults.forEach((r, i) => {
+        if (r.status === 'rejected') console.warn(`[Push] APNs error token ${i}:`, r.reason?.message || r.reason);
+        else console.log(`[Push] APNs enviado OK token ${i}`);
+      });
     }
   } catch (e) {
     console.error('sendPushToUser error:', e.message);
