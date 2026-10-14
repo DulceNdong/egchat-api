@@ -7092,6 +7092,15 @@ app.post('/api/push/register-expo-token', auth, async (req, res) => {
     }
     const resolvedPlatform = platform || 'android';
     const resolvedType = tokenType || (token.startsWith('ExponentPushToken') ? 'expo' : resolvedPlatform === 'ios' ? 'apns' : 'fcm');
+
+    // Primero borrar tokens viejos del mismo usuario/plataforma/tipo para evitar duplicados
+    await supabase.from('expo_push_tokens')
+      .delete()
+      .eq('user_id', req.user.id)
+      .eq('platform', resolvedPlatform)
+      .neq('token', token)
+      .catch(() => {});
+
     const { error: upsertError } = await supabase.from('expo_push_tokens').upsert({
       user_id: req.user.id,
       token,
