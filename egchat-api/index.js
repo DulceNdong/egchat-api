@@ -57,6 +57,13 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY || _SUPA_KEY_DEFAULT
 );
 
+// Los builders de Supabase no implementan `.catch()`. Las escrituras
+// secundarias no deben interrumpir una petición ni reiniciar el proceso.
+const ignoreSupabaseError = async (operation, label) => {
+  const { error } = await operation;
+  if (error) console.warn(`[Supabase] ${label}: ${error.message}`);
+};
+
 // --- Fallback de usuarios cuando Supabase no está disponible ----------
 // Permite login aunque Supabase esté restringido por cuota
 // Formato: phone -> { password_hash, full_name, id, avatar_url }
@@ -3823,9 +3830,9 @@ app.post('/api/lia/chat', auth, async (req, res) => {
     reply = `Entendido: "${message}". Puedo ayudarte con saldo, transferencias, taxi, salud, supermercados, seguros y noticias.`;
 
   // Guardar conversaciÁƒÂ³n en Supabase
-  await supabase.from('lia_conversations').insert({
+  await ignoreSupabaseError(supabase.from('lia_conversations').insert({
     user_id: req.user.id, message, reply
-  }).catch(() => {});
+  }), 'No se pudo guardar conversación Lia');
 
   res.json({ reply, timestamp: new Date().toISOString() });
 });
@@ -3883,13 +3890,13 @@ const safeRef = (prefix) => `${prefix}-${Date.now()}-${Math.floor(Math.random() 
 const toNum = (v) => Number(v || 0);
 
 const logAudit = async (userId, action, module, entityId, details) => {
-  await supabase.from('audit_logs').insert({
+  await ignoreSupabaseError(supabase.from('audit_logs').insert({
     user_id: userId,
     action,
     module,
     entity_id: entityId || null,
     details: details || {}
-  }).catch(() => {});
+  }), 'No se pudo guardar auditoría');
 };
 
 const createServiceOrder = async (userId, provider, serviceType, amount, contractRef, payload, response) => {
@@ -7094,12 +7101,11 @@ app.post('/api/push/register-expo-token', auth, async (req, res) => {
     const resolvedType = tokenType || (token.startsWith('ExponentPushToken') ? 'expo' : resolvedPlatform === 'ios' ? 'apns' : 'fcm');
 
     // Primero borrar tokens viejos del mismo usuario/plataforma/tipo para evitar duplicados
-    await supabase.from('expo_push_tokens')
+    await ignoreSupabaseError(supabase.from('expo_push_tokens')
       .delete()
       .eq('user_id', req.user.id)
       .eq('platform', resolvedPlatform)
-      .neq('token', token)
-      .catch(() => {});
+      .neq('token', token), 'No se pudieron limpiar tokens antiguos');
 
     const { error: upsertError } = await supabase.from('expo_push_tokens').upsert({
       user_id: req.user.id,
