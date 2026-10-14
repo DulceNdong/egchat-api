@@ -6893,6 +6893,7 @@ app.get('/api/push/vapid-public-key', (req, res) => {
 const sendPushToUser = async (userId, payload) => {
   try {
     const isCall = payload.notificationType === 'incoming_call';
+    console.log(`[Push] sendPushToUser → user: ${userId}, tipo: ${isCall ? 'llamada' : 'mensaje'}`);
 
     // ── Web Push (navegador/PWA) ──────────────────────────────────────────
     const { data: subs } = await supabase
@@ -6933,10 +6934,9 @@ const sendPushToUser = async (userId, payload) => {
     const apnsSubs = (pushTokens || []).filter(sub => sub.platform === 'ios' && !String(sub.token || '').startsWith('ExponentPushToken'));
     const expoSubs = (pushTokens || []).filter(sub => {
       if (!String(sub.token || '').startsWith('ExponentPushToken')) return false;
-      // Incluir siempre los tokens Expo — son el canal principal para todos los usuarios
-      // (fcmSubs nativos solo se usan si el usuario tiene token FCM nativo registrado)
       return true;
     });
+    console.log(`[Push] Tokens encontrados → expo: ${expoSubs.length}, apns: ${apnsSubs.length}, fcm: ${fcmSubs.length}`);
 
     if (expoSubs.length > 0) {
       const expoMessages = expoSubs.map(sub => ({
