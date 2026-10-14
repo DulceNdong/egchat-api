@@ -6991,8 +6991,16 @@ const sendPushToUser = async (userId, payload) => {
       console.log(`[Push] Enviando APNs directo a ${apnsSubs.length} tokens`);
       const apnsResults = await Promise.allSettled(apnsSubs.map(sub => sendApnsAlertPush(sub.token, payload)));
       apnsResults.forEach((r, i) => {
-        if (r.status === 'rejected') console.warn(`[Push] APNs error token ${i}:`, r.reason?.message || r.reason);
-        else console.log(`[Push] APNs enviado OK token ${i}`);
+        if (r.status === 'rejected') {
+          console.warn(`[Push] APNs error token ${i}:`, r.reason?.message || r.reason);
+          // Limpiar tokens con entorno incorrecto
+          if (/BadEnvironmentKeyInToken|BadDeviceToken/.test(String(r.reason?.message || ''))) {
+            supabase.from('expo_push_tokens').delete().eq('token', apnsSubs[i].token).catch(() => {});
+            console.warn(`[Push] Token APNs inválido eliminado: ...${String(apnsSubs[i].token).slice(-8)}`);
+          }
+        } else {
+          console.log(`[Push] APNs enviado OK token ${i}`);
+        }
       });
     }
   } catch (e) {
