@@ -6958,26 +6958,26 @@ const sendPushToUser = async (userId, payload) => {
         }));
 
       if (expoMessages.length > 0) {
-        const chunks = expoPush.chunkPushNotifications(expoMessages);
-        for (const chunk of chunks) {
+        // Enviar cada token individualmente para evitar error de proyecto mixto
+        for (const msg of expoMessages) {
           try {
-            const tickets = await expoPush.sendPushNotificationsAsync(chunk);
-            const errors = tickets.filter(t => t.status === 'error');
-            const ok = tickets.filter(t => t.status === 'ok');
-            console.log(`[Push] Expo SDK: ${ok.length} OK, ${errors.length} errores`);
-            if (errors.length > 0) {
-              errors.forEach(e => console.warn(`[Push] Expo error: ${e.message} (${e.details?.error})`));
-              const invalidTokens = errors
-                .map((e, i) => ({ e, token: chunk[i].to }))
-                .filter(({ e }) => e.details?.error === 'DeviceNotRegistered');
-              if (invalidTokens.length > 0) {
-                await Promise.allSettled(
-                  invalidTokens.map(({ token }) => supabase.from('expo_push_tokens').delete().eq('token', token))
-                );
+            const tickets = await expoPush.sendPushNotificationsAsync([msg]);
+            const t = tickets[0];
+            if (t.status === 'ok') {
+              console.log(`[Push] Expo SDK: OK para ...${String(msg.to).slice(-8)}`);
+            } else {
+              console.warn(`[Push] Expo error token ...${String(msg.to).slice(-8)}: ${t.message} (${t.details?.error})`);
+              if (t.details?.error === 'DeviceNotRegistered') {
+                await supabase.from('expo_push_tokens').delete().eq('token', msg.to).catch(() => {});
+              }
+              if (t.details?.error === 'InvalidCredentials' || t.message?.includes('same project')) {
+                // Token de otro proyecto — borrar
+                await supabase.from('expo_push_tokens').delete().eq('token', msg.to).catch(() => {});
+                console.warn(`[Push] Token de otro proyecto eliminado: ...${String(msg.to).slice(-8)}`);
               }
             }
           } catch (expoErr) {
-            console.warn('[Push] Expo SDK error:', expoErr.message);
+            console.warn(`[Push] Expo SDK error token ...${String(msg.to).slice(-8)}:`, expoErr.message);
           }
         }
       }
@@ -11468,11 +11468,12 @@ async function withApnsEnvironmentFallback(send) {
   try {
     return await send('api.push.apple.com');
   } catch (error) {
-    // Un token de una app instalada desde Xcode pertenece al sandbox, mientras
-    // TestFlight/App Store usan producción. Reintentar solo cuando APNs indica
-    // que el token no corresponde al entorno, nunca para ocultar otros fallos.
-    if (!/BadDeviceToken|DeviceTokenNotForTopic/.test(String(error?.message || error))) throw error;
-    return send('api.sandbox.push.apple.com');
+    const msg = String(error?.message || error);
+    // Reintentar en sandbox si el token no corresponde al entorno de producción
+    if (/BadDeviceToken|DeviceTokenNotForTopic|APNs 0/.test(msg)) {
+      return send('api.sandbox.push.apple.com');
+    }
+    throw error;
   }
 }
 
