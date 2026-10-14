@@ -6893,6 +6893,17 @@ app.get('/api/push/vapid-public-key', (req, res) => {
   res.json({ publicKey: VAPID_PUBLIC_KEY });
 });
 
+async function removePushToken(token) {
+  const { error } = await supabase
+    .from('expo_push_tokens')
+    .delete()
+    .eq('token', token);
+
+  if (error) {
+    console.warn(`[Push] No se pudo eliminar token inválido: ${error.message}`);
+  }
+}
+
 // Función interna para enviar push a un usuario
 const sendPushToUser = async (userId, payload) => {
   try {
@@ -6968,11 +6979,11 @@ const sendPushToUser = async (userId, payload) => {
             } else {
               console.warn(`[Push] Expo error token ...${String(msg.to).slice(-8)}: ${t.message} (${t.details?.error})`);
               if (t.details?.error === 'DeviceNotRegistered') {
-                await supabase.from('expo_push_tokens').delete().eq('token', msg.to).catch(() => {});
+                await removePushToken(msg.to);
               }
               if (t.details?.error === 'InvalidCredentials' || t.message?.includes('same project')) {
                 // Token de otro proyecto — borrar
-                await supabase.from('expo_push_tokens').delete().eq('token', msg.to).catch(() => {});
+                await removePushToken(msg.to);
                 console.warn(`[Push] Token de otro proyecto eliminado: ...${String(msg.to).slice(-8)}`);
               }
             }
@@ -6995,7 +7006,9 @@ const sendPushToUser = async (userId, payload) => {
           console.warn(`[Push] APNs error token ${i}:`, r.reason?.message || r.reason);
           // Limpiar tokens con entorno incorrecto
           if (/BadEnvironmentKeyInToken|BadDeviceToken/.test(String(r.reason?.message || ''))) {
-            supabase.from('expo_push_tokens').delete().eq('token', apnsSubs[i].token).catch(() => {});
+            removePushToken(apnsSubs[i].token).catch(error => {
+              console.warn(`[Push] Error limpiando token APNs: ${error.message}`);
+            });
             console.warn(`[Push] Token APNs inválido eliminado: ...${String(apnsSubs[i].token).slice(-8)}`);
           }
         } else {
