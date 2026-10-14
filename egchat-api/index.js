@@ -593,6 +593,7 @@ app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'Sesión ce
 const crypto = require('crypto');
 const fs = require('fs');
 const https = require('https');
+const http2 = require('http2');
 const KYCProviderFactory = require('./kyc/KYCProviderFactory');
 const { calculateRiskScore } = require('./kyc/KYCScoringEngine');
 const kycProviderFactory = new KYCProviderFactory();
@@ -6942,42 +6943,42 @@ const sendPushToUser = async (userId, payload) => {
     console.log(`[Push] Tokens encontrados → expo: ${expoSubs.length}, apns: ${apnsSubs.length}, fcm: ${fcmSubs.length}`);
 
     if (expoSubs.length > 0) {
-      const expoMessages = expoSubs.map(sub => ({
-        to: sub.token,
-        title: payload.title || 'EGChat',
-        body: payload.body || 'Nueva notificacion',
-        sound: isCall ? 'default' : 'notification.wav',
-        badge: 1,
-        channelId: isCall ? 'egchat-calls-v2' : 'egchat-messages',
-        priority: isCall ? 'high' : 'normal',
-        data: payload,
-        // Llamadas: TTL de 120s para dar tiempo a desbloquear el teléfono
-        ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
-      }));
+      const expoMessages = expoSubs
+        .filter(sub => Expo.isExpoPushToken(sub.token))
+        .map(sub => ({
+          to: sub.token,
+          title: payload.title || 'EGChat',
+          body: payload.body || 'Nueva notificacion',
+          sound: isCall ? 'default' : 'notification.wav',
+          badge: 1,
+          channelId: isCall ? 'egchat-calls-v2' : 'egchat-messages',
+          priority: isCall ? 'high' : 'normal',
+          data: payload,
+          ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
+        }));
 
-      for (let i = 0; i < expoMessages.length; i += 100) {
-        const batch = expoMessages.slice(i, i + 100);
-        try {
-          const expoRes = await fetch('https://exp.host/--/api/v2/push/send', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-            body: JSON.stringify(batch),
-          });
-          const result = await expoRes.json();
-          console.log(`[Push] Expo response status: ${expoRes.status}, tickets: ${JSON.stringify(result.data?.map(r => ({ status: r.status, error: r.details?.error })))}`);
-          if (result.data) {
-            const invalid = result.data
-              .map((r, idx) => ({ r, token: batch[idx].to }))
-              .filter(({ r }) => r.status === 'error' && r.details?.error === 'DeviceNotRegistered');
-            if (invalid.length > 0) {
-              console.warn(`[Push] Tokens inválidos (DeviceNotRegistered): ${invalid.length}`);
-              await Promise.allSettled(
-                invalid.map(({ token }) => supabase.from('expo_push_tokens').delete().eq('token', token))
-              );
+      if (expoMessages.length > 0) {
+        const chunks = expoPush.chunkPushNotifications(expoMessages);
+        for (const chunk of chunks) {
+          try {
+            const tickets = await expoPush.sendPushNotificationsAsync(chunk);
+            const errors = tickets.filter(t => t.status === 'error');
+            const ok = tickets.filter(t => t.status === 'ok');
+            console.log(`[Push] Expo SDK: ${ok.length} OK, ${errors.length} errores`);
+            if (errors.length > 0) {
+              errors.forEach(e => console.warn(`[Push] Expo error: ${e.message} (${e.details?.error})`));
+              const invalidTokens = errors
+                .map((e, i) => ({ e, token: chunk[i].to }))
+                .filter(({ e }) => e.details?.error === 'DeviceNotRegistered');
+              if (invalidTokens.length > 0) {
+                await Promise.allSettled(
+                  invalidTokens.map(({ token }) => supabase.from('expo_push_tokens').delete().eq('token', token))
+                );
+              }
             }
+          } catch (expoErr) {
+            console.warn('[Push] Expo SDK error:', expoErr.message);
           }
-        } catch (expoErr) {
-          console.warn('Expo push error:', expoErr.message);
         }
       }
     }
@@ -11512,19 +11513,51 @@ function getApnsJwt() {
   }
 }
 
-async function sendVoipPush({ deviceToken, payload }) {
-  return withApnsEnvironmentFallback(hostname => new Promise((resolve, reject) => {
-    const jwt = getApnsJwt();
-    if (!jwt) return reject(new Error('APNs JWT no disponible'));
+// ── Helper HTTP/2 para APNs ─────────────────────────────────────────────────
+// APNs requiere HTTP/2. El módulo https usa HTTP/1.1 y falla con
+// "Expected HTTP/, RTSP/ or ICE/". Usamos http2 nativo de Node.js.
+function sendApnsHttp2({ hostname, deviceToken, headers, body }) {
+  return new Promise((resolve, reject) => {
+    const client = http2.connect(`https://${hostname}`);
+    client.on('error', err => { client.destroy(); reject(err); });
 
+    const req = client.request({
+      ':method': 'POST',
+      ':path': `/3/device/${deviceToken}`,
+      ':scheme': 'https',
+      ':authority': hostname,
+      ...headers,
+      'content-length': Buffer.byteLength(body),
+    });
+
+    let status = 0;
+    let data = '';
+    req.on(':response', (hdrs) => { status = hdrs[':status']; });
+    req.on('data', chunk => { data += chunk; });
+    req.on('end', () => {
+      client.close();
+      if (status === 200) resolve({ ok: true });
+      else {
+        try { reject(new Error(`APNs ${status}: ${JSON.parse(data).reason}`)); }
+        catch { reject(new Error(`APNs ${status}: ${data}`)); }
+      }
+    });
+    req.on('error', err => { client.destroy(); reject(err); });
+    req.setTimeout(10000, () => { client.destroy(); reject(new Error('APNs timeout')); });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function sendVoipPush({ deviceToken, payload }) {
+  return withApnsEnvironmentFallback(async hostname => {
+    const jwt = getApnsJwt();
+    if (!jwt) throw new Error('APNs JWT no disponible');
     const BUNDLE_ID = process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat';
     const body = JSON.stringify(payload);
-
-    const options = {
+    return sendApnsHttp2({
       hostname,
-      port: 443,
-      path: `/3/device/${deviceToken}`,
-      method: 'POST',
+      deviceToken,
       headers: {
         'authorization': `bearer ${jwt}`,
         'apns-push-type': 'voip',
@@ -11532,34 +11565,16 @@ async function sendVoipPush({ deviceToken, payload }) {
         'apns-priority': '10',
         'apns-expiration': String(Math.floor(Date.now() / 1000) + 30),
         'content-type': 'application/json',
-        'content-length': Buffer.byteLength(body),
       },
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        if (res.statusCode === 200) {
-          resolve({ ok: true });
-        } else {
-          try { reject(new Error(`APNs ${res.statusCode}: ${JSON.parse(data).reason}`)); }
-          catch { reject(new Error(`APNs ${res.statusCode}: ${data}`)); }
-        }
-      });
+      body,
     });
-
-    req.on('error', reject);
-    req.setTimeout(10000, () => { req.destroy(); reject(new Error('APNs timeout')); });
-    req.write(body);
-    req.end();
-  }));
+  });
 }
 
 function sendApnsAlertPush(deviceToken, payload) {
-  return withApnsEnvironmentFallback(hostname => new Promise((resolve, reject) => {
+  return withApnsEnvironmentFallback(async hostname => {
     const jwt = getApnsJwt();
-    if (!jwt) return reject(new Error('APNs JWT no disponible'));
+    if (!jwt) throw new Error('APNs JWT no disponible');
     const bundleId = process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat';
     const isCall = payload.notificationType === 'incoming_call';
     const extra = Object.entries(payload).reduce((result, [key, value]) => {
@@ -11575,32 +11590,19 @@ function sendApnsAlertPush(deviceToken, payload) {
       },
       ...extra,
     });
-    const request = https.request({
+    return sendApnsHttp2({
       hostname,
-      port: 443,
-      path: `/3/device/${deviceToken}`,
-      method: 'POST',
+      deviceToken,
       headers: {
-        authorization: `bearer ${jwt}`,
+        'authorization': `bearer ${jwt}`,
         'apns-push-type': 'alert',
         'apns-topic': bundleId,
         'apns-priority': '10',
         'content-type': 'application/json',
-        'content-length': Buffer.byteLength(body),
       },
-    }, response => {
-      let responseBody = '';
-      response.on('data', chunk => { responseBody += chunk; });
-      response.on('end', () => {
-        if (response.statusCode === 200) resolve({ ok: true });
-        else reject(new Error(`APNs ${response.statusCode}: ${responseBody}`));
-      });
+      body,
     });
-    request.on('error', reject);
-    request.setTimeout(10000, () => { request.destroy(); reject(new Error('APNs timeout')); });
-    request.write(body);
-    request.end();
-  }));
+  });
 }
 
 async function sendVoipPushToUser({ targetUserId, callId, callerName, callerAvatar, callType, offer }) {
