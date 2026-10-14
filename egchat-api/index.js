@@ -1561,6 +1561,7 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
 
       // Enviar Web Push a usuarios que no son el remitente
       const otherUsers = targetUsers.filter(uid => String(uid) !== String(req.user.id));
+      console.log(`[Push] Nuevo mensaje en chat ${chatId} — remitente: ${req.user.id}, destinatarios: ${otherUsers.join(', ')}`);
       // Obtener nombre del remitente
       const { data: sender } = await supabase
         .from('users').select('full_name').eq('id', req.user.id).single();
@@ -1592,7 +1593,9 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
         senderName,
       };
       await Promise.allSettled(otherUsers.map(uid => sendPushToUser(uid, pushPayload)));
-    } catch {}
+    } catch (pushErr) {
+      console.error('[Push] Error en bloque push de mensaje:', pushErr?.message || pushErr);
+    }
 
     res.status(201).json(message);
   } catch (e) {
