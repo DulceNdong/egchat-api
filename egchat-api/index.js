@@ -6308,9 +6308,13 @@ app.post('/api/call/offer', auth, async (req, res) => {
 // Callee responde con answer
 app.post('/api/call/answer', auth, async (req, res) => {
   const { callId, answer } = req.body;
-  const { data } = await supabase.from('call_sessions').select('call_id').eq('call_id', callId).eq('ended', false).single();
+  const { data } = await supabase.from('call_sessions').select('call_id, caller_id').eq('call_id', callId).eq('ended', false).single();
   if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
   await supabase.from('call_sessions').update({ answer: JSON.stringify(answer), updated_at: new Date().toISOString() }).eq('call_id', callId);
+  // Notificar al caller via SSE para que no dependa solo del polling
+  if (data.caller_id) {
+    emitToUser(String(data.caller_id), { type: 'call_answered', callId, calleeId: req.user.id });
+  }
   res.json({ ok: true });
 });
 
@@ -6349,7 +6353,16 @@ app.get('/api/call/:callId', auth, async (req, res) => {
 
 // Terminar llamada
 app.delete('/api/call/:callId', auth, async (req, res) => {
+  const { data: session } = await supabase.from('call_sessions')
+    .select('caller_id, target_user_id')
+    .eq('call_id', req.params.callId)
+    .single();
   await supabase.from('call_sessions').update({ ended: true, updated_at: new Date().toISOString() }).eq('call_id', req.params.callId);
+  // Notificar a ambas partes via SSE
+  if (session) {
+    const otherId = req.user.id === session.caller_id ? session.target_user_id : session.caller_id;
+    if (otherId) emitToUser(String(otherId), { type: 'call_ended', callId: req.params.callId });
+  }
   // Borrar después de 15 segundos
   setTimeout(async () => {
     await supabase.from('call_sessions').delete().eq('call_id', req.params.callId);
