@@ -7021,20 +7021,21 @@ const sendPushToUser = async (userId, payload) => {
     if (apnsSubs.length > 0) {
       console.log(`[Push] Enviando APNs directo a ${apnsSubs.length} tokens`);
       const apnsResults = await Promise.allSettled(apnsSubs.map(sub => sendApnsAlertPush(sub.token, payload)));
-      apnsResults.forEach((r, i) => {
+      for (let i = 0; i < apnsResults.length; i++) {
+        const r = apnsResults[i];
+        const token = apnsSubs[i]?.token;
         if (r.status === 'rejected') {
-          console.warn(`[Push] APNs error token ${i}:`, r.reason?.message || r.reason);
-          // Limpiar tokens con entorno incorrecto
-          if (/BadEnvironmentKeyInToken|BadDeviceToken/.test(String(r.reason?.message || ''))) {
-            removePushToken(apnsSubs[i].token).catch(error => {
-              console.warn(`[Push] Error limpiando token APNs: ${error.message}`);
-            });
-            console.warn(`[Push] Token APNs inválido eliminado: ...${String(apnsSubs[i].token).slice(-8)}`);
+          const errMsg = String(r.reason?.message || r.reason || '');
+          console.warn(`[Push] APNs error token ${i}:`, errMsg);
+          if (token && /BadEnvironmentKeyInToken|BadDeviceToken/.test(errMsg)) {
+            removePushToken(token).then(() => {
+              console.warn(`[Push] Token APNs inválido eliminado: ...${String(token).slice(-8)}`);
+            }).catch(() => {});
           }
         } else {
           console.log(`[Push] APNs enviado OK token ${i}`);
         }
-      });
+      }
     }
   } catch (e) {
     console.error('sendPushToUser error:', e.message);
@@ -11681,7 +11682,18 @@ async function sendVoipPushToUser({ targetUserId, callId, callerName, callerAvat
   );
 
   const sent = results.filter(r => r.status === 'fulfilled').length;
-  results.filter(r => r.status === 'rejected').forEach(f => console.warn('[VoIP] Push failed:', f.reason?.message));
+  results.forEach((r, i) => {
+    if (r.status === 'rejected') {
+      const errMsg = String(r.reason?.message || '');
+      console.warn('[VoIP] Push failed:', errMsg);
+      // Limpiar token VoIP inválido
+      if (/BadEnvironmentKeyInToken|BadDeviceToken/.test(errMsg) && tokens[i]?.token) {
+        supabase.from('voip_push_tokens').delete().eq('token', tokens[i].token).then(() => {
+          console.warn(`[VoIP] Token VoIP inválido eliminado: ...${String(tokens[i].token).slice(-8)}`);
+        }).catch(() => {});
+      }
+    }
+  });
   console.log(`[VoIP] Sent ${sent}/${tokens.length} VoIP pushes para user ${targetUserId}`);
   return { voipPushSent: sent > 0 };
 }
