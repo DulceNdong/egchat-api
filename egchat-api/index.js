@@ -6990,31 +6990,53 @@ const sendPushToUser = async (userId, payload) => {
           priority: isCall ? 'high' : 'normal',
           data: payload,
           // mutableContent activa UNNotificationServiceExtension en iOS
-          // para descargar el avatar antes de mostrar la notificación
-          ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : { mutableContent: true }),
+          // para que la extensión descargue el avatar antes de mostrar el banner
+          mutableContent: !isCall,
+          ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
         }));
 
       if (expoMessages.length > 0) {
-        // Enviar cada token individualmente para evitar error de proyecto mixto
+        // Usar API REST de Expo directamente para poder pasar mutableContent
+        // (el SDK expo-server-sdk no soporta mutableContent)
         for (const msg of expoMessages) {
           try {
-            const tickets = await expoPush.sendPushNotificationsAsync([msg]);
-            const t = tickets[0];
-            if (t.status === 'ok') {
-              console.log(`[Push] Expo SDK: OK para ...${String(msg.to).slice(-8)}`);
+            const restPayload = {
+              to: msg.to,
+              title: msg.title,
+              body: msg.body,
+              sound: msg.sound,
+              badge: msg.badge,
+              channelId: msg.channelId,
+              priority: msg.priority,
+              data: msg.data,
+              ...(msg.mutableContent ? { mutableContent: true } : {}),
+              ...(msg.ttl ? { ttl: msg.ttl, expiration: msg.expiration } : {}),
+            };
+            const expoRes = await fetch('https://exp.host/--/api/v2/push/send', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Accept-Encoding': 'gzip, deflate',
+              },
+              body: JSON.stringify(restPayload),
+            });
+            const result = await expoRes.json();
+            const t = result.data;
+            if (t?.status === 'ok') {
+              console.log(`[Push] Expo REST: OK para ...${String(msg.to).slice(-8)}`);
             } else {
-              console.warn(`[Push] Expo error token ...${String(msg.to).slice(-8)}: ${t.message} (${t.details?.error})`);
-              if (t.details?.error === 'DeviceNotRegistered') {
+              console.warn(`[Push] Expo REST error ...${String(msg.to).slice(-8)}: ${t?.message} (${t?.details?.error})`);
+              if (t?.details?.error === 'DeviceNotRegistered') {
                 await removePushToken(msg.to);
               }
-              if (t.details?.error === 'InvalidCredentials' || t.message?.includes('same project')) {
-                // Token de otro proyecto — borrar
+              if (t?.details?.error === 'InvalidCredentials' || t?.message?.includes('same project')) {
                 await removePushToken(msg.to);
                 console.warn(`[Push] Token de otro proyecto eliminado: ...${String(msg.to).slice(-8)}`);
               }
             }
           } catch (expoErr) {
-            console.warn(`[Push] Expo SDK error token ...${String(msg.to).slice(-8)}:`, expoErr.message);
+            console.warn(`[Push] Expo REST error token ...${String(msg.to).slice(-8)}:`, expoErr.message);
           }
         }
       }
