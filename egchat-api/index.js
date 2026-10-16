@@ -7028,6 +7028,7 @@ const sendPushToUser = async (userId, payload) => {
           const errMsg = String(r.reason?.message || r.reason || '');
           console.warn(`[Push] APNs error token ${i}:`, errMsg);
           if (token && /BadEnvironmentKeyInToken|BadDeviceToken/.test(errMsg)) {
+            // Solo eliminar si también falló en sandbox (withApnsEnvironmentFallback ya reintentó)
             removePushToken(token).then(() => {
               console.warn(`[Push] Token APNs inválido eliminado: ...${String(token).slice(-8)}`);
             }).catch(() => {});
@@ -11520,7 +11521,8 @@ async function withApnsEnvironmentFallback(send) {
   } catch (error) {
     const msg = String(error?.message || error);
     // Reintentar en sandbox si el token no corresponde al entorno de producción
-    if (/BadDeviceToken|DeviceTokenNotForTopic|APNs 0/.test(msg)) {
+    if (/BadDeviceToken|DeviceTokenNotForTopic|BadEnvironmentKeyInToken|APNs 0/.test(msg)) {
+      console.log('[APNs] Reintentando en sandbox...');
       return send('api.sandbox.push.apple.com');
     }
     throw error;
