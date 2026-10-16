@@ -1570,10 +1570,11 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
       // Enviar Web Push a usuarios que no son el remitente
       const otherUsers = targetUsers.filter(uid => String(uid) !== String(req.user.id));
       console.log(`[Push] Nuevo mensaje en chat ${chatId} — remitente: ${req.user.id}, destinatarios: ${otherUsers.join(', ')}`);
-      // Obtener nombre del remitente
+      // Obtener nombre Y avatar del remitente
       const { data: sender } = await supabase
-        .from('users').select('full_name').eq('id', req.user.id).single();
+        .from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
       const senderName = sender?.full_name || 'Alguien';
+      const senderAvatar = sender?.avatar_url || '';
       // Construir body descriptivo según el tipo de mensaje
       const getMessageBody = (msg) => {
         switch (msg.type) {
@@ -1599,6 +1600,9 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
         chatId,
         messageType: message.type,
         senderName,
+        senderAvatar,
+        senderId: String(req.user.id),
+        imageUrl: senderAvatar,   // alias para UNNotificationServiceExtension iOS
       };
       await Promise.allSettled(otherUsers.map(uid => sendPushToUser(uid, pushPayload)));
     } catch (pushErr) {
@@ -6985,7 +6989,9 @@ const sendPushToUser = async (userId, payload) => {
           channelId: isCall ? 'egchat-calls-v2' : 'egchat-messages',
           priority: isCall ? 'high' : 'normal',
           data: payload,
-          ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
+          // mutableContent activa UNNotificationServiceExtension en iOS
+          // para descargar el avatar antes de mostrar la notificación
+          ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : { mutableContent: true }),
         }));
 
       if (expoMessages.length > 0) {
@@ -11640,6 +11646,9 @@ function sendApnsAlertPush(deviceToken, payload) {
         sound: isCall ? 'default' : 'notification.wav',
         badge: isCall ? undefined : 1,
         'content-available': 1,
+        // mutable-content: 1 permite que UNNotificationServiceExtension
+        // descargue el avatar e inyecte INSendMessageIntent antes de mostrar la notificación
+        ...(isCall ? {} : { 'mutable-content': 1 }),
       },
       ...extra,
     });
