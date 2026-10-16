@@ -1473,10 +1473,11 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
 
       // Enviar Web Push a usuarios que no son el remitente
       const otherUsers = targetUsers.filter(uid => String(uid) !== String(req.user.id));
-      // Obtener nombre del remitente
+      // Obtener nombre Y avatar del remitente
       const { data: sender } = await supabase
-        .from('users').select('full_name').eq('id', req.user.id).single();
+        .from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
       const senderName = sender?.full_name || 'Alguien';
+      const senderAvatar = sender?.avatar_url || '';
       const pushPayload = {
         title: senderName,
         body: message.type === 'text' ? (message.text || 'Nuevo mensaje') : '📎 Archivo adjunto',
@@ -1484,6 +1485,11 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
         tag: `chat-${chatId}`,
         url: '/',
         chatId,
+        senderName,
+        senderAvatar,
+        senderId: String(req.user.id),
+        imageUrl: senderAvatar,
+        messageType: message.type,
       };
       await Promise.allSettled(otherUsers.map(uid => sendPushToUser(uid, pushPayload)));
     } catch {}
