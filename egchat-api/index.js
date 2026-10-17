@@ -7060,8 +7060,10 @@ const sendPushToUser = async (userId, payload) => {
         if (r.status === 'rejected') {
           const errMsg = String(r.reason?.message || r.reason || '');
           console.warn(`[Push] APNs error token ${i}:`, errMsg);
-          if (token && /BadEnvironmentKeyInToken|BadDeviceToken/.test(errMsg)) {
-            // Solo eliminar si también falló en sandbox (withApnsEnvironmentFallback ya reintentó)
+          // Solo eliminar si es BadDeviceToken (token corrupto/inválido permanentemente)
+          // NO eliminar por BadEnvironmentKeyInToken — withApnsEnvironmentFallback ya reintentó
+          // en sandbox. Si sigue fallando es un problema de entorno, no de token inválido.
+          if (token && /BadDeviceToken/.test(errMsg) && !/BadEnvironmentKeyInToken/.test(errMsg)) {
             removePushToken(token).then(() => {
               console.warn(`[Push] Token APNs inválido eliminado: ...${String(token).slice(-8)}`);
             }).catch(() => {});
@@ -7148,12 +7150,30 @@ app.post('/api/push/register-expo-token', auth, async (req, res) => {
     const resolvedPlatform = platform || 'android';
     const resolvedType = tokenType || (token.startsWith('ExponentPushToken') ? 'expo' : resolvedPlatform === 'ios' ? 'apns' : 'fcm');
 
-    // Primero borrar tokens viejos del mismo usuario/plataforma/tipo para evitar duplicados
-    await ignoreSupabaseError(supabase.from('expo_push_tokens')
-      .delete()
-      .eq('user_id', req.user.id)
-      .eq('platform', resolvedPlatform)
-      .neq('token', token), 'No se pudieron limpiar tokens antiguos');
+    // Para iOS: permitir tener AMBOS tokens (ExponentPushToken Y APNs nativo)
+    // porque el APNs nativo es necesario para mutable-content (fotos en notificaciones)
+    // Solo borrar tokens del mismo tipo, no todos los de la plataforma
+    if (resolvedPlatform === 'ios') {
+      // Borrar solo tokens del mismo tipo para este usuario
+      const isExpoToken = token.startsWith('ExponentPushToken');
+      await ignoreSupabaseError(
+        supabase.from('expo_push_tokens')
+          .delete()
+          .eq('user_id', req.user.id)
+          .eq('platform', resolvedPlatform)
+          .neq('token', token)
+          .like('token', isExpoToken ? 'ExponentPushToken%' : '%')
+          .not('token', 'like', isExpoToken ? '' : 'ExponentPushToken%'),
+        'No se pudieron limpiar tokens antiguos iOS'
+      );
+    } else {
+      // Android: borrar tokens viejos del mismo usuario/plataforma
+      await ignoreSupabaseError(supabase.from('expo_push_tokens')
+        .delete()
+        .eq('user_id', req.user.id)
+        .eq('platform', resolvedPlatform)
+        .neq('token', token), 'No se pudieron limpiar tokens antiguos');
+    }
 
     const { error: upsertError } = await supabase.from('expo_push_tokens').upsert({
       user_id: req.user.id,
