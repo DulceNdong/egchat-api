@@ -7014,15 +7014,13 @@ const sendPushToUser = async (userId, payload) => {
               channelId: msg.channelId,
               priority: msg.priority,
               data: msg.data,
-              // mutableContent: Expo lo pasa como mutable-content:1 a APNs
-              // Esto activa UNNotificationServiceExtension para descargar el avatar
-              // richContent: Expo pasa la imagen directamente a APNs/FCM
               ...(msg.mutableContent ? {
                 mutableContent: true,
                 richContent: msg.data?.imageUrl ? { image: msg.data.imageUrl } : undefined,
               } : {}),
               ...(msg.ttl ? { ttl: msg.ttl, expiration: msg.expiration } : {}),
             };
+            console.log(`[Push] Expo payload → mutableContent: ${!!msg.mutableContent}, richContent image: ${msg.data?.imageUrl ? msg.data.imageUrl.slice(0, 60) + '...' : 'NINGUNA'}`);
             const expoRes = await fetch('https://exp.host/--/api/v2/push/send', {
               method: 'POST',
               headers: {
