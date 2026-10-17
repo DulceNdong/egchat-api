@@ -7235,6 +7235,31 @@ app.get('/api/push/status', auth, async (req, res) => {
 // PUSH DIAGNOSTICS
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Admin: test APNs directo con mutable-content para verificar Notification Service Extension
+app.post('/api/push/test-apns-mutable', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.query.key;
+  if (!key || key !== (process.env.ADMIN_RESET_KEY || JWT_SECRET)) {
+    return res.status(403).json({ message: 'No autorizado' });
+  }
+  try {
+    const { token, avatarUrl, senderName } = req.body;
+    if (!token) return res.status(400).json({ message: 'token requerido' });
+    const payload = {
+      title: senderName || 'Test',
+      body: 'Prueba de notificación con foto',
+      senderAvatar: avatarUrl || '',
+      imageUrl: avatarUrl || '',
+      senderName: senderName || 'Test',
+      chatId: 'test',
+    };
+    const result = await sendApnsAlertPush(token, payload);
+    res.json({ ok: true, result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
 // Admin: verificar suscripciones por teléfono
 app.get('/api/push/check/:phone', async (req, res) => {
   const key = req.headers['x-admin-key'] || req.query.key;
