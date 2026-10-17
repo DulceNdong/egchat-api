@@ -6984,7 +6984,11 @@ const sendPushToUser = async (userId, payload) => {
 
     if (expoSubs.length > 0) {
       const expoMessages = expoSubs
-        .filter(sub => Expo.isExpoPushToken(sub.token))
+        .filter(sub => {
+          const valid = Expo.isExpoPushToken(sub.token);
+          if (!valid) console.warn(`[Push] Token descartado por isExpoPushToken: ...${String(sub.token).slice(-8)}`);
+          return valid;
+        })
         .map(sub => ({
           to: sub.token,
           title: payload.title || 'EGChat',
