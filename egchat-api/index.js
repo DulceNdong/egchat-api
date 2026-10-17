@@ -1602,7 +1602,9 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
         senderName,
         senderAvatar,
         senderId: String(req.user.id),
-        imageUrl: senderAvatar,   // alias para UNNotificationServiceExtension iOS
+        imageUrl: senderAvatar,   // alias para UNNotificationServiceExtension iOS (avatar)
+        // Para mensajes de imagen: URL de la miniatura del mensaje
+        messageImageUrl: message.type === 'image' ? (message.file_url || '') : '',
       };
       await Promise.allSettled(otherUsers.map(uid => sendPushToUser(uid, pushPayload)));
     } catch (pushErr) {
@@ -7020,7 +7022,9 @@ const sendPushToUser = async (userId, payload) => {
               data: msg.data,
               ...(msg.mutableContent ? {
                 mutableContent: true,
-                richContent: msg.data?.imageUrl ? { image: msg.data.imageUrl } : undefined,
+                richContent: (msg.data?.messageImageUrl || msg.data?.imageUrl)
+                  ? { image: msg.data.messageImageUrl || msg.data.imageUrl }
+                  : undefined,
               } : {}),
               ...(msg.ttl ? { ttl: msg.ttl, expiration: msg.expiration } : {}),
             };
