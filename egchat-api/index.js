@@ -6969,13 +6969,18 @@ const sendPushToUser = async (userId, payload) => {
       .select('token, platform')
       .eq('user_id', userId);
 
-    const fcmSubs = (pushTokens || []).filter(sub => sub.platform === 'android' && !String(sub.token || '').startsWith('ExponentPushToken'));
-    const apnsSubs = (pushTokens || []).filter(sub => sub.platform === 'ios' && !String(sub.token || '').startsWith('ExponentPushToken'));
-    const expoSubs = (pushTokens || []).filter(sub => {
+    const fcmSubs   = (pushTokens || []).filter(sub => sub.platform === 'android' && !String(sub.token || '').startsWith('ExponentPushToken'));
+    const apnsSubs  = (pushTokens || []).filter(sub => sub.platform === 'ios'     && !String(sub.token || '').startsWith('ExponentPushToken'));
+    // Para iOS: si hay token APNs nativo, usar solo ese (permite mutable-content para fotos en notificaciones)
+    // Si no hay APNs nativo, usar ExponentPushToken como fallback
+    const iosHasNativeToken = apnsSubs.length > 0;
+    const expoSubs  = (pushTokens || []).filter(sub => {
       if (!String(sub.token || '').startsWith('ExponentPushToken')) return false;
+      // Si el usuario iOS ya tiene token APNs nativo, no enviar por Expo (evita duplicados)
+      if (sub.platform === 'ios' && iosHasNativeToken) return false;
       return true;
     });
-    console.log(`[Push] Tokens encontrados → expo: ${expoSubs.length}, apns: ${apnsSubs.length}, fcm: ${fcmSubs.length}`);
+    console.log(`[Push] Tokens → expo: ${expoSubs.length}, apns: ${apnsSubs.length}, fcm: ${fcmSubs.length} (iOS nativo: ${iosHasNativeToken})`);
 
     if (expoSubs.length > 0) {
       const expoMessages = expoSubs
