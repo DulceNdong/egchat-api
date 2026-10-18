@@ -6213,33 +6213,40 @@ const updateUserVersions = async () => {
 // ─── WebRTC Signaling — persistido en Supabase ───────────────────────────────
 
 // TURN token endpoint — genera credenciales temporales para TURN server
-app.get('/api/call/turn-token', auth, async (req, res) => {
+// Alias sin prefijo /call/ para compatibilidad con cliente web
+const handleTurnToken = async (req, res) => {
   try {
-    const accountSid  = process.env.TWILIO_ACCOUNT_SID;
-    const apiKeySid   = process.env.TWILIO_API_KEY_SID;
+    const accountSid   = process.env.TWILIO_ACCOUNT_SID;
+    const apiKeySid    = process.env.TWILIO_API_KEY_SID;
     const apiKeySecret = process.env.TWILIO_API_KEY_SECRET;
 
     const client = require('twilio')(apiKeySid, apiKeySecret, { accountSid });
-    const token = await client.tokens.create({ ttl: 86400 });
+    const token  = await client.tokens.create({ ttl: 86400 });
 
     res.json({
       iceServers: token.iceServers.map(s => ({
-        urls: s.url || s.urls,
-        username: s.username,
+        urls:       s.url || s.urls,
+        username:   s.username,
         credential: s.credential,
       }))
     });
   } catch (e) {
-    console.error('TURN token error:', e.message);
+    // Fallback con STUN + TURN públicos (Metered.ca free tier)
     res.json({
       iceServers: [
-        { urls: ['stun:stun.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+        { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
         { urls: 'stun:stun.cloudflare.com:3478' },
-        { urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443'], username: 'openrelayproject', credential: 'openrelayproject' }
+        { urls: 'turn:relay.metered.ca:80',               username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:relay.metered.ca:443',              username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turns:relay.metered.ca:443',             username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:relay.metered.ca:80?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
       ]
     });
   }
-});
+};
+
+app.get('/api/turn-token',      auth, handleTurnToken);
+app.get('/api/call/turn-token', auth, handleTurnToken);
 
 // Iniciar llamada — caller envía offer + push al destinatario
 app.post('/api/call/offer', auth, async (req, res) => {
