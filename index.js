@@ -6531,7 +6531,7 @@ const sendPushToUser = async (userId, payload) => {
     });
 
     // APNs directo para iOS (soporta mutable-content para fotos en notificaciones)
-    if (apnsSubs.length > 0 && sendApnsAlertPush) {
+    if (apnsSubs.length > 0 && typeof sendApnsAlertPush === 'function') {
       const apnsPayload = {
         ...payload,
         imageUrl: payload.senderAvatar || payload.imageUrl || '',
