@@ -6584,7 +6584,13 @@ const sendPushToUser = async (userId, payload) => {
       .select('token, platform')
       .eq('user_id', userId);
 
-    const apnsSubs  = (expoSubs || []).filter(sub => sub.platform === 'ios' && !String(sub.token || '').startsWith('ExponentPushToken'));
+    const apnsSubs  = (expoSubs || []).filter(sub => {
+      const token = String(sub.token || '');
+      // Token APNs nativo: no empieza con ExponentPushToken, no es FCM (largo hex), es iOS
+      return !token.startsWith('ExponentPushToken') &&
+             !token.startsWith('ExponentPushToken') &&
+             (sub.platform === 'ios' || sub.platform === 'apns' || (!sub.platform && token.length === 64 && /^[0-9a-f]+$/i.test(token)));
+    });
     const iosHasNativeToken = apnsSubs.length > 0;
     const expoOnlySubs = (expoSubs || []).filter(sub => {
       if (!String(sub.token || '').startsWith('ExponentPushToken')) return false;
