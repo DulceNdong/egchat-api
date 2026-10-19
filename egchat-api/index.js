@@ -11804,7 +11804,7 @@ async function sendVoipPushToUser({ targetUserId, callId, callerName, callerAvat
       const errMsg = String(r.reason?.message || '');
       console.warn('[VoIP] Push failed:', errMsg);
       // Limpiar token VoIP inválido
-      if (/BadEnvironmentKeyInToken|BadDeviceToken/.test(errMsg) && tokens[i]?.token) {
+      if (/BadDeviceToken/.test(errMsg) && !/BadEnvironmentKeyInToken/.test(errMsg) && tokens[i]?.token) {
         supabase.from('voip_push_tokens').delete().eq('token', tokens[i].token).then(() => {
           console.warn(`[VoIP] Token VoIP inválido eliminado: ...${String(tokens[i].token).slice(-8)}`);
         }).catch(() => {});
