@@ -5824,12 +5824,13 @@ app.post('/api/call/offer', auth, async (req, res) => {
 
   // Si targetUserId es un chatId (UUID sin user en voip_push_tokens), resolver el userId real
   if (targetUserId) {
-    const { data: participant } = await supabase
+    const { data: participant, error: partErr } = await supabase
       .from('chat_participants')
       .select('user_id')
       .eq('chat_id', targetUserId)
       .neq('user_id', req.user.id)
       .maybeSingle();
+    console.log(`[Call] Resolución chatId: targetUserId=${targetUserId}, callerId=${req.user.id}, found=${!!participant?.user_id}, error=${partErr?.message || 'none'}`);
     if (participant?.user_id) {
       console.log(`[Call] targetUserId ${targetUserId} era chatId → resuelto a userId ${participant.user_id}`);
       targetUserId = participant.user_id;
