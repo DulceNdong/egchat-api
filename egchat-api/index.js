@@ -6250,8 +6250,23 @@ app.get('/api/call/turn-token', auth, handleTurnToken);
 
 // Iniciar llamada — caller envía offer + push al destinatario
 app.post('/api/call/offer', auth, async (req, res) => {
-  const { callId, offer, targetUserId, type } = req.body;
+  let { callId, offer, targetUserId, type } = req.body;
   if (!callId || !offer) return res.status(400).json({ error: 'callId y offer requeridos' });
+
+  // Si targetUserId es un chatId, resolver el userId real del otro participante
+  if (targetUserId) {
+    const { data: participant, error: partErr } = await supabase
+      .from('chat_participants')
+      .select('user_id')
+      .eq('chat_id', targetUserId)
+      .neq('user_id', req.user.id)
+      .maybeSingle();
+    console.log(`[Call] Resolución: targetUserId=${targetUserId}, found=${!!participant?.user_id}, err=${partErr?.message || 'none'}`);
+    if (participant?.user_id) {
+      console.log(`[Call] chatId → userId: ${participant.user_id}`);
+      targetUserId = participant.user_id;
+    }
+  }
   try {
     await supabase.from('call_sessions').upsert({
       call_id: callId,
