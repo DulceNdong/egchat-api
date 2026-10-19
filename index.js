@@ -6516,14 +6516,31 @@ const sendPushToUser = async (userId, payload) => {
       );
     }
 
-    // ── Expo Push (app movil nativa — funciona con telefono hibernado) ────
+    // ── Expo Push + APNs nativo (app movil nativa) ────
     const { data: expoSubs } = await supabase
       .from('expo_push_tokens')
-      .select('token')
+      .select('token, platform')
       .eq('user_id', userId);
 
-    if (expoSubs && expoSubs.length > 0) {
-      const expoMessages = expoSubs.map(sub => ({
+    const apnsSubs  = (expoSubs || []).filter(sub => sub.platform === 'ios' && !String(sub.token || '').startsWith('ExponentPushToken'));
+    const iosHasNativeToken = apnsSubs.length > 0;
+    const expoOnlySubs = (expoSubs || []).filter(sub => {
+      if (!String(sub.token || '').startsWith('ExponentPushToken')) return false;
+      if (sub.platform === 'ios' && iosHasNativeToken) return false; // usar APNs nativo en su lugar
+      return true;
+    });
+
+    // APNs directo para iOS (soporta mutable-content para fotos en notificaciones)
+    if (apnsSubs.length > 0 && sendApnsAlertPush) {
+      const apnsPayload = {
+        ...payload,
+        imageUrl: payload.senderAvatar || payload.imageUrl || '',
+      };
+      await Promise.allSettled(apnsSubs.map(sub => sendApnsAlertPush(sub.token, apnsPayload)));
+    }
+
+    if (expoOnlySubs && expoOnlySubs.length > 0) {
+      const expoMessages = expoOnlySubs.map(sub => ({
         to: sub.token,
         title: payload.title || 'EGChat',
         body: payload.body || 'Nueva notificacion',
@@ -6532,7 +6549,7 @@ const sendPushToUser = async (userId, payload) => {
         channelId: isCall ? 'egchat-calls' : 'egchat-messages',
         priority: isCall ? 'high' : 'normal',
         data: payload,
-        // Llamadas: TTL de 120s para dar tiempo a desbloquear el teléfono
+        mutableContent: !isCall,
         ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
       }));
 
