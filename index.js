@@ -6482,6 +6482,68 @@ app.get('/api/push/vapid-public-key', (req, res) => {
   res.json({ publicKey: VAPID_PUBLIC_KEY });
 });
 
+// ── Enviar alert push directo a APNs (mensajes con mutable-content) ──────────
+async function sendApnsAlertPush(deviceToken, payload) {
+  return new Promise((resolve, reject) => {
+    const jwt = getApnsJwt();
+    if (!jwt) return resolve({ ok: false, error: 'No JWT' });
+
+    const BUNDLE_ID = process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat';
+    const isCall = payload.notificationType === 'incoming_call';
+    const extra = Object.entries(payload).reduce((acc, [k, v]) => {
+      if (v !== undefined && v !== null) acc[k] = v;
+      return acc;
+    }, {});
+
+    const body = JSON.stringify({
+      aps: {
+        alert: { title: payload.title || 'EGChat', body: payload.body || 'Nuevo mensaje' },
+        sound: isCall ? 'default' : 'notification.wav',
+        badge: isCall ? undefined : 1,
+        'content-available': 1,
+        ...(isCall ? {} : { 'mutable-content': 1 }),
+      },
+      ...extra,
+    });
+
+    const options = {
+      hostname: 'api.push.apple.com',
+      port: 443,
+      path: `/3/device/${deviceToken}`,
+      method: 'POST',
+      headers: {
+        'authorization': `bearer ${jwt}`,
+        'apns-push-type': 'alert',
+        'apns-topic': BUNDLE_ID,
+        'apns-priority': '10',
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode === 200) resolve({ ok: true });
+        else {
+          const reason = (() => { try { return JSON.parse(data).reason; } catch { return data; } })();
+          // Reintentar en sandbox si el entorno no coincide
+          if (/BadEnvironmentKeyInToken|BadDeviceToken/.test(reason)) {
+            resolve({ ok: false, error: reason });
+          } else {
+            resolve({ ok: false, error: `APNs ${res.statusCode}: ${reason}` });
+          }
+        }
+      });
+    });
+    req.on('error', err => resolve({ ok: false, error: err.message }));
+    req.setTimeout(10000, () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
+    req.write(body);
+    req.end();
+  });
+}
+
 // Función interna para enviar push a un usuario
 const sendPushToUser = async (userId, payload) => {
   try {
