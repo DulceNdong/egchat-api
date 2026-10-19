@@ -5861,7 +5861,7 @@ app.post('/api/call/offer', auth, async (req, res) => {
         // 1️⃣ VoIP push (iOS PushKit) — despierta la app aunque esté cerrada
         //    Se envía PRIMERO porque tiene latencia 0 y es el canal correcto para llamadas
         try {
-          await sendVoipPushToUser({
+          const voipResult = await sendVoipPushToUser({
             targetUserId,
             callId,
             callerName,
@@ -5869,6 +5869,7 @@ app.post('/api/call/offer', auth, async (req, res) => {
             callType: type || 'audio',
             offer,
           });
+          console.log(`[VoIP] Push resultado para user ${targetUserId}:`, JSON.stringify(voipResult));
         } catch (voipErr) {
           console.warn('[VoIP] VoIP push failed:', voipErr.message);
         }
