@@ -6605,7 +6605,32 @@ const sendPushToUser = async (userId, payload) => {
         ...payload,
         imageUrl: payload.senderAvatar || payload.imageUrl || '',
       };
-      await Promise.allSettled(apnsSubs.map(sub => sendApnsAlertPush(sub.token, apnsPayload)));
+      const apnsResults = await Promise.allSettled(apnsSubs.map(sub => sendApnsAlertPush(sub.token, apnsPayload)));
+      // Si el token APNs falla con BadEnvironmentKeyInToken, caer de vuelta a Expo
+      const apnsAllFailed = apnsResults.every(r => r.status === 'rejected' ||
+        (r.status === 'fulfilled' && r.value?.error?.includes?.('BadEnvironmentKeyInToken')));
+      if (apnsAllFailed) {
+        console.warn('[Push] APNs nativo falló, usando ExponentPushToken como fallback');
+        // Incluir ExponentPushToken iOS aunque haya token APNs nativo
+        const expoFallback = (expoSubs || []).filter(sub =>
+          String(sub.token || '').startsWith('ExponentPushToken')
+        );
+        if (expoFallback.length > 0) {
+          for (const sub of expoFallback) {
+            try {
+              await fetch('https://exp.host/--/api/v2/push/send', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                body: JSON.stringify({
+                  to: sub.token, title: payload.title, body: payload.body,
+                  sound: 'notification.wav', badge: 1, channelId: 'egchat-messages',
+                  priority: 'normal', data: payload, mutableContent: true,
+                }),
+              });
+            } catch { /* silencioso */ }
+          }
+        }
+      }
     }
 
     if (expoOnlySubs && expoOnlySubs.length > 0) {
