@@ -8361,37 +8361,40 @@ async function sendVoipPush({ deviceToken, payload }) {
     const BUNDLE_ID = process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat';
     const body = JSON.stringify(payload);
 
-    const options = {
-      hostname: 'api.push.apple.com',
-      port: 443,
-      path: `/3/device/${deviceToken}`,
-      method: 'POST',
-      headers: {
-        'authorization': `bearer ${jwt}`,
-        'apns-push-type': 'voip',
-        'apns-topic': `${BUNDLE_ID}.voip`,
-        'apns-priority': '10',
-        'apns-expiration': String(Math.floor(Date.now() / 1000) + 30),
-        'content-type': 'application/json',
-        'content-length': Buffer.byteLength(body),
-      },
-    };
+    // APNs requiere HTTP/2 — usar http2 nativo de Node.js
+    const http2 = require('http2');
+    const client = http2.connect('https://api.push.apple.com');
+    client.on('error', (err) => { client.destroy(); reject(err); });
 
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        if (res.statusCode === 200) {
-          resolve({ ok: true });
-        } else {
-          try { reject(new Error(`APNs ${res.statusCode}: ${JSON.parse(data).reason}`)); }
-          catch { reject(new Error(`APNs ${res.statusCode}: ${data}`)); }
-        }
-      });
+    const req = client.request({
+      ':method': 'POST',
+      ':path': `/3/device/${deviceToken}`,
+      ':scheme': 'https',
+      ':authority': 'api.push.apple.com',
+      'authorization': `bearer ${jwt}`,
+      'apns-push-type': 'voip',
+      'apns-topic': `${BUNDLE_ID}.voip`,
+      'apns-priority': '10',
+      'apns-expiration': String(Math.floor(Date.now() / 1000) + 30),
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body),
     });
 
-    req.on('error', reject);
-    req.setTimeout(10000, () => { req.destroy(); reject(new Error('APNs timeout')); });
+    let status = 0;
+    let data = '';
+    req.on(':response', (hdrs) => { status = hdrs[':status']; });
+    req.on('data', chunk => { data += chunk; });
+    req.on('end', () => {
+      client.close();
+      if (status === 200) {
+        resolve({ ok: true });
+      } else {
+        try { reject(new Error(`APNs ${status}: ${JSON.parse(data).reason}`)); }
+        catch { reject(new Error(`APNs ${status}: ${data}`)); }
+      }
+    });
+    req.on('error', err => { client.destroy(); reject(err); });
+    req.setTimeout(10000, () => { client.destroy(); reject(new Error('APNs timeout')); });
     req.write(body);
     req.end();
   });
