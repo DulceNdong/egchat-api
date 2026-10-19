@@ -5835,18 +5835,6 @@ app.post('/api/call/offer', auth, async (req, res) => {
       targetUserId = participant.user_id;
     }
   }
-
-  // Si targetUserId parece ser un chatId (no un userId), resolver el userId real
-  // Un chatId tiene participantes en la tabla chat_participants
-  if (targetUserId) {
-    const { data: participant } = await supabase
-      .from('chat_participants')
-      .select('user_id')
-      .eq('chat_id', targetUserId)
-      .neq('user_id', req.user.id)
-      .single();
-    if (participant?.user_id) {
-      console.log(`[Call] targetUserId ${targetUserId} era chatId, resuelto a userId ${participant.user_id}`);
       targetUserId = participant.user_id;
     }
   }
