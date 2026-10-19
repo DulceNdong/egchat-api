@@ -8180,20 +8180,40 @@ app.post('/api/push/register', auth, async (req, res) => {
 app.post('/api/push/register-expo-token', auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { expoPushToken } = req.body;
+    const { expoPushToken, platform, tokenType } = req.body;
+    const token = expoPushToken || req.body.token;
 
-    if (!expoPushToken || !Expo.isExpoPushToken(expoPushToken)) {
-      return res.status(400).json({ message: 'Token Expo Push inválido' });
+    if (!token || typeof token !== 'string' || token.length < 10) {
+      return res.status(400).json({ message: 'Token push inválido' });
     }
 
-    // Insertar o actualizar token
-    await supabase.from('expo_push_tokens').upsert({
-      user_id: userId,
-      token: expoPushToken,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'user_id,token' });
+    const resolvedPlatform = platform || 'android';
+    const isExpoToken = token.startsWith('ExponentPushToken');
+    const resolvedType = tokenType || (isExpoToken ? 'expo' : resolvedPlatform === 'ios' ? 'apns' : 'fcm');
 
-    res.json({ ok: true });
+    // Para iOS: mantener AMBOS tokens (ExponentPushToken Y APNs nativo)
+    // El APNs nativo permite mutable-content para fotos en notificaciones
+    if (resolvedPlatform === 'ios' && !isExpoToken) {
+      // Token APNs nativo — guardar sin borrar el ExponentPushToken
+      await supabase.from('expo_push_tokens').upsert({
+        user_id: userId,
+        token,
+        platform: 'ios',
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'token' });
+      console.log(`[Push] Token APNs nativo registrado para user ${userId}: ...${token.slice(-8)}`);
+    } else {
+      // ExponentPushToken o token Android
+      await supabase.from('expo_push_tokens').upsert({
+        user_id: userId,
+        token,
+        platform: resolvedPlatform,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'token' });
+      console.log(`[Push] Token registrado (${resolvedType}/${resolvedPlatform}) para user ${userId}: ...${token.slice(-8)}`);
+    }
+
+    res.json({ ok: true, message: 'Token registrado', tokenType: resolvedType });
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
