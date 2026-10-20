@@ -6179,6 +6179,123 @@ app.post('/api/stories/:storyId/react', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
+// ── GET /api/stories/contacts-new — estados nuevos de contactos (últimas 24h) ──
+app.get('/api/stories/contacts-new', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+    // Obtener contactos
+    const { data: contacts } = await supabase
+      .from('contacts')
+      .select('contact_user_id, contact_id')
+      .or(`user_id.eq.${userId},contact_id.eq.${userId}`)
+      .eq('is_blocked', false);
+
+    const contactIds = new Set();
+    (contacts || []).forEach(c => {
+      if (c.contact_user_id && c.contact_user_id !== userId) contactIds.add(c.contact_user_id);
+      if (c.contact_id && c.contact_id !== userId) contactIds.add(c.contact_id);
+    });
+
+    if (contactIds.size === 0) return res.json([]);
+
+    const { data: stories } = await supabase
+      .from('stories')
+      .select('id, user_id, created_at, user:users!user_id(full_name, avatar_url)')
+      .in('user_id', [...contactIds])
+      .gt('created_at', since)
+      .order('created_at', { ascending: false });
+
+    const result = (stories || []).map(s => ({
+      id: s.id,
+      user_id: s.user_id,
+      created_at: s.created_at,
+      full_name: s.user?.full_name || 'Usuario',
+      avatar_url: s.user?.avatar_url || '',
+    }));
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/moments/contacts-new — moments nuevos de contactos (últimas 24h) ──
+app.get('/api/moments/contacts-new', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+    const { data: contacts } = await supabase
+      .from('contacts')
+      .select('contact_user_id, contact_id')
+      .or(`user_id.eq.${userId},contact_id.eq.${userId}`)
+      .eq('is_blocked', false);
+
+    const contactIds = new Set();
+    (contacts || []).forEach(c => {
+      if (c.contact_user_id && c.contact_user_id !== userId) contactIds.add(c.contact_user_id);
+      if (c.contact_id && c.contact_id !== userId) contactIds.add(c.contact_id);
+    });
+
+    if (contactIds.size === 0) return res.json([]);
+
+    const { data: moments } = await supabase
+      .from('moments')
+      .select('id, user_id, created_at, user:users!user_id(full_name, avatar_url)')
+      .in('user_id', [...contactIds])
+      .gt('created_at', since)
+      .order('created_at', { ascending: false });
+
+    const result = (moments || []).map(m => ({
+      id: m.id,
+      user_id: m.user_id,
+      created_at: m.created_at,
+      full_name: m.user?.full_name || 'Usuario',
+      avatar_url: m.user?.avatar_url || '',
+    }));
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/live/active — lives activos de contactos ──────────────
+app.get('/api/live/active', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { data: contacts } = await supabase
+      .from('contacts')
+      .select('contact_user_id, contact_id')
+      .or(`user_id.eq.${userId},contact_id.eq.${userId}`)
+      .eq('is_blocked', false);
+
+    const contactIds = new Set();
+    (contacts || []).forEach(c => {
+      if (c.contact_user_id && c.contact_user_id !== userId) contactIds.add(c.contact_user_id);
+      if (c.contact_id && c.contact_id !== userId) contactIds.add(c.contact_id);
+    });
+
+    if (contactIds.size === 0) return res.json([]);
+
+    // Intentar desde live_sessions si existe, sino devolver array vacío
+    const { data: lives, error } = await supabase
+      .from('live_sessions')
+      .select('id, host_id, created_at, user:users!host_id(full_name, avatar_url)')
+      .in('host_id', [...contactIds])
+      .eq('is_active', true)
+      .order('created_at', { ascending: false });
+
+    if (error) return res.json([]); // tabla no existe aún
+
+    const result = (lives || []).map(l => ({
+      live_id: l.id,
+      host_id: l.host_id,
+      created_at: l.created_at,
+      full_name: l.user?.full_name || 'Usuario',
+      avatar_url: l.user?.avatar_url || '',
+    }));
+    res.json(result);
+  } catch (e) { res.json([]); }
+});
+
 // ════════════════════════════════════════════════════════════════════
 // START
 // ════════════════════════════════════════════════════════════════════
