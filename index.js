@@ -5950,12 +5950,58 @@ app.get('/api/call/:callId', auth, async (req, res) => {
     callerId: data.caller_id,
     targetUserId: data.target_user_id,
     ended: data.ended,
+    offerVersion: data.offer_version ?? 1,
   });
+});
+
+// Rechazar llamada (callee)
+app.post('/api/call/reject', auth, async (req, res) => {
+  const { callId } = req.body;
+  const { data } = await supabase.from('call_sessions').select('caller_id').eq('call_id', callId).single();
+  await supabase.from('call_sessions').update({ ended: true, updated_at: new Date().toISOString() }).eq('call_id', callId);
+  if (data?.caller_id) {
+    emitToUser(String(data.caller_id), { type: 'call_ended', callId, reason: 'rejected', ts: Date.now() });
+  }
+  res.json({ ok: true });
+});
+
+// Cancelar llamada (caller)
+app.post('/api/call/cancel', auth, async (req, res) => {
+  const { callId } = req.body;
+  const { data } = await supabase.from('call_sessions').select('target_user_id').eq('call_id', callId).single();
+  await supabase.from('call_sessions').update({ ended: true, updated_at: new Date().toISOString() }).eq('call_id', callId);
+  if (data?.target_user_id) {
+    emitToUser(String(data.target_user_id), { type: 'call_ended', callId, reason: 'cancelled', ts: Date.now() });
+  }
+  res.json({ ok: true });
+});
+
+// Marcar como conectado
+app.post('/api/call/connected', auth, async (req, res) => {
+  const { callId } = req.body;
+  await supabase.from('call_sessions').update({ updated_at: new Date().toISOString() }).eq('call_id', callId);
+  res.json({ ok: true });
+});
+
+// Anti doble-aceptación
+app.post('/api/calls/claim', auth, async (req, res) => {
+  const { callId } = req.body;
+  const { data } = await supabase.from('call_sessions').select('callee_claimed').eq('call_id', callId).eq('ended', false).single();
+  if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
+  if (data.callee_claimed) return res.json({ alreadyAccepted: true });
+  await supabase.from('call_sessions').update({ callee_claimed: true, updated_at: new Date().toISOString() }).eq('call_id', callId);
+  res.json({ alreadyAccepted: false });
 });
 
 // Terminar llamada
 app.delete('/api/call/:callId', auth, async (req, res) => {
-  await supabase.from('call_sessions').update({ ended: true, updated_at: new Date().toISOString() }).eq('call_id', req.params.callId);
+  const callId = req.params.callId;
+  const { data } = await supabase.from('call_sessions').select('caller_id, target_user_id').eq('call_id', callId).single();
+  await supabase.from('call_sessions').update({ ended: true, updated_at: new Date().toISOString() }).eq('call_id', callId);
+  // Notificar a ambos participantes via SSE
+  const reason = req.query.reason || 'normal';
+  if (data?.caller_id)      emitToUser(String(data.caller_id),      { type: 'call_ended', callId, reason, ts: Date.now() });
+  if (data?.target_user_id) emitToUser(String(data.target_user_id), { type: 'call_ended', callId, reason, ts: Date.now() });
   // Borrar después de 15 segundos
   setTimeout(async () => {
     await supabase.from('call_sessions').delete().eq('call_id', req.params.callId);
