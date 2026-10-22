@@ -5836,9 +5836,6 @@ app.post('/api/call/offer', auth, async (req, res) => {
       targetUserId = participant.user_id;
     }
   }
-      targetUserId = participant.user_id;
-    }
-  }
   try {
     await supabase.from('call_sessions').upsert({
       call_id: callId,
