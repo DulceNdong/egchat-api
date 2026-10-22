@@ -9178,6 +9178,41 @@ app.post('/api/moments/:momentId/comments', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Eliminar momento (solo el autor)
+app.delete('/api/moments/:momentId', auth, async (req, res) => {
+  try {
+    const { momentId } = req.params;
+    const { data: moment } = await supabase.from('moments').select('user_id').eq('id', momentId).single();
+    if (!moment) return res.status(404).json({ error: 'Momento no encontrado' });
+    if (String(moment.user_id) !== String(req.user.id))
+      return res.status(403).json({ error: 'No tienes permiso para eliminar este momento' });
+    await supabase.from('moment_likes').delete().eq('moment_id', momentId);
+    await supabase.from('moment_comments').delete().eq('moment_id', momentId);
+    const { error } = await supabase.from('moments').delete().eq('id', momentId).eq('user_id', req.user.id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, deleted: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Editar momento (solo el autor)
+app.put('/api/moments/:momentId', auth, async (req, res) => {
+  try {
+    const { momentId } = req.params;
+    const { text, images } = req.body;
+    const { data: moment } = await supabase.from('moments').select('user_id').eq('id', momentId).single();
+    if (!moment) return res.status(404).json({ error: 'Momento no encontrado' });
+    if (String(moment.user_id) !== String(req.user.id))
+      return res.status(403).json({ error: 'No tienes permiso para editar este momento' });
+    const { data, error } = await supabase.from('moments')
+      .update({ text: text || null, images: images || [], updated_at: new Date().toISOString() })
+      .eq('id', momentId)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── #6: CANALES OFICIALES ───────────────────────────────────────────
 app.get('/api/channels', auth, async (req, res) => {
   try {
