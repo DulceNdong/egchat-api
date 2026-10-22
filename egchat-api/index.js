@@ -6469,6 +6469,7 @@ app.post('/api/call/ice', auth, async (req, res) => {
   const { data } = await supabase.from('call_sessions').select('caller_candidates, callee_candidates').eq('call_id', callId).single();
   // Race condition: si la sesión no existe aún, ignorar silenciosamente
   if (!data) return res.json({ ok: true, ignored: true });
+  if (role === 'caller') {
     const arr = JSON.parse(data.caller_candidates || '[]');
     arr.push(candidate);
     await supabase.from('call_sessions').update({ caller_candidates: JSON.stringify(arr), updated_at: new Date().toISOString() }).eq('call_id', callId);
