@@ -6507,7 +6507,10 @@ app.delete('/api/call/:callId', auth, async (req, res) => {
   // Notificar a ambas partes via SSE
   if (session) {
     const otherId = req.user.id === session.caller_id ? session.target_user_id : session.caller_id;
+    // Notificar a AMBAS partes via SSE
     if (otherId) emitToUser(String(otherId), { type: 'call_ended', callId: req.params.callId });
+    if (session.caller_id) emitToUser(String(session.caller_id), { type: 'call_ended', callId: req.params.callId });
+    if (session.target_user_id) emitToUser(String(session.target_user_id), { type: 'call_ended', callId: req.params.callId });
   }
   // Borrar después de 15 segundos
   setTimeout(async () => {
