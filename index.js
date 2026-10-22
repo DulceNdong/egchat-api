@@ -5909,9 +5909,14 @@ app.post('/api/call/offer', auth, async (req, res) => {
 // Callee responde con answer
 app.post('/api/call/answer', auth, async (req, res) => {
   const { callId, answer } = req.body;
-  const { data } = await supabase.from('call_sessions').select('call_id').eq('call_id', callId).eq('ended', false).single();
+  const { data } = await supabase.from('call_sessions').select('call_id, caller_id').eq('call_id', callId).eq('ended', false).single();
   if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
   await supabase.from('call_sessions').update({ answer: JSON.stringify(answer), updated_at: new Date().toISOString() }).eq('call_id', callId);
+  // Notificar al caller via SSE para que no dependa solo del polling
+  if (data.caller_id) {
+    emitToUser(String(data.caller_id), { type: 'call_answered', callId, calleeId: req.user.id });
+    console.log(`[Call] SSE call_answered emitido al caller ${data.caller_id}`);
+  }
   res.json({ ok: true });
 });
 
