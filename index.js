@@ -5921,7 +5921,8 @@ app.post('/api/call/answer', auth, async (req, res) => {
 app.post('/api/call/ice', auth, async (req, res) => {
   const { callId, candidate, role } = req.body;
   const { data } = await supabase.from('call_sessions').select('caller_candidates, callee_candidates').eq('call_id', callId).single();
-  if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
+  // Si la sesión no existe aún (race condition), ignorar silenciosamente
+  if (!data) return res.json({ ok: true, ignored: true });
   if (role === 'caller') {
     const arr = JSON.parse(data.caller_candidates || '[]');
     arr.push(candidate);
