@@ -5911,7 +5911,7 @@ app.post('/api/call/answer', auth, async (req, res) => {
   await supabase.from('call_sessions').update({ answer: JSON.stringify(answer), updated_at: new Date().toISOString() }).eq('call_id', callId);
   // Notificar al caller via SSE para que no dependa solo del polling
   if (data.caller_id) {
-    emitToUser(String(data.caller_id), { type: 'call_answered', callId, calleeId: req.user.id });
+    emitToUser(String(data.caller_id), { type: 'call_answered', callId, calleeId: req.user.id, ts: Date.now() });
     console.log(`[Call] SSE call_answered emitido al caller ${data.caller_id}`);
   }
   res.json({ ok: true });
