@@ -5908,7 +5908,11 @@ app.post('/api/call/answer', auth, async (req, res) => {
   const { callId, answer } = req.body;
   const { data } = await supabase.from('call_sessions').select('call_id, caller_id, type').eq('call_id', callId).eq('ended', false).single();
   if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
-  await supabase.from('call_sessions').update({ answer: JSON.stringify(answer), updated_at: new Date().toISOString() }).eq('call_id', callId);
+  await supabase.from('call_sessions').update({
+    answer: JSON.stringify(answer),
+    status: 'accepted',
+    updated_at: new Date().toISOString()
+  }).eq('call_id', callId);
 
   if (data.caller_id) {
     // 1️⃣ SSE — llega inmediatamente si el caller tiene la app en foreground
