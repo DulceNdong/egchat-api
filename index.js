@@ -5906,13 +5906,32 @@ app.post('/api/call/offer', auth, async (req, res) => {
 // Callee responde con answer
 app.post('/api/call/answer', auth, async (req, res) => {
   const { callId, answer } = req.body;
-  const { data } = await supabase.from('call_sessions').select('call_id, caller_id').eq('call_id', callId).eq('ended', false).single();
+  const { data } = await supabase.from('call_sessions').select('call_id, caller_id, type').eq('call_id', callId).eq('ended', false).single();
   if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
   await supabase.from('call_sessions').update({ answer: JSON.stringify(answer), updated_at: new Date().toISOString() }).eq('call_id', callId);
-  // Notificar al caller via SSE para que no dependa solo del polling
+
   if (data.caller_id) {
+    // 1️⃣ SSE — llega inmediatamente si el caller tiene la app en foreground
     emitToUser(String(data.caller_id), { type: 'call_answered', callId, calleeId: req.user.id, ts: Date.now() });
     console.log(`[Call] SSE call_answered emitido al caller ${data.caller_id}`);
+
+    // 2️⃣ VoIP push al caller — despierta la app si está en background
+    // Sin esto, el SSE no llega porque iOS congela las conexiones de red
+    try {
+      const { data: callee } = await supabase.from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
+      await sendVoipPushToUser({
+        targetUserId: String(data.caller_id),
+        callId,
+        callerName: callee?.full_name || 'EGChat',
+        callerAvatar: callee?.avatar_url || '',
+        callType: data.type || 'audio',
+        offer: null,
+        notificationType: 'call_answered', // distinguir de llamada entrante
+      });
+      console.log(`[Call] VoIP push call_answered enviado al caller ${data.caller_id}`);
+    } catch (e) {
+      console.warn('[Call] VoIP push al caller falló:', e.message);
+    }
   }
   res.json({ ok: true });
 });
