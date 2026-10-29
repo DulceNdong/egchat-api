@@ -6385,7 +6385,7 @@ app.post('/api/call/offer', auth, async (req, res) => {
     }
   }
   try {
-    await supabase.from('call_sessions').upsert({
+    const { error: sessionError } = await supabase.from('call_sessions').upsert({
       call_id: callId,
       offer: JSON.stringify(offer),
       answer: null,
@@ -6398,6 +6398,7 @@ app.post('/api/call/offer', auth, async (req, res) => {
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }, { onConflict: 'call_id' });
+    if (sessionError) throw sessionError;
 
     // Enviar push de llamada entrante al destinatario
     if (targetUserId) {
@@ -6417,6 +6418,7 @@ app.post('/api/call/offer', auth, async (req, res) => {
           callId,
           callerId: req.user.id,
           callerName,
+          callerAvatar: caller?.avatar_url || '',
           callType: type || 'audio',
           notificationType: 'incoming_call',
           offer,
@@ -6453,9 +6455,18 @@ app.post('/api/call/offer', auth, async (req, res) => {
 // Callee responde con answer
 app.post('/api/call/answer', auth, async (req, res) => {
   const { callId, answer } = req.body;
-  const { data } = await supabase.from('call_sessions').select('call_id, caller_id').eq('call_id', callId).eq('ended', false).single();
+  if (!callId || !answer) return res.status(400).json({ error: 'callId y answer requeridos' });
+  const { data, error: lookupError } = await supabase.from('call_sessions')
+    .select('call_id, caller_id, target_user_id, ended, answer').eq('call_id', callId).eq('ended', false).maybeSingle();
+  if (lookupError) return res.status(500).json({ error: 'Error buscando la llamada' });
   if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
-  await supabase.from('call_sessions').update({ answer: JSON.stringify(answer), updated_at: new Date().toISOString() }).eq('call_id', callId);
+  if (String(data.target_user_id) !== String(req.user.id)) return res.status(403).json({ error: 'No autorizado' });
+  if (data.answer) return res.status(409).json({ error: 'La llamada ya fue respondida en otro dispositivo' });
+  const { data: accepted, error: updateError } = await supabase.from('call_sessions').update({
+    answer: JSON.stringify(answer), updated_at: new Date().toISOString(),
+  }).eq('call_id', callId).eq('target_user_id', String(req.user.id)).eq('ended', false).is('answer', null).select('call_id').maybeSingle();
+  if (updateError) return res.status(500).json({ error: 'Error guardando la respuesta de llamada' });
+  if (!accepted) return res.status(409).json({ error: 'La llamada ya fue respondida en otro dispositivo' });
   // Notificar al caller via SSE para que no dependa solo del polling
   if (data.caller_id) {
     emitToUser(String(data.caller_id), { type: 'call_answered', callId, calleeId: req.user.id });
@@ -6892,6 +6903,7 @@ app.post('/api/mini-apps/:appId/install', auth, async (req, res) => {
 
 // Notificar llamada entrante (el callee hace polling de esto)
 app.get('/api/call/incoming/:userId', auth, async (req, res) => {
+  if (String(req.user.id) !== String(req.params.userId)) return res.status(403).json({ error: 'No autorizado' });
   const { data } = await supabase
     .from('call_sessions')
     .select('*')
@@ -6904,11 +6916,16 @@ app.get('/api/call/incoming/:userId', auth, async (req, res) => {
   // Limpiar sesiones muy antiguas (más de 150 segundos — tiempo para desbloquear teléfono hibernado)
   const now = Date.now();
   const valid = data.filter(s => now - new Date(s.created_at).getTime() < 150000);
+  const callerIds = [...new Set(valid.map(s => s.caller_id).filter(Boolean))];
+  const { data: callers } = await supabase.from('users').select('id, full_name, avatar_url').in('id', callerIds);
+  const callersById = new Map((callers || []).map(user => [String(user.id), user]));
   res.json(valid.map(s => ({
     callId: s.call_id,
     callerId: s.caller_id,
     type: s.type,
     offer: JSON.parse(s.offer || 'null'),
+    callerName: callersById.get(String(s.caller_id))?.full_name || 'Usuario',
+    callerAvatar: callersById.get(String(s.caller_id))?.avatar_url || '',
   })));
 });
 
@@ -7140,12 +7157,15 @@ const sendPushToUser = async (userId, payload) => {
           body: payload.body || 'Nueva notificacion',
           sound: isCall ? 'default' : 'notification.wav',
           badge: 1,
-          channelId: isCall ? 'egchat-calls-v2' : 'egchat-messages',
+          channelId: isCall ? 'egchat-calls' : 'egchat-messages',
           priority: isCall ? 'high' : 'normal',
           data: payload,
           // mutableContent activa UNNotificationServiceExtension en iOS
           // para que la extensión descargue el avatar antes de mostrar el banner
-          mutableContent: !isCall,
+          mutableContent: true,
+          ...(payload.callerAvatar || payload.senderAvatar || payload.icon
+            ? { richContent: { image: payload.callerAvatar || payload.senderAvatar || payload.icon } }
+            : {}),
           ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
         }));
 
@@ -7165,9 +7185,11 @@ const sendPushToUser = async (userId, payload) => {
               data: msg.data,
               ...(msg.mutableContent ? {
                 mutableContent: true,
-                richContent: (msg.data?.messageImageUrl || msg.data?.imageUrl)
-                  ? { image: msg.data.messageImageUrl || msg.data.imageUrl }
-                  : undefined,
+                richContent: msg.richContent || (
+                  (msg.data?.callerAvatar || msg.data?.senderAvatar || msg.data?.icon || msg.data?.messageImageUrl || msg.data?.imageUrl)
+                    ? { image: msg.data?.callerAvatar || msg.data?.senderAvatar || msg.data?.icon || msg.data?.messageImageUrl || msg.data?.imageUrl }
+                    : undefined
+                ),
               } : {}),
               ...(msg.ttl ? { ttl: msg.ttl, expiration: msg.expiration } : {}),
             };
