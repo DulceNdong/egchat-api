@@ -42,7 +42,7 @@ const dependencyCache = { timestamp: 0, result: null };
 // Proyecto correcto: fqfxtjnfhvpggssbymdn (tiene todos los usuarios)
 const supabase = createClient(
   process.env.SUPABASE_URL || 'https://fqfxtjnfhvpggssbymdn.supabase.co',
-  process.env.SUPABASE_SERVICE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZxZnh0am5maHZwZ2dzc2J5bWRuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NTg0MzgyMCwiZXhwIjoyMTAxNDE5ODIwfQ.ulwcC4WW-00pgjKzzs9CclyMGad1y4dqjS7P-c2O-CM'
+  process.env.SUPABASE_SERVICE_KEY
 );
 
 // --- Fallback de usuarios cuando Supabase no está disponible ----------

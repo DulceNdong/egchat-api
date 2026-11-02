@@ -81,7 +81,7 @@ Cuando Render actualice (por cualquier opción), ejecuta:
 cd /Users/raymonreddintone/Desktop/EGCHAT_NATIVA/server
 node - << 'EOF'
 const https = require('https');
-const KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZxZnh0am5maHZwZ2dzc2J5bWRuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NTg0MzgyMCwiZXhwIjoyMTAxNDE5ODIwfQ.ulwcC4WW-00pgjKzzs9CclyMGad1y4dqjS7P-c2O-CM';
+const KEY=process.env.SUPABASE_SERVICE_KEY; // exportala en tu shell antes de ejecutar
     function req(m,p){return new Promise(r=>{const d='{}';const rq=https.request({hostname:'egchat-api-xlxj.onrender.com',path:p,method:m,headers:{'Authorization':`Bearer ${KEY}`,'Content-Type':'application/json','Content-Length':d.length}},res=>{let b='';res.on('data',x=>b+=x);res.on('end',()=>r(res.statusCode))});rq.on('error',()=>r(0));rq.write(d);rq.end();});}
 (async()=>{
   const routes=[['GET','/health'],['GET','/api/djangue'],['POST','/api/djangue/x/advance-turn'],['POST','/api/djangue/x/manual-payout'],['PATCH','/api/chats/x/settings'],['POST','/api/chats/x/invite-link']];

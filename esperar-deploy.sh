@@ -21,7 +21,7 @@ for i in {1..20}; do
     echo "🔍 Verificando endpoints..."
     node - << 'EOF'
 const https = require('https');
-const KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZxZnh0am5maHZwZ2dzc2J5bWRuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NTg0MzgyMCwiZXhwIjoyMTAxNDE5ODIwfQ.ulwcC4WW-00pgjKzzs9CclyMGad1y4dqjS7P-c2O-CM';
+const KEY=process.env.SUPABASE_SERVICE_KEY;
 function req(m,p){return new Promise(r=>{const d='{}';const rq=https.request({hostname:'egchat-api-xlxj.onrender.com',path:p,method:m,headers:{'Authorization':`Bearer ${KEY}`,'Content-Type':'application/json','Content-Length':d.length}},res=>{res.on('data',()=>{});res.on('end',()=>r(res.statusCode))});rq.on('error',()=>r(0));rq.write(d);rq.end();});}
 (async()=>{
   const routes=[['GET','/api/djangue'],['POST','/api/djangue/x/advance-turn'],['PATCH','/api/chats/x/settings']];

@@ -45,7 +45,7 @@ const dependencyCache = { timestamp: 0, result: null };
 // --- Supabase ---------------------------------------------------------
 // Proyecto correcto: fqfxtjnfhvpggssbymdn (tiene todos los usuarios)
 const _SUPA_URL_DEFAULT = 'https://fqfxtjnfhvpggssbymdn.supabase.co';
-const _SUPA_KEY_DEFAULT = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZxZnh0am5maHZwZ2dzc2J5bWRuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NTg0MzgyMCwiZXhwIjoyMTAxNDE5ODIwfQ.ulwcC4WW-00pgjKzzs9CclyMGad1y4dqjS7P-c2O-CM';
+const _SUPA_KEY_DEFAULT = process.env.SUPABASE_SERVICE_KEY || '';
 // Validar que SUPABASE_URL sea una URL http/https válida (no un postgres:// string)
 const _rawSupabaseUrl = process.env.SUPABASE_URL || '';
 const _supabaseUrl = /^https?:\/\//i.test(_rawSupabaseUrl) ? _rawSupabaseUrl : _SUPA_URL_DEFAULT;
