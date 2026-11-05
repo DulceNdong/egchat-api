@@ -6797,6 +6797,27 @@ app.post('/api/push/register-expo-token', auth, async (req, res) => {
   }
 });
 
+// ── Registrar token APNs nativo (iOS, para NSE con fotos) ────────────────────
+app.post('/api/push/register-apns-token', auth, async (req, res) => {
+  try {
+    const { apnsToken, platform } = req.body;
+    if (!apnsToken || apnsToken.length < 32) {
+      return res.status(400).json({ message: 'Token APNs invalido' });
+    }
+    await supabase.from('expo_push_tokens').upsert({
+      user_id: req.user.id,
+      token: apnsToken,
+      platform: platform || 'apns',
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'token' });
+    console.log(`[Push] Token APNs nativo registrado para user=${req.user.id.substring(0,8)}`);
+    res.json({ message: 'Token APNs registrado' });
+  } catch (e) {
+    console.error('APNs token register error:', e.message);
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PUSH DIAGNOSTICS
 // ─────────────────────────────────────────────────────────────────────────────
