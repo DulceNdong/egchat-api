@@ -5875,6 +5875,14 @@ app.post('/api/call/offer', auth, async (req, res) => {
 
         // 1️⃣ VoIP push (iOS PushKit) — despierta la app aunque esté cerrada
         //    Se envía PRIMERO porque tiene latencia 0 y es el canal correcto para llamadas
+        console.log('[DEBUG] VoIP Payload:', JSON.stringify({
+          targetUserId,
+          callId,
+          callerName,
+          callerAvatar: caller?.avatar_url || '',
+          callType: type || 'audio',
+          hasOffer: !!offer
+        }));
         try {
           const voipResult = await sendVoipPushToUser({
             targetUserId,
@@ -5890,6 +5898,7 @@ app.post('/api/call/offer', auth, async (req, res) => {
         }
 
         // 2️⃣ Expo push — fallback para Android y iOS sin VoIP token
+        console.log('[DEBUG] Expo Push Payload:', JSON.stringify(callPushPayload));
         await sendPushToUser(targetUserId, callPushPayload);
 
       } catch (pushErr) {
