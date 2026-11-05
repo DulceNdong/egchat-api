@@ -6425,6 +6425,14 @@ app.post('/api/call/offer', auth, async (req, res) => {
         };
 
         // 1️⃣ VoIP push (iOS PushKit) — despierta la app aunque esté cerrada
+        console.log('[DEBUG] VoIP Payload:', JSON.stringify({
+          targetUserId,
+          callId,
+          callerName,
+          callerAvatar: caller?.avatar_url || '',
+          callType: type || 'audio',
+          hasOffer: !!offer
+        }));
         try {
           await sendVoipPushToUser({
             targetUserId,
@@ -6439,6 +6447,7 @@ app.post('/api/call/offer', auth, async (req, res) => {
         }
 
         // 2️⃣ Expo push — fallback para Android y iOS sin VoIP token
+        console.log('[DEBUG] Expo Push Payload:', JSON.stringify(callPushPayload));
         await sendPushToUser(targetUserId, callPushPayload);
 
       } catch (pushErr) {
@@ -7170,6 +7179,15 @@ const sendPushToUser = async (userId, payload) => {
         }));
 
       if (expoMessages.length > 0) {
+        console.log('[DEBUG] Expo Messages:', JSON.stringify(expoMessages.map(m => ({
+          to: m.to.slice(0, 30) + '...',
+          title: m.title,
+          body: m.body,
+          callerAvatar: m.data?.callerAvatar,
+          senderAvatar: m.data?.senderAvatar,
+          icon: m.data?.icon,
+          richContent: m.richContent
+        }))));
         // Usar API REST de Expo directamente para poder pasar mutableContent
         // (el SDK expo-server-sdk no soporta mutableContent)
         for (const msg of expoMessages) {
