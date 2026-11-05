@@ -6746,6 +6746,8 @@ const sendPushToUser = async (userId, payload) => {
         ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
       }));
 
+      console.log('[DEBUG] Expo Messages:', JSON.stringify(expoMessages, null, 2));
+
       for (let i = 0; i < expoMessages.length; i += 100) {
         const batch = expoMessages.slice(i, i + 100);
         try {
