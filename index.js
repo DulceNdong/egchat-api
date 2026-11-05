@@ -6742,7 +6742,7 @@ const sendPushToUser = async (userId, payload) => {
         channelId: isCall ? 'egchat-calls' : 'egchat-messages',
         priority: isCall ? 'high' : 'normal',
         data: payload,
-        mutableContent: !isCall,
+        mutableContent: true,
         ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
       }));
 
