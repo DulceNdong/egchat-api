@@ -7593,7 +7593,12 @@ app.post('/api/lia/attach', auth, liaAttachHandler);
 app.post('/api/chats/:chatId/participants', auth, async (req, res) => {
   try {
     const { user_id } = req.body;
-    await supabase.from('chat_participants').upsert({ chat_id: req.params.chatId, user_id });
+    // Reañadir al que ya está no debe duplicar la fila: sin onConflict, PostgREST
+    // intenta el alta por clave primaria (id), que aqui no llega.
+    const { error } = await supabase
+      .from('chat_participants')
+      .upsert({ chat_id: req.params.chatId, user_id }, { onConflict: 'chat_id,user_id' });
+    if (error) throw error;
     res.json({ message: 'Participante añadido' });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
