@@ -196,7 +196,13 @@ const decodeMojibakeRun = (run) => {
     let changed = false;
     while (index < chars.length) {
       const lead = bytes[index];
-      const size = lead >= 0xC2 && lead <= 0xDF ? 2 : lead >= 0xE0 && lead <= 0xEF ? 3 : 0;
+      // Cuatro bytes: sin esta rama los emoji se quedaban doblemente
+      // codificados, porque su secuencia arranca en 0xF0..0xF4 y antes solo se
+      // reconocían tramos de 2 y 3.
+      const size = lead >= 0xC2 && lead <= 0xDF ? 2
+        : lead >= 0xE0 && lead <= 0xEF ? 3
+        : lead >= 0xF0 && lead <= 0xF4 ? 4
+        : 0;
       if (size && index + size <= bytes.length) {
         let valid = true;
         for (let offset = 1; offset < size; offset++) {
@@ -223,7 +229,12 @@ const decodeMojibakeRun = (run) => {
 };
 
 const repairMojibake = (value) => {
-  if (typeof value !== 'string' || !/[\u00C2\u00C3]/.test(value)) return value;
+  // El prefiltro no podía mirar solo Â/Ã: un emoji mal codificado arranca en
+  // 0xF0 (su secuencia de continuaciones cae en 0x80..0xBF, así que nunca lleva
+  // Â ni Ã y el reparador lo saltaba). Se añade ese lead exacto y no el rango
+  // F0..F4, porque 0xF1 es la «ñ» y abrirlo corrompía texto legítimo como
+  // «España Nº 5» (Ñ + º decodifican como secuencia UTF-8 válida).
+  if (typeof value !== 'string' || !/[\u00C2\u00C3\u00F0]/.test(value)) return value;
   let out = '';
   let index = 0;
   while (index < value.length) {
@@ -1046,6 +1057,15 @@ const getChatParticipants = async (chatId) => {
   });
 };
 
+// Una tabla auxiliar que la instalación no tiene no es un fallo de la operación:
+// PostgREST lo avisa con PGRST205 y «Could not find the table», y el motor con
+// 42P01. Las dos formas significan lo mismo.
+const tablaAuxiliarAusente = (error) => {
+  if (!error) return false;
+  return /PGRST20\d|42P01|Could not find the table|does not exist/i
+    .test(`${error.code || ''} ${error.message || ''}`);
+};
+
 // Obtener todos los chats del usuario
 app.get('/api/chats', auth, async (req, res) => {
   try {
@@ -1647,6 +1667,100 @@ app.put('/api/chats/:chatId', auth, async (req, res) => {
     res.json({ message: 'Grupo actualizado', chat: updated });
   } catch (e) {
     console.error('Update group error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Borra un chat privado de raíz: sus mensajes, sus participantes y el propio
+// chat. La app ofrece esta acción como irreversible («se eliminará el chat,
+// todos los mensajes y el contacto asociado»), así que no basta con sacarlo de
+// la lista local. En grupos la misma llamada la usa la app para dos intenciones
+// distintas —«salir del grupo» y «eliminar grupo»— sin distinguirlas, así que
+// aquí decide el chat: solo el creador lo destruye; para los demás es una salida
+// y los mensajes del resto se conservan. `message_reads` cae por clave foránea,
+// pero se borra a mano también por si la instalación no tiene la clave puesta.
+app.delete('/api/chats/:chatId', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    const { data: miParticipacion } = await supabase
+      .from('chat_participants')
+      .select('chat_id')
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (!miParticipacion) return res.status(403).json({ message: 'No tienes acceso a este chat' });
+
+    const { data: chat } = await supabase
+      .from('chats')
+      .select('id, type, created_by')
+      .eq('id', chatId)
+      .maybeSingle();
+    if (!chat) return res.status(404).json({ message: 'Chat no encontrado' });
+
+    if (chat.type === 'group') {
+      const esCreador = String(chat.created_by || '') === String(req.user.id);
+      const { data: restantes } = await supabase
+        .from('chat_participants')
+        .select('user_id')
+        .eq('chat_id', chatId)
+        .neq('user_id', req.user.id);
+      const seguidores = (restantes || []).length;
+
+      if (!esCreador && seguidores > 0) {
+        const { error: errorSalida } = await supabase
+          .from('chat_participants')
+          .delete()
+          .eq('chat_id', chatId)
+          .eq('user_id', req.user.id);
+        if (errorSalida) throw errorSalida;
+        return res.json({ message: 'Has salido del grupo', left: true });
+      }
+    }
+
+    let otroUsuario = null;
+    if (chat.type === 'private') {
+      const { data: otros } = await supabase
+        .from('chat_participants')
+        .select('user_id')
+        .eq('chat_id', chatId)
+        .neq('user_id', req.user.id);
+      otroUsuario = otros?.[0]?.user_id || null;
+    }
+
+    const { data: mensajes } = await supabase
+      .from('messages').select('id').eq('chat_id', chatId);
+    const idsDeMensajes = (mensajes || []).map((m) => m.id);
+
+    if (idsDeMensajes.length) {
+      const { error: errorBorrado } = await supabase
+        .from('message_deletions').delete().in('message_id', idsDeMensajes);
+      if (errorBorrado && !tablaAuxiliarAusente(errorBorrado)) throw errorBorrado;
+    }
+
+    const { error: errorMensajes } = await supabase.from('messages').delete().eq('chat_id', chatId);
+    if (errorMensajes) throw errorMensajes;
+    const { error: errorLecturas } = await supabase.from('message_reads').delete().eq('chat_id', chatId);
+    if (errorLecturas && !tablaAuxiliarAusente(errorLecturas)) throw errorLecturas;
+    const { error: errorParticipantes } = await supabase.from('chat_participants').delete().eq('chat_id', chatId);
+    if (errorParticipantes) throw errorParticipantes;
+    const { error: errorChat } = await supabase.from('chats').delete().eq('id', chatId);
+    if (errorChat) throw errorChat;
+
+    if (otroUsuario) {
+      const { error: errorContacto } = await supabase
+        .from('contacts')
+        .delete()
+        .eq('user_id', req.user.id)
+        .eq('contact_user_id', otroUsuario);
+      if (errorContacto) {
+        console.warn('Delete chat: el contacto asociado no se pudo borrar:', errorContacto.message);
+      }
+    }
+
+    res.json({ message: 'Chat eliminado', messages_deleted: idsDeMensajes.length });
+  } catch (e) {
+    console.error('Delete chat error:', e);
     res.status(500).json({ message: e.message });
   }
 });
