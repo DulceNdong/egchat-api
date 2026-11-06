@@ -637,6 +637,12 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ message: 'Credenciales incorrectas' });
 
+    // Después de comprobar la contraseña, no antes: si se rechazara antes del
+    // bcrypt el 401 diría «esta sí existe», y el borrado es lógico, no público.
+    if (user.deleted_at) {
+      return res.status(401).json({ message: 'Esta cuenta fue eliminada' });
+    }
+
     // Actualizar último acceso (ignorar si la columna no existe)
     try {
       await supabase.from('users').update({ last_login: new Date().toISOString() }).eq('id', user.id);
@@ -803,6 +809,325 @@ app.put('/api/auth/profile', auth, async (req, res) => {
       .single();
     if (error) throw error;
     res.json(user);
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// AJUSTES — preferencias de privacidad, sesiones por dispositivo y
+// borrado de cuenta. Las llamadas ya existen en la app (Ajustes →
+// Privacidad, Ajustes → Chat y Ajustes → Dispositivos); lo que faltaba
+// era el otro lado del mostrador.
+// ════════════════════════════════════════════════════════════════════
+
+const PREFERENCIAS_DEFAULT = {
+  last_seen_visibility: 'todos',
+  photo_visibility: 'todos',
+  status_visibility: 'todos',
+  read_receipts_enabled: true,
+};
+
+// Los tres valores que ofrece la pantalla. Se filtran aquí porque la columna es
+// texto libre: un valor inventado por otra clienta se leería después como si
+// fuera una preferencia legítima y la app no sabría dibujarlo.
+const VISIBILIDADES_ACEPTADAS = ['todos', 'contactos', 'nadie'];
+
+const leerPreferencias = async (userId) => {
+  const { data } = await supabase
+    .from('user_preferences')
+    .select('last_seen_visibility, photo_visibility, status_visibility, read_receipts_enabled')
+    .eq('user_id', userId)
+    .maybeSingle();
+  return { ...PREFERENCIAS_DEFAULT, ...(data || {}) };
+};
+
+// Escribe solo las claves que trae la petición. Upsert con las cuatro siempre
+// aplastaría contra el default la preferencia que el otro dispositivo no tocó.
+const guardarPreferencias = async (userId, cambios) => {
+  const fila = { user_id: userId, updated_at: new Date().toISOString() };
+  for (const campo of ['last_seen_visibility', 'photo_visibility', 'status_visibility']) {
+    if (cambios[campo] !== undefined) {
+      const valor = String(cambios[campo]);
+      if (!VISIBILIDADES_ACEPTADAS.includes(valor)) {
+        return { invalid: campo };
+      }
+      fila[campo] = valor;
+    }
+  }
+  if (cambios.read_receipts_enabled !== undefined) {
+    fila.read_receipts_enabled = Boolean(cambios.read_receipts_enabled);
+  }
+  if (Object.keys(fila).length <= 2) return { nothing: true };
+  const { error } = await supabase
+    .from('user_preferences')
+    .upsert(fila, { onConflict: 'user_id' });
+  if (error) throw error;
+  return { fila };
+};
+
+app.get('/api/auth/privacy', auth, async (req, res) => {
+  try {
+    if (isLocalUserId(req.user.id)) return res.json(PREFERENCIAS_DEFAULT);
+    res.json(await leerPreferencias(req.user.id));
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// PATCH admite una o las cuatro claves: la pantalla de Privacidad manda una por
+// una cada vez que el usuario toca un selector.
+app.patch('/api/auth/privacy', auth, async (req, res) => {
+  try {
+    if (isLocalUserId(req.user.id)) {
+      return res.json({ ok: true, ...PREFERENCIAS_DEFAULT, ...(req.body || {}) });
+    }
+    const r = await guardarPreferencias(req.user.id, req.body || {});
+    if (r.invalid) {
+      return res.status(400).json({
+        message: `${r.invalid} debe ser todos, contactos o nadie`,
+      });
+    }
+    res.json({ ok: true, ...(await leerPreferencias(req.user.id)) });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// La pantalla de Chat manda esta ruta aparte, no dentro de /privacy.
+app.patch('/api/auth/read-receipts', auth, async (req, res) => {
+  try {
+    const enabled = Boolean(req.body?.read_receipts_enabled);
+    if (isLocalUserId(req.user.id)) return res.json({ ok: true, read_receipts_enabled: enabled });
+    const { error } = await supabase
+      .from('user_preferences')
+      .upsert({
+        user_id: req.user.id,
+        read_receipts_enabled: enabled,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'user_id' });
+    if (error) throw error;
+    res.json({ ok: true, read_receipts_enabled: enabled });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── Sesiones de dispositivo ──────────────────────────────────────
+// Un renglon por (usuario, dispositivo). El id del dispositivo lo fija la app en
+// SecureStore y no se regenera, así que reinstalar la app abre sesión nueva en
+// vez de reclamar la vieja.
+
+const sesionPublica = (s) => ({
+  id: s.id,
+  deviceId: s.device_id,
+  deviceName: s.device_name || '',
+  deviceType: s.device_type || 'web',
+  platform: s.platform || '',
+  lastSeen: s.last_seen,
+  createdAt: s.created_at,
+});
+
+app.post('/api/auth/sessions/register', auth, async (req, res) => {
+  try {
+    const deviceId = String(req.body?.deviceId || '').trim();
+    if (!deviceId) return res.status(400).json({ message: 'deviceId requerido' });
+    if (isLocalUserId(req.user.id)) return res.json({ ok: true, local: true });
+
+    const ip = String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '')
+      .split(',')[0].trim();
+    const { error } = await supabase
+      .from('device_sessions')
+      .upsert({
+        user_id: req.user.id,
+        device_id: deviceId,
+        device_name: req.body?.deviceName || null,
+        device_type: req.body?.deviceType || null,
+        platform: req.body?.platform || null,
+        ip,
+        last_seen: new Date().toISOString(),
+        revoked_at: null,
+      }, { onConflict: 'user_id,device_id' });
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// El latido no trae nombre de dispositivo: se envían solo las columnas que
+// cambian para no pisar con null la ficha que escribió el registro.
+app.post('/api/auth/sessions/heartbeat', auth, async (req, res) => {
+  try {
+    const deviceId = String(req.body?.deviceId || '').trim();
+    if (!deviceId) return res.status(400).json({ message: 'deviceId requerido' });
+    if (isLocalUserId(req.user.id)) return res.json({ ok: true, local: true });
+    const { error } = await supabase
+      .from('device_sessions')
+      .upsert({
+        user_id: req.user.id,
+        device_id: deviceId,
+        last_seen: new Date().toISOString(),
+      }, { onConflict: 'user_id,device_id' });
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.get('/api/auth/sessions', auth, async (req, res) => {
+  try {
+    if (isLocalUserId(req.user.id)) return res.json([]);
+    const { data, error } = await supabase
+      .from('device_sessions')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .is('revoked_at', null)
+      .order('last_seen', { ascending: false });
+    if (error) throw error;
+    res.json((data || []).map(sesionPublica));
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Declarada ANTES de /sessions/:sessionId: si no, Express casa
+// 'all-except-current' con el parámetro y la revocación múltiple se convierte en
+// un 404 por el orden de las rutas.
+app.delete('/api/auth/sessions/all-except-current', auth, async (req, res) => {
+  try {
+    const deviceId = String(req.body?.deviceId || req.query.deviceId || '').trim();
+    if (!deviceId) return res.status(400).json({ message: 'deviceId requerido' });
+    if (isLocalUserId(req.user.id)) return res.json({ ok: true, revoked: 0 });
+
+    const { data: otras, error: errorLista } = await supabase
+      .from('device_sessions')
+      .select('id, device_id')
+      .eq('user_id', req.user.id)
+      .neq('device_id', deviceId)
+      .is('revoked_at', null);
+    if (errorLista) throw errorLista;
+
+    const ids = (otras || []).map(s => s.id);
+    if (ids.length) {
+      const { error } = await supabase
+        .from('device_sessions')
+        .update({ revoked_at: new Date().toISOString() })
+        .in('id', ids);
+      if (error) throw error;
+      (otras || []).forEach(s => {
+        emitToUser(req.user.id, { type: 'session_revoked', deviceId: s.device_id });
+      });
+    }
+    res.json({ ok: true, revoked: ids.length });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.delete('/api/auth/sessions/:sessionId', auth, async (req, res) => {
+  try {
+    if (isLocalUserId(req.user.id)) return res.json({ ok: true });
+    const { data: sesion, error: errorBusca } = await supabase
+      .from('device_sessions')
+      .select('id, device_id, user_id')
+      .eq('id', req.params.sessionId)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (errorBusca) throw errorBusca;
+    if (!sesion) return res.status(404).json({ message: 'Sesión no encontrada' });
+
+    const { error } = await supabase
+      .from('device_sessions')
+      .update({ revoked_at: new Date().toISOString() })
+      .eq('id', sesion.id);
+    if (error) throw error;
+
+    // El token firma 30 días y el middleware no lee la base, así que lo único
+    // que corta la sesión remota al instante es este aviso por SSE: el cliente
+    // lo escucha en _layout y hace logout.
+    emitToUser(req.user.id, { type: 'session_revoked', deviceId: sesion.device_id });
+    res.json({ ok: true, message: 'Sesión cerrada' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── Exportación de datos ─────────────────────────────────────────
+// Se encola, no se genera en la petición: una cuenta con historial tarda más de
+// lo que aguanta una conexión HTTP y el resultado es un archivo, no un JSON.
+app.post('/api/auth/request-data-export', auth, async (req, res) => {
+  try {
+    if (isLocalUserId(req.user.id)) {
+      return res.json({ ok: true, status: 'requested', local: true });
+    }
+    const { data: pendiente } = await supabase
+      .from('data_export_requests')
+      .select('id, requested_at')
+      .eq('user_id', req.user.id)
+      .eq('status', 'requested')
+      .order('requested_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (pendiente) {
+      return res.json({ ok: true, id: pendiente.id, status: 'requested', ya_pendiente: true });
+    }
+    const { data, error } = await supabase
+      .from('data_export_requests')
+      .insert({ user_id: req.user.id, status: 'requested' })
+      .select('id, status, requested_at')
+      .single();
+    if (error) throw error;
+    res.json({ ok: true, id: data.id, status: 'requested' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── Borrado de cuenta ────────────────────────────────────────────
+// Es lógico, no físico. El libro mayor es inmutable y sus asientos apuntan a
+// users con clave foránea: borrar la fila rompería la contabilidad y borraría la
+// pista de auditoría de todos los movimientos de esa cuenta.
+app.delete('/api/auth/delete-account', auth, async (req, res) => {
+  try {
+    if (isLocalUserId(req.user.id)) {
+      return res.json({ ok: true, message: 'Cuenta eliminada' });
+    }
+
+    // El saldo es la guarda real: una cuenta con dinero no se cierra, porque el
+    // asiento que lo respalda se quedaría huérfano. Se lee la fila, no se crea
+    // monedero si no existe (getWallet lo alta).
+    const { data: wallet } = await supabase
+      .from('wallets').select('balance').eq('user_id', req.user.id).maybeSingle();
+    const saldo = Number(wallet?.balance || 0);
+    if (saldo !== 0) {
+      return res.status(409).json({
+        message: `Tu monedero tiene ${saldo} ${WALLET_CURRENCY}. Retira o transfiere el saldo antes de eliminar la cuenta.`,
+        balance: saldo,
+      });
+    }
+
+    const { error: errorUsuario } = await supabase
+      .from('users')
+      .update({ deleted_at: new Date().toISOString(), online_status: false })
+      .eq('id', req.user.id);
+    if (errorUsuario) throw errorUsuario;
+
+    const { data: sesiones } = await supabase
+      .from('device_sessions')
+      .select('device_id')
+      .eq('user_id', req.user.id)
+      .is('revoked_at', null);
+    if (sesiones?.length) {
+      await supabase
+        .from('device_sessions')
+        .update({ revoked_at: new Date().toISOString() })
+        .eq('user_id', req.user.id);
+    }
+    emitToUser(req.user.id, { type: 'session_revoked' });
+
+    res.json({ ok: true, message: 'Cuenta eliminada' });
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
@@ -1803,18 +2128,46 @@ app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
     const usersMap = {};
     (users || []).forEach(u => { usersMap[String(u.id)] = u; });
 
+    // La visibilidad de la última conexión es del dueño del dato, no del que
+    // mira. Se lee de una para todos los demás: 'nadie' borra la marca, y
+    // 'contactos' solo se la enseña a quien tiene a ese usuario en su agenda.
+    const otrosIds = (parts || [])
+      .map(p => String(p.user_id))
+      .filter(uid => uid !== String(req.user.id));
+    const visMap = {};
+    if (otrosIds.length) {
+      const { data: prefsRows } = await supabase
+        .from('user_preferences')
+        .select('user_id, last_seen_visibility')
+        .in('user_id', otrosIds);
+      (prefsRows || []).forEach(p => { visMap[String(p.user_id)] = p.last_seen_visibility; });
+    }
+
+    let misContactos = new Set();
+    if (Object.values(visMap).includes('contactos')) {
+      const { data: miaAgenda } = await supabase
+        .from('contacts')
+        .select('contact_user_id')
+        .eq('user_id', req.user.id);
+      misContactos = new Set((miaAgenda || []).map(c => String(c.contact_user_id)));
+    }
+
+    const yoId = String(req.user.id);
     const members = parts.map(p => {
       const uid = String(p.user_id);
       const u = usersMap[uid] || {};
+      const vis = visMap[uid] || 'todos';
+      const oculta = uid !== yoId
+        && (vis === 'nadie' || (vis === 'contactos' && !misContactos.has(uid)));
       return {
         id: uid,
         user_id: uid,
         full_name: u.full_name || '',
         phone: u.phone || '',
         avatar_url: u.avatar_url || '',
-        online_status: u.online_status || false,
-        last_seen: u.last_seen || null,
-        role: uid === String(req.user.id) ? 'admin' : 'member',
+        online_status: oculta ? false : (u.online_status || false),
+        last_seen: oculta ? null : (u.last_seen || null),
+        role: uid === yoId ? 'admin' : 'member',
       };
     });
 
@@ -1875,7 +2228,13 @@ const applyChatRead = async (chatId, userId, upToMessageId) => {
   const unreadMsgs = (unread || []).filter(m => m.status !== 'read');
   const messageIds = unreadMsgs.map(m => m.id);
 
-  if (messageIds.length > 0) {
+  // Con las confirmaciones de lectura apagadas, el lector sí consume sus mensajes
+  // (su badge se limpia y queda su posición en message_reads), pero no se lo
+  // dice a nadie: ni se toca status, que es lo que pinta el doble check azul al
+  // recargar, ni se emite el evento SSE.
+  const prefs = await leerPreferencias(userId);
+
+  if (messageIds.length > 0 && prefs.read_receipts_enabled) {
     const { error: statusError } = await supabase
       .from('messages')
       .update({ status: 'read' })
@@ -1908,14 +2267,16 @@ const applyChatRead = async (chatId, userId, upToMessageId) => {
     if (!bySender[key]) bySender[key] = [];
     bySender[key].push(m.id);
   });
-  Object.keys(bySender).forEach(senderId => {
-    emitToUser(senderId, {
-      type: 'read',
-      chatId,
-      readerId: String(userId),
-      messageIds: bySender[senderId],
+  if (prefs.read_receipts_enabled) {
+    Object.keys(bySender).forEach(senderId => {
+      emitToUser(senderId, {
+        type: 'read',
+        chatId,
+        readerId: String(userId),
+        messageIds: bySender[senderId],
+      });
     });
-  });
+  }
 
   return { messageIds };
 };
@@ -2445,6 +2806,43 @@ app.post('/api/contacts/:contactId/unblock', auth, async (req, res) => {
     res.json({ message: 'Contacto desbloqueado exitosamente', contact });
   } catch (e) {
     console.error('Unblock contact error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Lista de bloqueados: la pide Ajustes → Privacidad. Devuelve el id de la fila
+// de `contacts` (no el del usuario) porque es el que la pantalla reenvía a
+// /contacts/:contactId/unblock, que busca por contacts.id.
+app.get('/api/contacts/blocked', auth, async (req, res) => {
+  try {
+    if (isLocalUserId(req.user.id)) return res.json([]);
+
+    const { data: contacts, error } = await supabase
+      .from('contacts')
+      .select('id, contact_user_id, nickname, phone, created_at')
+      .eq('user_id', req.user.id)
+      .eq('is_blocked', true)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    if (!contacts || contacts.length === 0) return res.json([]);
+
+    const userIds = contacts.map(c => c.contact_user_id).filter(Boolean);
+    const { data: users } = await supabase
+      .from('users')
+      .select('id, phone, full_name, avatar_url')
+      .in('id', userIds);
+    const usersMap = (users || []).reduce((acc, u) => { acc[u.id] = u; return acc; }, {});
+
+    res.json(contacts.map(c => ({
+      id: c.id,
+      contact_user_id: c.contact_user_id,
+      full_name: c.nickname || usersMap[c.contact_user_id]?.full_name || '',
+      phone: usersMap[c.contact_user_id]?.phone || c.phone || '',
+      avatar_url: usersMap[c.contact_user_id]?.avatar_url || '',
+      blocked_at: c.created_at,
+    })));
+  } catch (e) {
+    console.error('Get blocked contacts error:', e);
     res.status(500).json({ message: e.message });
   }
 });
