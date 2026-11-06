@@ -669,6 +669,35 @@ app.get('/api/auth/me', auth, async (req, res) => {
   res.json({ ...user, app_version: APP_VERSION });
 });
 
+// ── Rol y permisos del usuario ───────────────────────────────────
+// users.role es la unica fuente: no existe tabla de roles ni de permisos.
+// Las claves son exactamente las que consulta el cliente (useRole.ts y las
+// pantallas del area de negocio), ninguna inventada.
+const ROLE_PERMISSIONS = {
+  user:        ['chat.send'],
+  official:    ['chat.send', 'chat.broadcast', 'business.view_stats', 'services.view_orders'],
+  business:    ['chat.send', 'chat.broadcast', 'business.view_stats', 'services.view_orders', 'wallet.view'],
+  merchant:    ['chat.send', 'services.view_orders', 'wallet.view'],
+  moderator:   ['chat.send', 'chat.broadcast', 'business.view_stats', 'services.view_orders', 'wallet.view'],
+  admin:       ['chat.send', 'chat.broadcast', 'business.view_stats', 'services.view_orders', 'wallet.view', 'provider.operator', 'provider.director', 'admin.users'],
+  super_admin: ['chat.send', 'chat.broadcast', 'business.view_stats', 'services.view_orders', 'wallet.view', 'provider.operator', 'provider.director', 'admin.users'],
+};
+
+// is_verified no tiene columna propia en users: se deriva del rol.
+app.get('/api/me/role', auth, async (req, res) => {
+  const minimo = { role: 'user', permissions: ROLE_PERMISSIONS.user, is_verified: false };
+  try {
+    const { data, error } = await supabase
+      .from('users').select('role').eq('id', req.user.id).maybeSingle();
+    // error = la migracion de users.role todavia no esta aplicada; !data = usuario borrado.
+    if (error || !data) return res.json(minimo);
+    const role = ROLE_PERMISSIONS[data.role] ? data.role : 'user';
+    res.json({ role, permissions: ROLE_PERMISSIONS[role], is_verified: role !== 'user' });
+  } catch {
+    res.json(minimo);
+  }
+});
+
 // Heartbeat — el cliente llama esto cada 30s para mantenerse "online"
 app.post('/api/auth/heartbeat', auth, async (req, res) => {
   if (!String(req.user.id || '').startsWith('local-')) {
