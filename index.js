@@ -1,6 +1,4 @@
-
 ﻿// Cargar variables de entorno (solo en local, en Render vienen del dashboard)
-// v2.5.2 — build forzado para limpiar cache Render
 try { 
   const dotenv = require('dotenv');
   dotenv.config();
@@ -9,78 +7,121 @@ const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+app.set('trust proxy', 1);
 
-// ── RENDER: abrir puerto inmediatamente para pasar el port scan ───────────────
-// Render mata el proceso si no detecta un puerto abierto en 60s.
-// Con un archivo grande como este, el parse puede tardar. Abrimos el puerto
-// aquí y lo cerramos/reabrimos al final cuando todo está listo.
-const _earlyServer = app.listen(PORT, () => {
-  console.log(`[startup] Puerto ${PORT} abierto (early bind para Render)`);
-});
+// El secreto debe venir del entorno (Render). Si falta, se deriva uno estable
+// y privado: el anterior estaba hardcodeado en el repo y permitía falsificar tokens.
+const JWT_SECRET = process.env.JWT_SECRET
+  || crypto.createHash('sha256')
+    .update(`egchat-jwt:${process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_URL || 'local'}`)
+    .digest('hex');
+if (!process.env.JWT_SECRET) {
+  console.error('[SECURITY] JWT_SECRET no configurado en el entorno; usando secreto derivado.');
+}
 
-const JWT_SECRET = process.env.JWT_SECRET || 'EGchat2025!xK9mP3nQ7rL2vW8tY4uJ6hF1bN5cA0dE_prod_secret';
-const JWT_SECRET_FALLBACK = 'EGchat2025!xK9mP3nQ7rL2vW8tY4uJ6hF1bN5cA0dE_prod_secret';
-console.log('JWT_SECRET source:', process.env.JWT_SECRET ? 'environment' : 'fallback');
-
-// Verificar token con múltiples secrets para compatibilidad
-const verifyToken = (token) => {
-  const secrets = [JWT_SECRET, JWT_SECRET_FALLBACK].filter((s, i, arr) => arr.indexOf(s) === i);
-  for (const secret of secrets) {
-    try { return jwt.verify(token, secret); } catch {}
-  }
-  throw new Error('Token inválido o expirado');
-};
-const APP_VERSION = '2.6.3-FORCE-DEPLOY'; // FORZAR RENDER A ACTUALIZAR
+const verifyToken = (token) => jwt.verify(token, JWT_SECRET);
+const APP_VERSION = '2.5.0';
 const chatStreams = new Map();
 const dependencyCache = { timestamp: 0, result: null };
+const enableExternalNewsScraping = process.env.ENABLE_EXTERNAL_NEWS_SCRAPING === '1';
+const localAuthUsers = new Map();
+
+const getLocalAuthUser = (phone, fullName = 'Usuario EGCHAT', avatarUrl = null) => {
+  const cleanPhone = String(phone || '').trim();
+  if (!cleanPhone) return null;
+  if (!localAuthUsers.has(cleanPhone)) {
+    localAuthUsers.set(cleanPhone, {
+      id: `local-${Buffer.from(cleanPhone).toString('hex').slice(0, 24)}`,
+      phone: cleanPhone,
+      full_name: fullName,
+      avatar_url: avatarUrl,
+      app_version: APP_VERSION,
+    });
+  }
+  return localAuthUsers.get(cleanPhone);
+};
+
+const sendLocalAuth = (res, phone, fullName, avatarUrl, status = 200) => {
+  const user = getLocalAuthUser(phone, fullName, avatarUrl);
+  const token = jwt.sign({ id: user.id, phone: user.phone }, JWT_SECRET, { expiresIn: '30d' });
+  return res.status(status).json({ token, user });
+};
+
+const localChats = new Map();
+const localMessages = new Map();
+
+const isLocalUserId = (id) => String(id || '').startsWith('local-');
+const getLocalUserById = (id) => Array.from(localAuthUsers.values()).find(user => user.id === id) || null;
+const getDemoContactsFor = (userId) => Array.from(localAuthUsers.values())
+  .filter(user => user.id !== userId)
+  .map(user => ({
+    id: `contact-${user.id}`,
+    contact_user_id: user.id,
+    name: user.full_name,
+    phone: user.phone,
+    avatar_url: user.avatar_url || '',
+    is_blocked: false,
+    is_favorite: false,
+    created_at: new Date().toISOString(),
+    user,
+  }));
+
+const getLocalPrivateChat = (a, b) => {
+  const key = [a, b].sort().join('__');
+  if (!localChats.has(key)) {
+    localChats.set(key, {
+      id: `local-chat-${Buffer.from(key).toString('hex').slice(0, 24)}`,
+      key,
+      type: 'private',
+      participant_ids: [a, b],
+      created_by: a,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+  }
+  const chat = localChats.get(key);
+  if (!localMessages.has(chat.id)) localMessages.set(chat.id, []);
+  return chat;
+};
+
+const formatLocalChat = (chat) => {
+  const messages = localMessages.get(chat.id) || [];
+  return {
+    id: chat.id,
+    type: 'private',
+    name: null,
+    avatar_url: null,
+    created_by: chat.created_by,
+    participants: chat.participant_ids.map(userId => {
+      const user = getLocalUserById(userId) || {};
+      return {
+        chat_id: chat.id,
+        user_id: userId,
+        full_name: user.full_name || '',
+        phone: user.phone || '',
+        avatar_url: user.avatar_url || '',
+        user,
+        users: user,
+      };
+    }),
+    last_message: messages[messages.length - 1] || null,
+    updated_at: chat.updated_at,
+    unread_count: 0,
+  };
+};
 
 // --- Supabase ---------------------------------------------------------
-// Proyecto correcto: fqfxtjnfhvpggssbymdn (tiene todos los usuarios)
 const supabase = createClient(
   process.env.SUPABASE_URL || 'https://fqfxtjnfhvpggssbymdn.supabase.co',
-  process.env.SUPABASE_SERVICE_KEY
+  process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || ''
 );
-
-// --- Fallback de usuarios cuando Supabase no está disponible ----------
-// Permite login aunque Supabase esté restringido por cuota
-// Formato: phone -> { password_hash, full_name, id, avatar_url }
-const FALLBACK_USERS = new Map([
-  ['+240555570323', {
-    id: 'fallback-240555570323',
-    phone: '+240555570323',
-    full_name: 'Raymon Reddintone', // Usuario principal
-    avatar_url: null,
-    password_hash: '$2a$10$.7A2DtbtOvnbHxy63LTlUusN84Uc/2VDstC23ZWBpR2S5AR3lgTyy', // 509871
-  }],
-]);
-
-const isSupabaseQuotaError = (error) => {
-  if (!error) return false;
-  const msg = String(error?.message || error?.details || error?.hint || JSON.stringify(error) || '');
-  return msg.includes('exceed') || msg.includes('quota') || msg.includes('restricted') || msg.includes('spend');
-};
-
-// --- Helper: detecta si Supabase está operativo (caché 60s) -----------
-// Se auto-desactiva en cuanto Supabase se recupera.
-const _supabaseStatus = { ok: true, checkedAt: 0 };
-const SUPABASE_CHECK_TTL = 60_000; // 60 segundos
-const supabaseOk = async () => {
-  const now = Date.now();
-  if (now - _supabaseStatus.checkedAt < SUPABASE_CHECK_TTL) return _supabaseStatus.ok;
-  try {
-    const { error } = await supabase.from('users').select('id').limit(1);
-    _supabaseStatus.ok = !isSupabaseQuotaError(error);
-    _supabaseStatus.checkedAt = now;
-  } catch {
-    _supabaseStatus.ok = false;
-    _supabaseStatus.checkedAt = now;
-  }
-  return _supabaseStatus.ok;
-};
 
 const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'https://egchat-app.vercel.app,https://egchat-v2.vercel.app,http://localhost:5173,http://localhost:3001,http://localhost:3000,http://127.0.0.1:3001')
   .split(',')
@@ -94,19 +135,126 @@ const corsOptions = {
     if (allowedOrigins.includes(origin)) return callback(null, true);
     // Permitir cualquier localhost en desarrollo
     if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true);
+    // Permitir LAN local para probar web + iPhone desde el Mac
+    if (/^http:\/\/(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)\d{1,3}\.\d{1,3}(:\d+)?$/.test(origin)) return callback(null, true);
     // Permitir cualquier subdominio de vercel.app (egchat-v2, egchat-app, etc.)
     if (/^https:\/\/egchat.*\.vercel\.app$/.test(origin)) return callback(null, true);
     return callback(new Error('CORS policy: origin not allowed'));
   },
   credentials: true,
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Cache-Control', 'X-Auth-Token'],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
 };
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle preflight for all routes
+app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false }));
+
+// Límites por IP. Se dejan holgados porque en redes móviles varios usuarios
+// pueden compartir la misma IP pública (CGNAT).
+const makeLimiter = (limit, windowMs, message) => rateLimit({
+  windowMs,
+  limit,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message },
+});
+const authLimiter = makeLimiter(50, 15 * 60 * 1000, 'Demasiados intentos. Espera unos minutos e inténtalo de nuevo.');
+const walletLimiter = makeLimiter(60, 10 * 60 * 1000, 'Demasiadas operaciones. Espera unos minutos.');
+const kycLimiter = makeLimiter(40, 60 * 60 * 1000, 'Demasiadas solicitudes de verificación. Espera una hora.');
+const pinLimiter = makeLimiter(20, 15 * 60 * 1000, 'Demasiados intentos de PIN. Espera unos minutos.');
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
+// ── Saneador de texto mojibake ────────────────────────────────────
+// El archivo histórico del API contiene literales codificados dos veces
+// (p. ej. "CÁƒÂ³digo" en lugar de "Código"). Se reparan al serializar
+// para que la app reciba siempre texto legible.
+const CP1252_TO_BYTE = { 0x20AC:0x80, 0x201A:0x82, 0x0192:0x83, 0x201E:0x84, 0x2026:0x85, 0x2020:0x86, 0x2021:0x87, 0x02C6:0x88, 0x2030:0x89, 0x0160:0x8A, 0x2039:0x8B, 0x0152:0x8C, 0x017D:0x8E, 0x2018:0x91, 0x2019:0x92, 0x201C:0x93, 0x201D:0x94, 0x2022:0x95, 0x2013:0x96, 0x2014:0x97, 0x02DC:0x98, 0x2122:0x99, 0x0161:0x9A, 0x203A:0x9B, 0x0153:0x9C, 0x017E:0x9E, 0x0178:0x9F };
+
+const isMojibakeChar = (char) => {
+  const code = char.codePointAt(0);
+  return (code >= 0x80 && code <= 0xFF) || CP1252_TO_BYTE[code] !== undefined;
+};
+
+const toMojibakeByte = (char) => {
+  if (char === '\u00C1') return 0xC3; // 'Á' sustituyó a 'Ã' en el archivo histórico
+  const code = char.codePointAt(0);
+  if (CP1252_TO_BYTE[code] !== undefined) return CP1252_TO_BYTE[code];
+  return code < 256 ? code : -1;
+};
+
+// Decodifica solo los tramos con bytes mal codificados, de modo que los
+// caracteres legítimos (•, «, », °) sobrevivan intactos.
+const decodeMojibakeRun = (run) => {
+  let chars = Array.from(run);
+  for (let pass = 0; pass < 4; pass++) {
+    const bytes = chars.map(toMojibakeByte);
+    if (bytes.some((byte) => byte < 0)) return chars.join('');
+    let out = '';
+    let index = 0;
+    let changed = false;
+    while (index < chars.length) {
+      const lead = bytes[index];
+      const size = lead >= 0xC2 && lead <= 0xDF ? 2 : lead >= 0xE0 && lead <= 0xEF ? 3 : 0;
+      if (size && index + size <= bytes.length) {
+        let valid = true;
+        for (let offset = 1; offset < size; offset++) {
+          if (bytes[index + offset] < 0x80 || bytes[index + offset] > 0xBF) { valid = false; break; }
+        }
+        if (valid) {
+          const decoded = Buffer.from(bytes.slice(index, index + size)).toString('utf8');
+          const original = chars.slice(index, index + size).join('');
+          if (decoded && !decoded.includes('\uFFFD') && decoded !== original) {
+            out += decoded;
+            index += size;
+            changed = true;
+            continue;
+          }
+        }
+      }
+      out += chars[index];
+      index += 1;
+    }
+    if (!changed) break;
+    chars = Array.from(out);
+  }
+  return chars.join('');
+};
+
+const repairMojibake = (value) => {
+  if (typeof value !== 'string' || !/[\u00C2\u00C3]/.test(value)) return value;
+  let out = '';
+  let index = 0;
+  while (index < value.length) {
+    if (!isMojibakeChar(value[index])) {
+      out += value[index];
+      index += 1;
+      continue;
+    }
+    let end = index;
+    while (end < value.length && isMojibakeChar(value[end])) end += 1;
+    out += decodeMojibakeRun(value.slice(index, end));
+    index = end;
+  }
+  return out;
+};
+
+const repairDeep = (value, depth = 0) => {
+  if (typeof value === 'string') return repairMojibake(value);
+  if (!value || typeof value !== 'object' || depth > 8) return value;
+  if (Array.isArray(value)) return value.map((item) => repairDeep(item, depth + 1));
+  const out = {};
+  for (const key of Object.keys(value)) out[key] = repairDeep(value[key], depth + 1);
+  return out;
+};
+
+app.use((_req, res, next) => {
+  const originalJson = res.json.bind(res);
+  res.json = (body) => originalJson(repairDeep(body));
+  next();
+});
+
 
 // --- Middleware auth --------------------------------------------------
 const parseBearerToken = (header) => {
@@ -145,6 +293,27 @@ const authFromQuery = (req, res, next) => {
   }
 };
 
+// Solo tokens emitidos por /auth/admin/login (type: 'admin').
+// Los endpoints de KYC exponen datos personales y no deben aceptar tokens de usuario.
+const requireAdmin = (req, res, next) => {
+  const authHeader = parseBearerToken(req.headers.authorization);
+  const xAuthToken = req.headers['x-auth-token'] || '';
+  const queryT = typeof req.query._t === 'string' ? req.query._t : '';
+  const token = authHeader || xAuthToken || queryT;
+  if (!token) return res.status(401).json({ error: 'NO_TOKEN', message: 'Token de administrador requerido' });
+  let payload;
+  try {
+    payload = verifyToken(token);
+  } catch {
+    return res.status(401).json({ error: 'INVALID_TOKEN', message: 'Token inválido o expirado' });
+  }
+  if (payload.type !== 'admin') {
+    return res.status(403).json({ error: 'FORBIDDEN', message: 'Se requieren permisos de administrador' });
+  }
+  req.admin = payload;
+  next();
+};
+
 const emitToUser = (userId, payload) => {
   const key = String(userId);
   const streams = chatStreams.get(key);
@@ -162,7 +331,38 @@ const emitToUsers = (userIds, payload) => {
   uniq.forEach((id) => emitToUser(id, payload));
 };
 
-const adminResetKey = process.env.ADMIN_RESET_KEY || JWT_SECRET;
+// Avisar de una señal de llamada a TODOS los dispositivos de los dos
+// participantes. Antes solo se avisaba al otro usuario, así que el segundo
+// iPhone del que contesta seguía timbrando sin que nadie le dijera nada.
+// El SSE llega a las conexiones vivas; el push VoIP es lo único que despierta
+// un iPhone suspendido con CallKit sonando.
+const notifyCallPeer = async (callId, selfUserId, payload) => {
+  try {
+    const { data } = await supabase
+      .from('call_sessions')
+      .select('caller_id, target_user_id')
+      .eq('call_id', callId)
+      .maybeSingle();
+    if (!data) return;
+    const users = [...new Set([data.caller_id, data.target_user_id]
+      .filter(Boolean).map((id) => String(id)))];
+    emitToUsers(users, payload);
+    sendVoipSignalToUsers(users, callId, payload.type, payload.reason).catch(() => {});
+  } catch (e) {
+    console.warn('[call/notify-peer]', e.message);
+  }
+};
+
+const adminResetKey = process.env.ADMIN_RESET_KEY || null;
+// Sin ADMIN_RESET_KEY las rutas administrativas quedan cerradas (antes caían
+// al secreto JWT, que estaba publicado en el repositorio).
+const isAdminKeyValid = (key) => {
+  if (!adminResetKey || typeof key !== 'string') return false;
+  const provided = Buffer.from(key);
+  const expected = Buffer.from(adminResetKey);
+  if (provided.length !== expected.length) return false;
+  return crypto.timingSafeEqual(provided, expected);
+};
 const ADMIN_RESET_MARKER = '00000000-0000-0000-0000-000000000000';
 const resetTable = async (table, column = 'id') => {
   try {
@@ -190,20 +390,20 @@ const checkTable = async (table) => {
 // --- ADMIN ROUTES (inline) -------------------------------------------
 app.post('/api/admin/reset-all', async (req, res) => {
   const key = req.headers['x-admin-key'] || req.body?.adminKey;
-  if (!key || key !== adminResetKey) return res.status(403).json({ message: 'No autorizado' });
+  if (!isAdminKeyValid(key)) return res.status(403).json({ message: 'No autorizado' });
   const results = [];
   results.push(await resetTable('message_reads', 'read_at'));
   results.push(await resetTable('messages', 'created_at'));
   results.push(await resetTable('chat_participants', 'joined_at'));
   results.push(await resetTable('chats', 'created_at'));
   results.push(await resetTable('contacts', 'created_at'));
-  results.push(await resetTable('transactions', 'created_at'));
-  results.push(await resetTable('recharge_codes', 'created_at'));
+  // wallets, transactions y recharge_codes quedan fuera a propósito: borrar el
+  // historial financiero deja los saldos sin asiento que los respalde y anula
+  // cualquier conciliación ante un supervisor.
   results.push(await resetTable('user_news_favorites', 'created_at'));
   results.push(await resetTable('insurance_claims', 'created_at'));
   results.push(await resetTable('insurance_policies', 'created_at'));
   results.push(await resetTable('lia_conversations', 'created_at'));
-  results.push(await resetTable('wallets', 'created_at'));
   results.push(await resetTable('notifications', 'created_at'));
   results.push(await resetTable('users', 'created_at'));
   return res.json({ message: 'Reset ejecutado', ok_tables: results.filter(r=>r.ok).map(r=>r.table), failed: results.filter(r=>!r.ok) });
@@ -211,7 +411,7 @@ app.post('/api/admin/reset-all', async (req, res) => {
 
 app.post('/api/admin/users/update-version', async (req, res) => {
   const key = req.headers['x-admin-key'] || req.body?.adminKey;
-  if (!key || key !== adminResetKey) return res.status(403).json({ message: 'No autorizado' });
+  if (!isAdminKeyValid(key)) return res.status(403).json({ message: 'No autorizado' });
   const version = typeof req.body?.version === 'string' ? req.body.version : APP_VERSION;
   try {
     const { error } = await supabase.from('users').update({ app_version: version });
@@ -225,7 +425,7 @@ app.post('/api/admin/users/update-version', async (req, res) => {
 // Reset contraseña por admin
 app.post('/api/admin/reset-password', async (req, res) => {
   const key = req.headers['x-admin-key'] || req.body?.adminKey;
-  if (!key || key !== adminResetKey) return res.status(403).json({ message: 'No autorizado' });
+  if (!isAdminKeyValid(key)) return res.status(403).json({ message: 'No autorizado' });
   const { phone, newPassword } = req.body;
   if (!phone || !newPassword) return res.status(400).json({ message: 'phone y newPassword requeridos' });
   const hashed = await bcrypt.hash(newPassword, 10);
@@ -234,32 +434,25 @@ app.post('/api/admin/reset-password', async (req, res) => {
   res.json({ message: 'Contrasena reseteada', user: data });
 });
 
-// --- EMERGENCY: listar usuarios reales de Supabase -------------------
-app.get('/api/emergency/list-users', async (req, res) => {
-  const { token } = req.query;
-  if (!token || token !== 'EG2026_RESET_TOKEN_X9K') return res.status(403).json({ message: 'No autorizado' });
-  try {
-    const { data, error } = await supabase
-      .from('users')
-      .select('id, phone, full_name, avatar_url')
-      .limit(200);
-    if (error) return res.status(500).json({ message: error.message, detail: error.details });
-    res.json({ ok: true, count: data.length, users: data });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// --- EMERGENCY RESET (temporal, borrar después) -----------------------
-app.post('/api/emergency/reset-pw', async (req, res) => {
+// --- EMERGENCY PASSWORD RESET (token de un solo uso) ------------------
+app.post('/api/emergency/reset-pw', authLimiter, async (req, res) => {
+  const expected = process.env.EMERGENCY_RESET_TOKEN;
+  if (!expected) return res.status(404).json({ message: 'No disponible' });
   const { token, phone, newPassword } = req.body || {};
-  if (!token || token !== 'EG2026_RESET_TOKEN_X9K') return res.status(403).json({ message: 'No autorizado' });
+  const tokenOk = typeof token === 'string'
+    && token.length === expected.length
+    && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+  if (!tokenOk) return res.status(403).json({ message: 'No autorizado' });
   if (!phone || !newPassword) return res.status(400).json({ message: 'phone y newPassword requeridos' });
+  if (String(newPassword).length < 8) return res.status(400).json({ message: 'La contraseña debe tener al menos 8 caracteres' });
   try {
     const hashed = await bcrypt.hash(newPassword, 10);
     const { data, error } = await supabase
-      .from('users').update({ password_hash: hashed }).eq('phone', phone)
-      .select('id, phone, full_name').single();
+      .from('users')
+      .update({ password_hash: hashed })
+      .eq('phone', phone)
+      .select('id, phone, full_name')
+      .single();
     if (error || !data) return res.status(404).json({ message: 'Usuario no encontrado', error: error?.message });
     res.json({ ok: true, user: data });
   } catch (e) {
@@ -272,55 +465,17 @@ app.get('/', (req, res) => res.json({
   message: 'EGCHAT API funcionando!',
   version: APP_VERSION,
   database: 'Supabase',
-  status: 'active',
-  deploy_test: 'RENDER_UPDATED_v2.6.2'
+  status: 'active'
 }));
 
-app.get('/health', (req, res) => res.json({ status: 'ok', version: APP_VERSION, timestamp: new Date().toISOString() }));
-
-// Test deploy version
-app.get('/api/test-deploy', (req, res) => res.json({ version: '7bfcbc3-TWILIO-FIXED', wallet_transfer: 'active', supabase: true, sms_verification: 'active' }));
-
-// Helper para generar hash de contraseña (solo dev)
-app.post('/api/dev/hash-password', async (req, res) => {
-  try {
-    const { password } = req.body;
-    if (!password) return res.status(400).json({ message: 'Password requerido' });
-    const hash = await bcrypt.hash(password, 10);
-    res.json({ password, hash });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Test wallet/transfer validation (sin auth)
-app.post('/api/test-wallet-validation', async (req, res) => {
-  const { to, amount } = req.body;
-  if (!to || !amount || amount <= 0) {
-    return res.status(400).json({ message: 'Destinatario y monto requeridos' });
-  }
-  if (amount > 10000000) {
-    return res.status(400).json({ message: 'Monto máximo: 10,000,000 XAF' });
-  }
-  res.json({ validation: 'passed', to, amount });
-});
-
-app.get('/jwt-debug', (req, res) => res.json({
-  jwt_secret_source: process.env.JWT_SECRET ? 'environment' : 'fallback',
-  jwt_secret_first10: JWT_SECRET.substring(0, 10),
-  jwt_secret_length: JWT_SECRET.length,
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  timestamp: new Date().toISOString(),
+  commit: process.env.RENDER_GIT_COMMIT ? String(process.env.RENDER_GIT_COMMIT).slice(0, 8) : null,
+  branch: process.env.RENDER_GIT_REF || null,
 }));
 
-app.get('/debug', (req, res) => res.json({
-  supabase_url_env: process.env.SUPABASE_URL || 'NO ENV — fallback activo',
-  supabase_key: process.env.SUPABASE_SERVICE_KEY ? 'SET' : 'MISSING',
-  jwt_secret: process.env.JWT_SECRET ? 'SET' : 'MISSING',
-  node_env: process.env.NODE_ENV || 'not set',
-  port: PORT,
-  version: APP_VERSION
-}));
-
-app.get('/api/system/dependencies', async (_req, res) => {
+app.get('/api/system/dependencies', requireAdmin, async (_req, res) => {
   const now = Date.now();
   if (dependencyCache.result && now - dependencyCache.timestamp < 60000) {
     return res.json(dependencyCache.result);
@@ -375,21 +530,6 @@ app.get('/api/chat/stream', authFromQuery, (req, res) => {
   // Evento inicial
   res.write(`data: ${JSON.stringify({ type: 'connected', userId, ts: Date.now() })}\n\n`);
 
-  // Marcar online y notificar contactos
-  const notifyPresence = async (online) => {
-    try {
-      await supabase.from('users').update({ online_status: online, last_seen: new Date().toISOString() }).eq('id', userId);
-      const { data: contacts } = await supabase.from('contacts').select('user_id').eq('contact_user_id', userId);
-      const { data: myContacts } = await supabase.from('contacts').select('contact_user_id').eq('user_id', userId);
-      const notifyIds = new Set([
-        ...(contacts || []).map(c => String(c.user_id)),
-        ...(myContacts || []).map(c => String(c.contact_user_id)),
-      ]);
-      notifyIds.forEach(id => emitToUser(id, { type: 'presence', userId, online, ts: Date.now() }));
-    } catch {}
-  };
-  notifyPresence(true);
-
   // Keepalive para evitar timeout en proxies
   const heartbeat = setInterval(() => {
     try {
@@ -402,17 +542,14 @@ app.get('/api/chat/stream', authFromQuery, (req, res) => {
     const streams = chatStreams.get(userId);
     if (streams) {
       streams.delete(res);
-      if (streams.size === 0) {
-        chatStreams.delete(userId);
-        notifyPresence(false);
-      }
+      if (streams.size === 0) chatStreams.delete(userId);
     }
   });
 });
 
 // AUTH
 // ════════════════════════════════════════════════════════════════════
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const { phone, password, full_name, avatar_url } = req.body;
     if (!phone || !password || !full_name)
@@ -434,8 +571,25 @@ app.post('/api/auth/register', async (req, res) => {
 
     if (error) throw error;
 
-    // Crear wallet inicial
-    await supabase.from('wallets').insert({ user_id: user.id, balance: 5000, currency: 'XAF' });
+    // Monedero nuevo a cero: el saldo de bienvenida de las pruebas se abona con
+    // su asiento (SYS-CASH paga, el cliente cobra). Antes se insertaba el saldo
+    // a pelo y el libro mayor no tenía ni idea de de dónde salían esos 5.000.
+    try {
+      const { error: walletError } = await supabase.from('wallets').insert({
+        user_id: user.id,
+        balance: 0,
+        currency: WALLET_CURRENCY,
+      });
+      if (!walletError && WALLET_SANDBOX) {
+        await creditWallet(user.id, 5000, {
+          operation: 'saldo_inicial',
+          account: 'SYS-CASH',
+          concept: 'Saldo de bienvenida (modo pruebas)',
+          key: `OPENING-${user.id}`,
+          reference: `OPENING:${user.id}`,
+        });
+      }
+    } catch {}
 
     const token = jwt.sign({ id: user.id, phone }, JWT_SECRET, { expiresIn: '30d' });
     res.status(201).json({ token, user: { ...user, app_version: APP_VERSION } });
@@ -445,7 +599,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-app.post('/api/auth/check-phone', async (req, res) => {
+app.post('/api/auth/check-phone', authLimiter, async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.json({ exists: false });
@@ -456,49 +610,18 @@ app.post('/api/auth/check-phone', async (req, res) => {
   }
 });
 
-// Heartbeat — mantener online_status=true y notificar contactos
-app.post('/api/auth/heartbeat', auth, async (req, res) => {
-  try {
-    const userId = String(req.user.id);
-    await supabase.from('users').update({ online_status: true, last_seen: new Date().toISOString() }).eq('id', userId);
-    // Notificar contactos bidireccionales
-    const [{ data: c1 }, { data: c2 }] = await Promise.all([
-      supabase.from('contacts').select('user_id').eq('contact_user_id', userId),
-      supabase.from('contacts').select('contact_user_id').eq('user_id', userId),
-    ]);
-    const ids = new Set([
-      ...((c1 || []).map(c => String(c.user_id))),
-      ...((c2 || []).map(c => String(c.contact_user_id))),
-    ]);
-    ids.forEach(id => emitToUser(id, { type: 'presence', userId, online: true, ts: Date.now() }));
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const { phone, password } = req.body;
     if (!phone || !password)
       return res.status(400).json({ message: 'phone y password son requeridos' });
 
-    // Intentar Supabase primero
     const { data: user, error } = await supabase
       .from('users').select('*').eq('phone', phone).maybeSingle();
 
-    // Si Supabase falla por cuota o restricción, usar fallback local
-    if (error && isSupabaseQuotaError(error)) {
-      console.warn('[Login] Supabase restringido por cuota — usando fallback local');
-      const fallback = FALLBACK_USERS.get(String(phone).trim());
-      if (!fallback) return res.status(401).json({ message: 'Credenciales incorrectas' });
-      const ok = await bcrypt.compare(password, fallback.password_hash);
-      if (!ok) return res.status(401).json({ message: 'Credenciales incorrectas' });
-      const token = jwt.sign({ id: fallback.id, phone: fallback.phone }, JWT_SECRET, { expiresIn: '30d' });
-      return res.json({ token, user: { ...fallback, app_version: APP_VERSION } });
+    if (error || !user) {
+      return res.status(401).json({ message: 'Credenciales incorrectas' });
     }
-
-    if (error || !user) return res.status(401).json({ message: 'Credenciales incorrectas' });
 
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ message: 'Credenciales incorrectas' });
@@ -517,23 +640,145 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.get('/api/auth/me', auth, async (req, res) => {
-  // Si Supabase está restringido por cuota, devolver datos del token JWT
-  if (!(await supabaseOk())) {
-    const fallback = FALLBACK_USERS.get(String(req.user.phone || '').trim());
-    return res.json({
-      id: req.user.id,
-      phone: req.user.phone,
-      full_name: fallback?.full_name || (`Usuario ${req.user.phone || 'EGCHAT'}`),
-      avatar_url: fallback?.avatar_url || null,
-      created_at: new Date().toISOString(),
-      app_version: APP_VERSION,
-      _offline: true,
-    });
+  if (String(req.user.id || '').startsWith('local-')) {
+    const user = getLocalAuthUser(req.user.phone);
+    return res.json(user);
   }
   const { data: user } = await supabase
     .from('users').select('id, phone, full_name, avatar_url, created_at').eq('id', req.user.id).single();
   if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
+  // Marcar como online
+  supabase.from('users').update({ online_status: true, last_seen: new Date().toISOString() }).eq('id', req.user.id).then(() => {});
   res.json({ ...user, app_version: APP_VERSION });
+});
+
+// Heartbeat — el cliente llama esto cada 30s para mantenerse "online"
+app.post('/api/auth/heartbeat', auth, async (req, res) => {
+  if (!String(req.user.id || '').startsWith('local-')) {
+    supabase.from('users').update({ online_status: true, last_seen: new Date().toISOString() }).eq('id', req.user.id).then(() => {});
+  }
+  res.json({ ok: true });
+});
+
+// ── PIN de seguridad del monedero ────────────────────────────────
+// Se guarda hasheado en users.pin_hash. Sin PIN configurado las
+// operaciones funcionan igual (útil mientras el monedero es de prueba).
+app.get('/api/auth/has-pin', auth, async (req, res) => {
+  try {
+    const { data } = await supabase
+      .from('users').select('pin_hash').eq('id', req.user.id).maybeSingle();
+    res.json({ hasPin: Boolean(data?.pin_hash) });
+  } catch (e) {
+    res.status(500).json({ message: 'No se pudo consultar el PIN' });
+  }
+});
+
+app.post('/api/auth/setup-pin', auth, pinLimiter, async (req, res) => {
+  try {
+    const pin = String(req.body?.pin ?? '');
+    const currentPin = req.body?.currentPin;
+    if (!/^\d{4,6}$/.test(pin)) {
+      return res.status(400).json({ message: 'El PIN debe tener entre 4 y 6 dígitos' });
+    }
+
+    const { data: user } = await supabase
+      .from('users').select('pin_hash').eq('id', req.user.id).maybeSingle();
+    if (user?.pin_hash) {
+      const valid = currentPin && await bcrypt.compare(String(currentPin), user.pin_hash);
+      if (!valid) return res.status(403).json({ code: 'PIN_INVALID', message: 'PIN actual incorrecto' });
+    }
+
+    const pin_hash = await bcrypt.hash(pin, 10);
+    const { error } = await supabase.from('users').update({ pin_hash }).eq('id', req.user.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ message: 'No se pudo guardar el PIN' });
+  }
+});
+
+app.post('/api/auth/verify-pin', auth, pinLimiter, async (req, res) => {
+  try {
+    const pin = String(req.body?.pin ?? '');
+    const result = await checkPinForOperation(req.user.id, pin);
+    if (result.ok) return res.json({ valid: true });
+    res.json({ valid: false, message: result.code === 'PIN_REQUIRED' ? 'Introduce tu PIN' : 'PIN incorrecto' });
+  } catch (e) {
+    res.status(500).json({ valid: false, message: 'No se pudo verificar el PIN' });
+  }
+});
+
+// Registro de actividad del usuario
+app.get('/api/auth/activity', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const activity = [];
+    const now = new Date();
+
+    // Último login (del campo last_login en users)
+    const { data: user } = await supabase.from('users').select('last_login, created_at').eq('id', userId).single();
+    if (user?.last_login) {
+      activity.push({ id: 'login_1', type: 'login', action: 'Inicio de sesión', description: 'Sesión activa en este dispositivo', timestamp: user.last_login });
+    }
+
+    // Transacciones recientes. La tabla no tiene columna `description`: se pedía
+    // y el consultor devolvía error, así que el listado salía vacío siempre.
+    const { data: txs } = await supabase.from('transactions').select('id, type, amount, currency, created_at').eq('user_id', userId).order('created_at', { ascending: false }).limit(5);
+    (txs || []).forEach(tx => {
+      activity.push({ id: `tx_${tx.id}`, type: 'transaction', action: tx.type === 'transfer' ? 'Transferencia' : tx.type === 'deposit' ? 'Recarga' : 'Pago', description: `${tx.amount} ${(tx.currency || 'XAF').toUpperCase()}`, timestamp: tx.created_at });
+    });
+
+    // Mensajes enviados recientes (como indicador de actividad de chat)
+    const { data: msgs } = await supabase.from('messages').select('id, created_at, chat_id').eq('sender_id', userId).order('created_at', { ascending: false }).limit(3);
+    if (msgs && msgs.length > 0) {
+      activity.push({ id: 'chat_1', type: 'chat', action: 'Mensajes enviados', description: `${msgs.length} mensajes recientes`, timestamp: msgs[0].created_at });
+    }
+
+    // Ordenar por fecha
+    activity.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    res.json(activity.slice(0, 20));
+  } catch (e) {
+    res.json([]);
+  }
+});
+
+// Marcar offline al cerrar sesión
+app.post('/api/auth/logout', auth, async (req, res) => {
+  if (!String(req.user.id || '').startsWith('local-')) {
+    supabase.from('users').update({ online_status: false, last_seen: new Date().toISOString() }).eq('id', req.user.id).then(() => {});
+  }
+  res.json({ message: 'Sesión cerrada' });
+});
+
+// Cambiar contraseña
+app.post('/api/auth/change-password', auth, async (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body;
+    if (!oldPassword || !newPassword) return res.status(400).json({ message: 'Contraseñas requeridas' });
+    if (newPassword.length < 6) return res.status(400).json({ message: 'La nueva contraseña debe tener al menos 6 caracteres' });
+    const { data: user } = await supabase.from('users').select('password_hash').eq('id', req.user.id).single();
+    if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
+    const valid = await bcrypt.compare(oldPassword, user.password_hash);
+    if (!valid) return res.status(401).json({ message: 'Contraseña actual incorrecta' });
+    const hash = await bcrypt.hash(newPassword, 10);
+    await supabase.from('users').update({ password_hash: hash }).eq('id', req.user.id);
+    res.json({ ok: true, message: 'Contraseña actualizada' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// Enviar feedback/comentarios
+app.post('/api/feedback', auth, async (req, res) => {
+  try {
+    const { category, message } = req.body;
+    if (!message?.trim()) return res.status(400).json({ message: 'Mensaje requerido' });
+    await supabase.from('feedback').insert({
+      user_id: req.user.id,
+      category: category || 'General',
+      message: message.trim(),
+      created_at: new Date().toISOString(),
+    });
+    res.json({ ok: true, message: 'Feedback recibido' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 app.put('/api/auth/profile', auth, async (req, res) => {
@@ -552,662 +797,120 @@ app.put('/api/auth/profile', auth, async (req, res) => {
   }
 });
 
-app.post('/api/auth/logout', auth, (req, res) => res.json({ message: 'Sesión cerrada' }));
-
-// ══════════════════════════════════════════════════════════════════
-// SESIONES MULTI-DISPOSITIVO
-// Registro, heartbeat, listado y revocación de sesiones activas.
-// Permite al usuario ver todos sus dispositivos conectados (como
-// WhatsApp Web) y cerrar sesiones remotamente.
-// ══════════════════════════════════════════════════════════════════
-
-// Registrar / actualizar sesión del dispositivo actual
-app.post('/api/auth/sessions/register', auth, async (req, res) => {
+// ── Verificar/crear buckets de storage ───────────────────────────
+app.post('/api/storage/init', auth, async (_req, res) => {
   try {
-    const { deviceId, deviceName, deviceType, platform } = req.body;
-    const userId = req.user.id;
-
-    if (!deviceId) return res.status(400).json({ message: 'deviceId requerido' });
-
-    await supabase.from('user_sessions').upsert({
-      id:          `${userId}_${deviceId}`,
-      user_id:     userId,
-      device_name: deviceName || 'Dispositivo',
-      device_type: deviceType || 'unknown',
-      platform:    platform   || '',
-      last_seen:   new Date().toISOString(),
-      is_active:   true,
-    }, { onConflict: 'id' });
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Heartbeat — mantener sesión viva
-app.post('/api/auth/sessions/heartbeat', auth, async (req, res) => {
-  try {
-    const { deviceId } = req.body;
-    const userId = req.user.id;
-    await supabase.from('user_sessions')
-      .update({ last_seen: new Date().toISOString(), is_active: true })
-      .eq('id', `${userId}_${deviceId}`);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Listar sesiones activas del usuario
-app.get('/api/auth/sessions', auth, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { data: sessions } = await supabase
-      .from('user_sessions')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('is_active', true)
-      .order('last_seen', { ascending: false });
-
-    res.json((sessions || []).map(s => ({
-      id:           s.id,
-      deviceId:     s.device_name ? s.id.replace(`${userId}_`, '') : s.id,
-      deviceName:   s.device_name,
-      deviceType:   s.device_type,
-      platform:     s.platform,
-      lastSeen:     s.last_seen,
-      createdAt:    s.created_at,
-    })));
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Revocar una sesión específica (cerrar otro dispositivo)
-app.delete('/api/auth/sessions/:sessionId', auth, async (req, res) => {
-  try {
-    const { sessionId } = req.params;
-    const userId = req.user.id;
-
-    // Verificar que la sesión pertenece a este usuario
-    const { data: session } = await supabase
-      .from('user_sessions')
-      .select('id, user_id')
-      .eq('id', sessionId)
-      .eq('user_id', userId)
-      .single();
-
-    if (!session) return res.status(404).json({ message: 'Sesión no encontrada' });
-
-    await supabase.from('user_sessions').update({ is_active: false }).eq('id', sessionId);
-
-    // Extraer deviceId del id compuesto "userId_deviceId"
-    const deviceId = sessionId.replace(`${userId}_`, '');
-
-    // Notificar al dispositivo remoto via SSE para que cierre sesión
-    emitToUser(String(userId), {
-      type: 'session_revoked',
-      deviceId,
-      sessionId,
-      ts: Date.now(),
-    });
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Cerrar todas las sesiones excepto la actual
-app.delete('/api/auth/sessions/all-except-current', auth, async (req, res) => {
-  try {
-    const { deviceId } = req.body;
-    const userId = req.user.id;
-    const currentSessionId = `${userId}_${deviceId}`;
-
-    const { data: sessions } = await supabase
-      .from('user_sessions')
-      .select('id')
-      .eq('user_id', userId)
-      .eq('is_active', true)
-      .neq('id', currentSessionId);
-
-    if (sessions?.length) {
-      await supabase.from('user_sessions')
-        .update({ is_active: false })
-        .in('id', sessions.map(s => s.id));
-
-      // Notificar a todos los otros dispositivos
-      emitToUser(String(userId), {
-        type: 'session_revoked',
-        all: true,
-        exceptDeviceId: deviceId,
-        ts: Date.now(),
-      });
-    }
-
-    res.json({ ok: true, revoked: sessions?.length || 0 });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Sincronización bilateral: emitir mensaje a todos los otros dispositivos del usuario
-// Esto se llama internamente después de enviar un mensaje, para que el móvil
-// reciba el mensaje enviado desde web/desktop
-app.post('/api/auth/sessions/sync-message', auth, async (req, res) => {
-  try {
-    const { chatId, message, senderDeviceId } = req.body;
-    const userId = req.user.id;
-
-    // Emitir a todos los dispositivos del usuario EXCEPTO el que envió
-    emitToUser(String(userId), {
-      type: 'sync_message',
-      chatId,
-      message,
-      senderDeviceId,
-      ts: Date.now(),
-    });
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════════
-// PAGOS CON PASARELA REAL — Stripe + Orange Money + MTN
-//
-// Arquitectura:
-//  - Stripe:       PaymentIntent en servidor → clientSecret al cliente
-//                  Cliente confirma con @stripe/stripe-react-native
-//                  Webhook /api/payments/webhook actualiza wallet
-//  - Orange/MTN:   USSD Push via API del operador (simulado aquí,
-//                  reemplazar con SDK real en producción)
-//                  Polling de estado hasta completar
-//  - Banco/Agente: Registro manual, auditor aprueba manualmente
-// ══════════════════════════════════════════════════════════════════
-
-// Stripe: clave secreta desde variables de entorno
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || null;
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || null;
-let stripe = null;
-if (STRIPE_SECRET_KEY) {
-  try { stripe = require('stripe')(STRIPE_SECRET_KEY); } catch {}
-}
-
-// Comisiones por pasarela
-const GATEWAY_FEES = {
-  stripe:        (amount) => Math.round(amount * 0.029) + 30,
-  orange_money:  (amount) => Math.round(amount * 0.01),
-  mtn_mobile:    (amount) => Math.round(amount * 0.01),
-  bank_transfer: () => 0,
-  cash_agent:    () => 0,
-  recharge_code: () => 0,
-  egchat_transfer: () => 0,
-};
-
-const GATEWAY_TIME = {
-  stripe:        'Inmediato',
-  orange_money:  'Inmediato (USSD)',
-  mtn_mobile:    'Inmediato (USSD)',
-  bank_transfer: '1-2 días hábiles',
-  cash_agent:    'Inmediato',
-  recharge_code: 'Inmediato',
-  egchat_transfer: 'Inmediato',
-};
-
-// ── Crear intento de depósito ─────────────────────────────────────
-app.post('/api/payments/deposit/intent', auth, async (req, res) => {
-  try {
-    const { amount, gateway, currency = 'XAF', phone, description } = req.body;
-    if (!amount || amount < 500) return res.status(400).json({ message: 'Importe mínimo: 500 XAF' });
-    if (!gateway)                return res.status(400).json({ message: 'Pasarela requerida' });
-
-    const userId = req.user.id;
-    const fee    = (GATEWAY_FEES[gateway] || (() => 0))(amount);
-    const intentId = `pay_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-    let responseData = {
-      id: intentId, amount, currency, gateway, fee,
-      status: 'pending', estimatedTime: GATEWAY_TIME[gateway] || 'Variable',
-    };
-
-    // ── Stripe ──────────────────────────────────────────────────
-    if (gateway === 'stripe') {
-      if (!stripe) {
-        return res.status(503).json({
-          message: 'Stripe no configurado. Añade STRIPE_SECRET_KEY al .env del servidor.',
-        });
-      }
-      const amountInSmallestUnit = Math.round(amount / 655.957); // XAF → EUR cents (1 EUR ≈ 655.957 XAF)
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount: Math.max(50, amountInSmallestUnit), // mínimo 50 cents EUR
-        currency: 'eur',
-        metadata: {
-          egchat_user_id: String(userId),
-          egchat_amount_xaf: String(amount),
-          egchat_intent_id: intentId,
-        },
-        description: description || 'Recarga EGChat',
-        automatic_payment_methods: { enabled: true },
-      });
-
-      // Guardar intent en BD para reconciliación con webhook
-      await supabase.from('payment_transactions').insert({
-        id: intentId,
-        user_id: userId,
-        type: 'deposit',
-        amount,
-        currency,
-        gateway,
-        gateway_txn_id: paymentIntent.id,
-        status: 'pending',
-        metadata: JSON.stringify({ stripeIntentId: paymentIntent.id, fee }),
-      }).catch(() => {});
-
-      return res.json({
-        ...responseData,
-        clientSecret: paymentIntent.client_secret,
-        stripeIntentId: paymentIntent.id,
-        status: 'pending',
-      });
-    }
-
-    // ── Orange Money / MTN (USSD Push) ───────────────────────────
-    if (gateway === 'orange_money' || gateway === 'mtn_mobile') {
-      if (!phone) return res.status(400).json({ message: 'Número de teléfono requerido' });
-
-      // Guardar en BD como pendiente
-      await supabase.from('payment_transactions').insert({
-        id: intentId,
-        user_id: userId,
-        type: 'deposit',
-        amount,
-        currency,
-        gateway,
-        status: 'pending',
-        metadata: JSON.stringify({ phone, fee }),
-      }).catch(() => {});
-
-      // En producción: llamar a la API de Orange/MTN para iniciar USSD Push
-      // Por ahora: devolver código USSD de demostración
-      const operatorPrefix = gateway === 'orange_money' ? '150' : '126';
-      return res.json({
-        ...responseData,
-        intentId,
-        ussdCode: `*${operatorPrefix}*2*${amount}#`,
-        phone,
-        instructions: [
-          `1. Marca *${operatorPrefix}*2*${amount}# en tu teléfono`,
-          '2. Confirma el pago con tu PIN',
-          '3. Espera la confirmación por SMS',
-        ],
-        pollUrl: `/api/payments/status/${intentId}`,
-      });
-    }
-
-    // ── Banco / Agente / Código / Transferencia EGChat ───────────
-    await supabase.from('payment_transactions').insert({
-      id: intentId,
-      user_id: userId,
-      type: 'deposit',
-      amount,
-      currency,
-      gateway,
-      status: gateway === 'egchat_transfer' ? 'pending' : 'pending',
-      metadata: JSON.stringify({ fee, description }),
-    }).catch(() => {});
-
-    return res.json({ ...responseData, intentId });
-  } catch (e) {
-    console.error('[payments] deposit/intent error:', e);
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── Confirmar depósito ────────────────────────────────────────────
-app.post('/api/payments/deposit/confirm', auth, async (req, res) => {
-  try {
-    const { intentId, gateway, paymentMethodId } = req.body;
-    const userId = req.user.id;
-
-    const { data: intent } = await supabase
-      .from('payment_transactions')
-      .select('*')
-      .eq('id', intentId)
-      .eq('user_id', userId)
-      .single();
-
-    if (!intent) return res.status(404).json({ message: 'Intent no encontrado' });
-    if (intent.status === 'completed') return res.json({ ok: true, alreadyCompleted: true });
-
-    // Stripe: confirmar via SDK en el cliente, el webhook actualiza el balance
-    // Este endpoint es para pasarelas que no usan webhook
-    if (gateway === 'stripe') {
-      return res.json({
-        ok: false,
-        requiresAction: true,
-        message: 'Usa el SDK de Stripe para confirmar el pago',
-      });
-    }
-
-    // Para pasarelas manuales: marcar como completado y actualizar wallet
-    const meta = typeof intent.metadata === 'string' ? JSON.parse(intent.metadata) : (intent.metadata || {});
-    const fee  = meta.fee || 0;
-    const net  = intent.amount - fee;
-
-    await supabase.from('payment_transactions')
-      .update({ status: 'completed', updated_at: new Date().toISOString() })
-      .eq('id', intentId);
-
-    // Actualizar wallet
-    const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', userId).single();
-    const newBalance = (wallet?.balance || 0) + net;
-    await supabase.from('wallets').upsert({ user_id: userId, balance: newBalance, currency: 'XAF' });
-
-    // Registrar en transactions para historial del monedero
-    await supabase.from('transactions').insert({
-      user_id: userId, type: 'deposit', amount: net,
-      method: gateway, reference: intentId, status: 'completed',
-    });
-
-    // Notificar via SSE
-    emitToUser(String(userId), {
-      type: 'wallet_updated',
-      balance: newBalance,
-      transaction: { type: 'deposit', amount: net, gateway },
-      ts: Date.now(),
-    });
-
-    res.json({ ok: true, newBalance, transactionId: intentId });
-  } catch (e) {
-    console.error('[payments] deposit/confirm error:', e);
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── Webhook de Stripe (actualiza wallet automáticamente) ──────────
-app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.json({ received: true });
-
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
-  } catch (e) {
-    return res.status(400).json({ message: 'Webhook signature invalid' });
-  }
-
-  if (event.type === 'payment_intent.succeeded') {
-    const pi = event.data.object;
-    const userId     = pi.metadata?.egchat_user_id;
-    const amountXaf  = parseInt(pi.metadata?.egchat_amount_xaf || '0');
-    const intentId   = pi.metadata?.egchat_intent_id;
-
-    if (userId && amountXaf > 0) {
-      // Evitar doble procesamiento
-      const { data: existing } = await supabase
-        .from('payment_transactions')
-        .select('status')
-        .eq('gateway_txn_id', pi.id)
-        .single();
-
-      if (existing?.status !== 'completed') {
-        await supabase.from('payment_transactions')
-          .update({ status: 'completed' })
-          .eq('gateway_txn_id', pi.id);
-
-        const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', userId).single();
-        const newBalance = (wallet?.balance || 0) + amountXaf;
-        await supabase.from('wallets').upsert({ user_id: userId, balance: newBalance, currency: 'XAF' });
-
-        await supabase.from('transactions').insert({
-          user_id: userId, type: 'deposit', amount: amountXaf,
-          method: 'Stripe (Tarjeta)', reference: pi.id, status: 'completed',
-        });
-
-        emitToUser(String(userId), { type: 'wallet_updated', balance: newBalance, ts: Date.now() });
+    const results = [];
+    for (const bucketName of ['chat-files', 'avatars']) {
+      const { data: list } = await supabase.storage.listBuckets();
+      const exists = (list || []).some(b => b.name === bucketName);
+      if (!exists) {
+        const { error } = await supabase.storage.createBucket(bucketName, { public: true });
+        results.push({ bucket: bucketName, created: !error, error: error?.message });
+      } else {
+        await supabase.storage.updateBucket(bucketName, { public: true }).catch(() => {});
+        results.push({ bucket: bucketName, created: false, exists: true });
       }
     }
-  }
-
-  res.json({ received: true });
-});
-
-// ── Estado de un pago (polling) ───────────────────────────────────
-app.get('/api/payments/status/:intentId', auth, async (req, res) => {
-  try {
-    const { data: intent } = await supabase
-      .from('payment_transactions')
-      .select('status, amount, updated_at')
-      .eq('id', req.params.intentId)
-      .eq('user_id', req.user.id)
-      .single();
-
-    if (!intent) return res.status(404).json({ message: 'Intent no encontrado' });
-
-    let balance = null;
-    if (intent.status === 'completed') {
-      const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', req.user.id).single();
-      balance = wallet?.balance;
-    }
-
-    res.json({ status: intent.status, amount: intent.amount, balance });
+    res.json({ ok: true, results });
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
 });
 
-// ── Crear intento de retiro ───────────────────────────────────────
-app.post('/api/payments/withdraw/intent', auth, async (req, res) => {
-  try {
-    const { amount, gateway, destination, currency = 'XAF' } = req.body;
-    const userId = req.user.id;
-
-    if (!amount || amount < 1000) return res.status(400).json({ message: 'Mínimo de retiro: 1,000 XAF' });
-
-    const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', userId).single();
-    if (!wallet || amount > wallet.balance) return res.status(400).json({ message: 'Saldo insuficiente' });
-
-    const fee       = (GATEWAY_FEES[gateway] || (() => 0))(amount);
-    const netAmount = amount - fee;
-    const intentId  = `wdr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-    await supabase.from('payment_transactions').insert({
-      id: intentId, user_id: userId, type: 'withdrawal',
-      amount, currency, gateway, status: 'pending',
-      metadata: JSON.stringify({ destination, fee, netAmount }),
-    });
-
-    res.json({
-      id: intentId, amount, netAmount, fee, currency, gateway,
-      status: 'pending', estimatedTime: GATEWAY_TIME[gateway] || 'Variable',
-    });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── Confirmar retiro ──────────────────────────────────────────────
-app.post('/api/payments/withdraw/confirm/:intentId', auth, async (req, res) => {
-  try {
-    const { intentId } = req.params;
-    const userId = req.user.id;
-
-    const { data: intent } = await supabase
-      .from('payment_transactions')
-      .select('*')
-      .eq('id', intentId)
-      .eq('user_id', userId)
-      .single();
-
-    if (!intent) return res.status(404).json({ message: 'Intent no encontrado' });
-    if (intent.status !== 'pending') return res.status(400).json({ message: `Estado inválido: ${intent.status}` });
-
-    const meta      = typeof intent.metadata === 'string' ? JSON.parse(intent.metadata) : (intent.metadata || {});
-    const netAmount = meta.netAmount || intent.amount;
-
-    // Descontar del wallet
-    const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', userId).single();
-    if (!wallet || intent.amount > wallet.balance) {
-      return res.status(400).json({ message: 'Saldo insuficiente en el momento de confirmar' });
-    }
-
-    const newBalance = wallet.balance - intent.amount;
-    await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', userId);
-
-    await supabase.from('payment_transactions')
-      .update({ status: 'completed', updated_at: new Date().toISOString() })
-      .eq('id', intentId);
-
-    await supabase.from('transactions').insert({
-      user_id: userId, type: 'withdraw', amount: intent.amount,
-      method: intent.gateway, reference: intentId, status: 'completed',
-    });
-
-    emitToUser(String(userId), { type: 'wallet_updated', balance: newBalance, ts: Date.now() });
-
-    res.json({ ok: true, newBalance, netAmount, transactionId: intentId });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── Historial de pagos externos ───────────────────────────────────
-app.get('/api/payments/history', auth, async (req, res) => {
-  try {
-    const page  = parseInt(String(req.query.page  || '1'));
-    const limit = parseInt(String(req.query.limit || '20'));
-    const offset = (page - 1) * limit;
-
-    const { data } = await supabase
-      .from('payment_transactions')
-      .select('*')
-      .eq('user_id', req.user.id)
-      .order('created_at', { ascending: false })
-      .range(offset, offset + limit - 1);
-
-    res.json((data || []).map(t => ({
-      id: t.id,
-      type: t.type,
-      amount: t.amount,
-      currency: t.currency,
-      gateway: t.gateway,
-      gatewayTxnId: t.gateway_txn_id,
-      status: t.status,
-      description: typeof t.metadata === 'object' ? t.metadata?.description : null,
-      createdAt: t.created_at,
-    })));
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-
-// ── Backup de clave privada E2E cifrada ───────────────────────────
-// El servidor guarda el blob cifrado (no puede leer la clave privada).
-// La clave privada solo se puede descifrar con la contraseña del usuario.
-
-// Guardar/actualizar backup de clave E2E
-app.post('/api/auth/e2e-key-backup', auth, async (req, res) => {
-  try {
-    const { encryptedKey, salt, publicKey, version, algorithm } = req.body;
-    if (!encryptedKey || !salt || !publicKey) {
-      return res.status(400).json({ message: 'encryptedKey, salt y publicKey son requeridos' });
-    }
-
-    // Upsert en la tabla users: guardar el blob cifrado
-    await supabase.from('users').update({
-      e2e_public_key:      publicKey,
-      e2e_key_backup:      JSON.stringify({ encryptedKey, salt, version: version || 1, algorithm: algorithm || 'nacl-secretbox-pbkdf2-sha512-100k' }),
-      e2e_backup_updated:  new Date().toISOString(),
-    }).eq('id', req.user.id);
-
-    res.json({ ok: true, backed_up_at: new Date().toISOString() });
-  } catch (e) {
-    console.error('E2E backup error:', e);
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Obtener backup de clave E2E (para restaurar en nuevo dispositivo)
-app.get('/api/auth/e2e-key-backup', auth, async (req, res) => {
-  try {
-    const { data: user } = await supabase
-      .from('users')
-      .select('e2e_key_backup, e2e_public_key, e2e_backup_updated')
-      .eq('id', req.user.id)
-      .single();
-
-    if (!user?.e2e_key_backup) {
-      return res.status(404).json({ message: 'No hay backup de clave E2E' });
-    }
-
-    const backup = typeof user.e2e_key_backup === 'string'
-      ? JSON.parse(user.e2e_key_backup)
-      : user.e2e_key_backup;
-
-    res.json({
-      encryptedKey: backup.encryptedKey,
-      salt:         backup.salt,
-      publicKey:    user.e2e_public_key,
-      version:      backup.version || 1,
-      algorithm:    backup.algorithm,
-      backedUpAt:   user.e2e_backup_updated,
-    });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// HEAD — verificar si existe backup sin descargar el blob
-app.head('/api/auth/e2e-key-backup', auth, async (req, res) => {
-  try {
-    const { data: user } = await supabase
-      .from('users')
-      .select('e2e_key_backup')
-      .eq('id', req.user.id)
-      .single();
-    if (user?.e2e_key_backup) res.status(200).end();
-    else res.status(404).end();
-  } catch {
-    res.status(500).end();
-  }
-});
-
-// Subir/actualizar clave pública E2E (para que contactos cifren hacia ti)
+// ── Cifrado E2E — claves públicas ─────────────────────────────────────────────
 app.post('/api/auth/e2e-key', auth, async (req, res) => {
   try {
     const { publicKey } = req.body;
-    if (!publicKey) return res.status(400).json({ message: 'publicKey es requerido' });
+    if (!publicKey) return res.status(400).json({ message: 'publicKey requerida' });
     await supabase.from('users').update({ e2e_public_key: publicKey }).eq('id', req.user.id);
     res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
+  } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// Obtener clave pública E2E de un usuario (para cifrar mensajes hacia él)
 app.get('/api/users/:userId/e2e-key', auth, async (req, res) => {
   try {
-    const { data: user } = await supabase
-      .from('users')
-      .select('e2e_public_key')
-      .eq('id', req.params.userId)
-      .single();
-    if (!user?.e2e_public_key) return res.status(404).json({ message: 'Sin clave E2E' });
-    res.json({ publicKey: user.e2e_public_key });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
+    const { data } = await supabase
+      .from('users').select('e2e_public_key').eq('id', req.params.userId).single();
+    res.json({ publicKey: data?.e2e_public_key || null });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ── Login QR desde PC ────────────────────────────────────────────────────────
+// Almacén en memoria: sessionId → { token, userId, expiresAt, confirmed }
+const qrSessions = new Map();
+
+// PC llama esto para generar un QR
+app.post('/api/auth/qr-create', async (req, res) => {
+  const sessionId = require('crypto').randomBytes(16).toString('hex');
+  qrSessions.set(sessionId, {
+    token: null,
+    userId: null,
+    confirmed: false,
+    expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutos
+  });
+  // Limpiar sesiones expiradas
+  for (const [id, s] of qrSessions.entries()) {
+    if (s.expiresAt < Date.now()) qrSessions.delete(id);
   }
+  res.json({
+    sessionId,
+    qrData: `egchat://qr-login/${sessionId}`,
+    expiresIn: 300,
+  });
+});
+
+// App móvil escanea el QR y confirma la sesión
+app.post('/api/auth/qr-confirm', auth, async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) return res.status(400).json({ message: 'sessionId requerido' });
+
+  const session = qrSessions.get(sessionId);
+  if (!session) return res.status(404).json({ message: 'QR no encontrado o expirado' });
+  if (session.expiresAt < Date.now()) {
+    qrSessions.delete(sessionId);
+    return res.status(410).json({ message: 'QR expirado' });
+  }
+
+  // Generar token de sesión para el PC
+  const pcToken = jwt.sign(
+    { id: req.user.id, phone: req.user.phone, via: 'qr' },
+    JWT_SECRET,
+    { expiresIn: '30d' }
+  );
+
+  session.token   = pcToken;
+  session.userId  = req.user.id;
+  session.confirmed = true;
+  qrSessions.set(sessionId, session);
+
+  res.json({ ok: true, message: 'Sesión confirmada desde el móvil' });
+});
+
+// PC hace polling para saber si el QR fue escaneado
+app.get('/api/auth/qr-status/:sessionId', async (req, res) => {
+  const session = qrSessions.get(req.params.sessionId);
+  if (!session) return res.json({ status: 'expired' });
+  if (session.expiresAt < Date.now()) {
+    qrSessions.delete(req.params.sessionId);
+    return res.json({ status: 'expired' });
+  }
+  if (session.confirmed) {
+    const token = session.token;
+    const userId = session.userId;
+    qrSessions.delete(req.params.sessionId); // Usar solo una vez
+    const { data: user } = await supabase
+      .from('users').select('id, phone, full_name, avatar_url').eq('id', userId).single();
+    return res.json({ status: 'confirmed', token, user });
+  }
+  res.json({ status: 'pending' });
 });
 
 // ── Recuperación de contraseña ────────────────────────────────────────────────
 // Almacén temporal en memoria: { phone -> { code, expiresAt } }
 const resetCodes = new Map();
 
-app.post('/api/auth/request-password-reset', async (req, res) => {
+app.post('/api/auth/send-verification', authLimiter, async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ message: 'Teléfono requerido' });
@@ -1220,50 +923,46 @@ app.post('/api/auth/request-password-reset', async (req, res) => {
     const code = String(Math.floor(100000 + Math.random() * 900000));
     resetCodes.set(phone, { code, expiresAt: Date.now() + 10 * 60 * 1000 }); // 10 min
 
-    // Intentar enviar SMS via Twilio si está configurado
+    // Sin las tres variables no hay canal de SMS: antes se respondia `sent:true` igual
+    // y el usuario se quedaba esperando un código que nunca salió.
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken  = process.env.TWILIO_AUTH_TOKEN;
+    const fromPhone  = process.env.TWILIO_PHONE;
+    if (!accountSid || !authToken || !fromPhone) {
+      resetCodes.delete(phone);
+      const faltan = ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE'].filter(k => !process.env[k]);
+      console.error('SMS de recuperacion sin configurar: faltan', faltan.join(', '));
+      return res.status(503).json({ sent: false, message: 'No podemos enviar el SMS en este momento. Inténtalo más tarde.' });
+    }
     try {
-      const accountSid = process.env.TWILIO_ACCOUNT_SID;
-      const authToken  = process.env.TWILIO_AUTH_TOKEN;
-      const fromPhone  = process.env.TWILIO_PHONE;
-      if (accountSid && authToken && fromPhone) {
-        const twilio = require('twilio')(accountSid, authToken);
-        await twilio.messages.create({
-          body: `Tu código de recuperación EGCHAT es: ${code}. Válido 10 minutos.`,
-          from: fromPhone,
-          to: phone,
-        });
-      }
+      const twilio = require('twilio')(accountSid, authToken);
+      await twilio.messages.create({
+        body: `Tu código de recuperación EGCHAT es: ${code}. Válido 10 minutos.`,
+        from: fromPhone,
+        to: phone,
+      });
     } catch (smsErr) {
-      console.warn('SMS no enviado (Twilio no configurado):', smsErr.message);
+      resetCodes.delete(phone);
+      console.error('Twilio rechazo el SMS de recuperacion:', smsErr.message);
+      return res.status(502).json({ sent: false, message: 'El envío del código falló. Inténtalo más tarde.' });
     }
 
-    console.log(`[RESET] Código para ${phone}: ${code}`);
+    // El código es la credencial del reset: nunca va al log.
     res.json({ sent: true, message: 'Código enviado' });
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
 });
 
-app.post('/api/auth/verify-code', async (req, res) => {
+app.post('/api/auth/verify-code', authLimiter, async (req, res) => {
   try {
     const { phone, code } = req.body;
     if (!phone || !code) return res.status(400).json({ message: 'Teléfono y código requeridos' });
 
-    // BYPASS CODE para testing: 999999 siempre válido en desarrollo
-    if (String(code) === '999999') {
-      console.log(`[BYPASS] Código 999999 usado para ${phone} - modo testing`);
-      return res.json({ verified: true, bypass: true });
-    }
-
-    // Buscar en verificationCodes (registro) o resetCodes (recuperación)
-    const verificationEntry = global.verificationCodes?.get(phone);
-    const resetEntry = resetCodes.get(phone);
-    const entry = verificationEntry || resetEntry;
-
+    const entry = resetCodes.get(phone);
     if (!entry) return res.status(400).json({ verified: false, message: 'No hay código activo para este número' });
     if (Date.now() > entry.expiresAt) {
-      if (verificationEntry) global.verificationCodes.delete(phone);
-      if (resetEntry) resetCodes.delete(phone);
+      resetCodes.delete(phone);
       return res.status(400).json({ verified: false, message: 'El código ha expirado. Solicita uno nuevo.' });
     }
     if (entry.code !== String(code)) return res.status(400).json({ verified: false, message: 'Código incorrecto' });
@@ -1274,7 +973,7 @@ app.post('/api/auth/verify-code', async (req, res) => {
   }
 });
 
-app.post('/api/auth/reset-password', async (req, res) => {
+app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   try {
     const { phone, code, newPassword } = req.body;
     if (!phone || !code || !newPassword) return res.status(400).json({ message: 'Faltan datos' });
@@ -1310,30 +1009,53 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
 const normalizeChatParticipant = (part = {}) => {
   const user = Array.isArray(part.users) ? part.users[0] : (part.users || part.user || {});
+  // Priorizar avatar del join users, luego del campo directo
+  const avatar_url = user.avatar_url || part.avatar_url || '';
   return {
     chat_id: part.chat_id,
     user_id: part.user_id || user.id,
     full_name: part.full_name || user.full_name || '',
     phone: part.phone || user.phone || '',
-    avatar_url: part.avatar_url || user.avatar_url || '',
-    user,
-    users: user,
+    avatar_url,
+    user: { ...user, avatar_url },
+    users: { ...user, avatar_url },
   };
 };
 
 const getChatParticipants = async (chatId) => {
-  const { data } = await supabase
+  const { data: parts } = await supabase
     .from('chat_participants')
-    .select('chat_id, user_id, users(id, phone, full_name, avatar_url)')
+    .select('chat_id, user_id')
     .eq('chat_id', chatId);
-  return (data || []).map(normalizeChatParticipant);
+  if (!parts || parts.length === 0) return [];
+  const userIds = parts.map(p => p.user_id);
+  const { data: users } = await supabase.from('users').select('id, phone, full_name, avatar_url').in('id', userIds);
+  const usersById = {};
+  (users || []).forEach(u => { usersById[String(u.id)] = u; });
+  return parts.map(part => {
+    const u = usersById[String(part.user_id)] || {};
+    return {
+      chat_id: part.chat_id,
+      user_id: part.user_id,
+      full_name: u.full_name || '',
+      phone: u.phone || '',
+      avatar_url: u.avatar_url || '',
+      user: u,
+      users: u,
+    };
+  });
 };
 
 // Obtener todos los chats del usuario
 app.get('/api/chats', auth, async (req, res) => {
   try {
-    // Si Supabase está restringido por cuota, devolver lista vacía
-    if (!(await supabaseOk())) return res.json([]);
+    if (isLocalUserId(req.user.id)) {
+      const chats = Array.from(localChats.values())
+        .filter(chat => chat.participant_ids.includes(req.user.id))
+        .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
+        .map(formatLocalChat);
+      return res.json(chats);
+    }
 
     // Buscar chats donde el usuario es participante
     const { data: participations, error: pErr } = await supabase
@@ -1358,9 +1080,9 @@ app.get('/api/chats', auth, async (req, res) => {
 
     if (!chats) return res.json([]);
 
-    const [{ data: participants }, { data: messages }] = await Promise.all([
+    const [{ data: rawParticipants }, { data: messages }] = await Promise.all([
       supabase.from('chat_participants')
-        .select('chat_id, user_id, users(id, phone, full_name, avatar_url)')
+        .select('chat_id, user_id, unread_count')
         .in('chat_id', chatIds),
       supabase.from('messages')
         .select('id, text, type, created_at, sender_id, chat_id')
@@ -1368,10 +1090,28 @@ app.get('/api/chats', auth, async (req, res) => {
         .order('created_at', { ascending: false })
     ]);
 
-    const participantsByChat = (participants || []).reduce((acc, part) => {
+    // Obtener info de usuarios en consulta separada (más robusto que FK join)
+    const allUserIds = [...new Set((rawParticipants || []).map(p => p.user_id))];
+    const { data: usersData } = allUserIds.length > 0
+      ? await supabase.from('users').select('id, phone, full_name, avatar_url').in('id', allUserIds)
+      : { data: [] };
+
+    const usersById = {};
+    (usersData || []).forEach(u => { usersById[String(u.id)] = u; });
+
+    const participantsByChat = (rawParticipants || []).reduce((acc, part) => {
       const chatId = part.chat_id;
       if (!acc[chatId]) acc[chatId] = [];
-      acc[chatId].push(normalizeChatParticipant(part));
+      const u = usersById[String(part.user_id)] || {};
+      acc[chatId].push({
+        chat_id: chatId,
+        user_id: part.user_id,
+        full_name: u.full_name || '',
+        phone: u.phone || '',
+        avatar_url: u.avatar_url || '',
+        user: u,
+        users: u,
+      });
       return acc;
     }, {});
 
@@ -1380,14 +1120,25 @@ app.get('/api/chats', auth, async (req, res) => {
       return acc;
     }, {});
 
+    // No leídos reales por chat: el servidor los acumula al entrar cada mensaje
+    const unreadByChat = {};
+    (rawParticipants || []).forEach(p => {
+      if (String(p.user_id) === String(req.user.id)) {
+        unreadByChat[p.chat_id] = Number(p.unread_count ?? 0);
+      }
+    });
+
     const result = chats.map(chat => ({
       id: chat.id,
       type: chat.type || 'private',
       name: chat.name,
+      avatar_url: chat.avatar_url || null,
+      description: chat.description || null,
+      created_by: chat.created_by || null,
       participants: participantsByChat[chat.id] || [],
       last_message: lastMessageByChat[chat.id] || null,
       updated_at: chat.updated_at,
-      unread_count: 0
+      unread_count: unreadByChat[chat.id] ?? 0
     }));
 
     res.json(result);
@@ -1401,6 +1152,12 @@ app.get('/api/chats', auth, async (req, res) => {
 app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
+    if (isLocalUserId(req.user.id)) {
+      const chat = Array.from(localChats.values()).find(item => item.id === chatId);
+      if (!chat || !chat.participant_ids.includes(req.user.id)) return res.status(403).json({ message: 'No tienes acceso a este chat' });
+      return res.json(localMessages.get(chatId) || []);
+    }
+
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 50;
     const from = (page - 1) * limit;
@@ -1415,16 +1172,14 @@ app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
 
     if (!part) return res.status(403).json({ message: 'No tienes acceso a este chat' });
 
-    // Excluir mensajes con soft-delete global (deleted_at IS NOT NULL = borrado para todos)
     const { data: messages } = await supabase
       .from('messages')
       .select('id, text, type, created_at, sender_id, status, reply_to, file_url')
       .eq('chat_id', chatId)
-      .is('deleted_at', null)          // soft-delete: excluir borrados para todos
       .order('created_at', { ascending: false })
       .range(from, from + limit - 1);
 
-    // Filtrar mensajes que el usuario eliminó para sí mismo (message_deletions)
+    // Filtrar mensajes que el usuario eliminó para sí mismo
     const { data: deletions } = await supabase
       .from('message_deletions')
       .select('message_id')
@@ -1433,7 +1188,28 @@ app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
     const deletedIds = new Set((deletions || []).map((d) => d.message_id));
     const filtered = (messages || []).filter(m => !deletedIds.has(m.id));
 
-    res.json(filtered.reverse());
+    // Obtener info de senders en consulta separada (más robusto que FK join)
+    const senderIds = [...new Set(filtered.map(m => m.sender_id).filter(Boolean))];
+    const { data: senders } = senderIds.length > 0
+      ? await supabase.from('users').select('id, full_name, avatar_url').in('id', senderIds)
+      : { data: [] };
+    const sendersById = {};
+    (senders || []).forEach(u => { sendersById[String(u.id)] = u; });
+
+    // Normalizar sender para que el cliente lo use directamente
+    const normalized = filtered.map(m => {
+      const senderUser = sendersById[String(m.sender_id)] || {};
+      return {
+        ...m,
+        sender: senderUser?.id ? {
+          id: senderUser.id,
+          full_name: senderUser.full_name || '',
+          avatar_url: senderUser.avatar_url || '',
+        } : undefined,
+      };
+    });
+
+    res.json(normalized.reverse());
   } catch (e) {
     console.error('Get messages error:', e.message);
     res.json([]);
@@ -1445,56 +1221,136 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
     const { chatId } = req.params;
     const { text, type = 'text', reply_to, file_url } = req.body;
     if (!text && !file_url) return res.status(400).json({ message: 'Texto o archivo requerido' });
+    if (isLocalUserId(req.user.id)) {
+      const chat = Array.from(localChats.values()).find(item => item.id === chatId);
+      if (!chat || !chat.participant_ids.includes(req.user.id)) return res.status(403).json({ message: 'Sin acceso' });
+      const sender = getLocalUserById(req.user.id) || {};
+      const message = {
+        id: `local-msg-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        chat_id: chatId,
+        sender_id: req.user.id,
+        text: text || null,
+        type,
+        reply_to: reply_to || null,
+        file_url: file_url || null,
+        status: 'sent',
+        created_at: new Date().toISOString(),
+        sender: { id: sender.id, full_name: sender.full_name || '', avatar_url: sender.avatar_url || '' },
+      };
+      localMessages.set(chatId, [...(localMessages.get(chatId) || []), message]);
+      chat.updated_at = message.created_at;
+      emitToUsers(chat.participant_ids, { type: 'new_message', chatId, message });
+      emitToUsers(chat.participant_ids, { type: 'chat_updated', chatId, ts: Date.now() });
+      return res.status(201).json(message);
+    }
 
     // Verificar acceso
     const { data: part } = await supabase
       .from('chat_participants').select('chat_id').eq('chat_id', chatId).eq('user_id', req.user.id).single();
     if (!part) return res.status(403).json({ message: 'Sin acceso' });
 
-    const { data: message, error } = await supabase
+    const seleccion = 'id, text, type, created_at, sender_id, status, file_url';
+    // client_ref es la clave que manda el emisor: el indice unico
+    // (chat_id, sender_id, client_ref) corta el reintento que duplicaba el
+    // mensaje en la pantalla del destinatario.
+    const clientRef = req.body?.client_ref ? String(req.body.client_ref).slice(0, 64) : null;
+    const fila = {
+      chat_id: chatId,
+      sender_id: req.user.id,
+      text: text || null,
+      type,
+      reply_to: reply_to || null,
+      file_url: file_url || null,
+      status: 'sent',
+    };
+    if (clientRef) fila.client_ref = clientRef;
+
+    let { data: message, error } = await supabase
       .from('messages')
-      .insert({ chat_id: chatId, sender_id: req.user.id, text: text || null, type, reply_to: reply_to || null, file_url: file_url || null, status: 'sent' })
-      .select('id, text, type, created_at, sender_id, status, file_url')
+      .insert(fila)
+      .select(seleccion)
       .single();
+
+    if (error && (error.code === '23505' || /uix_messages_client_ref|duplicate key/.test(String(error.message)))) {
+      const { data: existente } = await supabase.from('messages').select(seleccion)
+        .eq('chat_id', chatId).eq('sender_id', req.user.id).eq('client_ref', clientRef)
+        .maybeSingle();
+      if (existente) return res.json({ ...existente, duplicated: true });
+    }
 
     if (error) throw error;
 
     await supabase.from('chats').update({ updated_at: new Date().toISOString() }).eq('id', chatId);
 
+    // Obtener datos del sender para incluir en el evento
+    const { data: senderData } = await supabase
+      .from('users').select('id, full_name, avatar_url').eq('id', req.user.id).single();
+
+    const messageWithSender = {
+      ...message,
+      sender: senderData ? {
+        id: senderData.id,
+        full_name: senderData.full_name || '',
+        avatar_url: senderData.avatar_url || '',
+      } : undefined,
+    };
+
     // Emitir evento en tiempo real a todos los participantes del chat
     try {
-      const { data: parts } = await supabase
-        .from('chat_participants')
-        .select('user_id')
-        .eq('chat_id', chatId);
-      const targetUsers = (parts || []).map((p) => p.user_id);
-      emitToUsers(targetUsers, { type: 'new_message', chatId, message });
+      const targets = await getChatPushTargets(chatId, req.user.id);
+      const targetUsers = targets.map(t => t.userId);
+      emitToUsers(targetUsers, { type: 'new_message', chatId, message: messageWithSender });
       emitToUsers(targetUsers, { type: 'chat_updated', chatId, ts: Date.now() });
 
-      // Enviar Web Push a usuarios que no son el remitente
-      const otherUsers = targetUsers.filter(uid => String(uid) !== String(req.user.id));
-      // Obtener nombre Y avatar del remitente
-      const { data: sender } = await supabase
-        .from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
-      const senderName = sender?.full_name || 'Alguien';
-      const senderAvatar = sender?.avatar_url || '';
+      // El contador de no leídos vive en el servidor: es el badge real del destinatario
+      await Promise.allSettled(
+        targets.map(t => supabase
+          .from('chat_participants')
+          .update({ unread_count: t.unread })
+          .eq('chat_id', chatId)
+          .eq('user_id', t.userId))
+      );
+
+      const senderName = senderData?.full_name || 'Alguien';
+      const msgType = message.type || 'text';
+      const bodyText = msgType === 'text'
+        ? (message.text || 'Nuevo mensaje')
+        : msgType === 'image' ? '📷 Foto'
+        : msgType === 'audio' ? '🎵 Mensaje de voz'
+        : msgType === 'video' ? '🎥 Video'
+        : '📎 Archivo adjunto';
+
       const pushPayload = {
         title: senderName,
-        body: message.type === 'text' ? (message.text || 'Nuevo mensaje') : '📎 Archivo adjunto',
-        icon: '/favicon.svg',
+        body: bodyText,
+        icon: senderData?.avatar_url || '/favicon.svg',
         tag: `chat-${chatId}`,
         url: '/',
         chatId,
+        notificationType: 'message',
+        // Datos para notificaciones ricas nativas
         senderName,
-        senderAvatar,
-        senderId: String(req.user.id),
-        imageUrl: senderAvatar,
-        messageType: message.type,
+        // La extensión de iOS lee `senderId` para construir el INPerson del
+        // remitente; sin él todos los contactos comparten el identificador
+        // "unknown" y el banner nunca puede pintar su foto de perfil.
+        senderId: String(senderData?.id || ''),
+        senderAvatar: senderData?.avatar_url || '',
+        messageType: msgType,
+        imageUrl: msgType === 'image' ? (message.file_url || '') : '',
+        'mutable-content': 1,
       };
-      await Promise.allSettled(otherUsers.map(uid => sendPushToUser(uid, pushPayload)));
-    } catch {}
 
-    res.status(201).json(message);
+      // Los chats silenciados no notifican, pero sí acumulan no leídos
+      await Promise.allSettled(
+        targets
+          .filter(t => !t.muted)
+          .map(t => sendPushToUser(t.userId, { ...pushPayload, badge: t.unread }))
+      );
+    } catch (e) {
+      console.warn('Realtime/push al enviar mensaje:', e.message);
+    }
+
+    res.status(201).json(messageWithSender);
   } catch (e) {
     console.error('Send message error:', e.message);
     res.status(500).json({ message: e.message });
@@ -1503,21 +1359,27 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
 
 // Crear chat privado
 // Crear chat privado ââ‚¬â€ usa chat_participants
-
-
 app.post('/api/chats/private', auth, async (req, res) => {
   try {
     const { participant_id, phone } = req.body;
     let targetId = participant_id;
 
-    if (!targetId && phone) {
-      const { data: found, error: userError } = await supabase
-        .from('users')
-        .select('id, phone, full_name, avatar_url')
-        .eq('phone', phone)
-        .single();
+    if (isLocalUserId(req.user.id)) {
+      if (!targetId && phone) {
+        const target = getLocalAuthUser(phone);
+        targetId = target?.id;
+      }
+      const target = getLocalUserById(targetId);
+      if (!target) return res.status(404).json({ message: 'Usuario no encontrado con ese número' });
+      if (target.id === req.user.id) return res.status(400).json({ message: 'No puedes crear un chat contigo mismo' });
+      const chat = getLocalPrivateChat(req.user.id, target.id);
+      return res.status(201).json(formatLocalChat(chat));
+    }
 
-      if (userError || !found) {
+    if (!targetId && phone) {
+      const found = await findUserByPhone(phone);
+
+      if (!found) {
         return res.status(404).json({ message: 'Usuario no encontrado con ese nÁºmero' });
       }
 
@@ -1673,6 +1535,70 @@ app.post('/api/chats/group', auth, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
+// Upload avatar de grupo — recibe base64, sube a Supabase Storage
+// ════════════════════════════════════════════════════════════════════
+app.post('/api/chats/:chatId/avatar', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { base64, mimeType = 'image/jpeg' } = req.body;
+
+    if (!base64) return res.status(400).json({ message: 'base64 requerido' });
+
+    // Verificar acceso
+    const { data: part } = await supabase
+      .from('chat_participants')
+      .select('id')
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
+      .single();
+    if (!part) return res.status(403).json({ message: 'Sin acceso' });
+
+    // Convertir base64 a buffer
+    const base64Data = base64.replace(/^data:image\/\w+;base64,/, '');
+    const buffer = Buffer.from(base64Data, 'base64');
+    const ext = mimeType.split('/')[1] || 'jpg';
+    const fileName = `group-avatars/${chatId}-${Date.now()}.${ext}`;
+
+    // Subir a Supabase Storage (bucket: avatars)
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('avatars')
+      .upload(fileName, buffer, {
+        contentType: mimeType,
+        upsert: true,
+      });
+
+    if (uploadError) {
+      // Si falla Storage, guardar el base64 directamente en la BD como fallback
+      const { data: updated } = await supabase
+        .from('chats')
+        .update({ avatar_url: base64, updated_at: new Date().toISOString() })
+        .eq('id', chatId)
+        .select('avatar_url')
+        .single();
+      return res.json({ avatar_url: updated?.avatar_url || base64 });
+    }
+
+    // Obtener URL pública
+    const { data: publicData } = supabase.storage
+      .from('avatars')
+      .getPublicUrl(fileName);
+
+    const publicUrl = publicData?.publicUrl || '';
+
+    // Actualizar en la BD
+    await supabase
+      .from('chats')
+      .update({ avatar_url: publicUrl, updated_at: new Date().toISOString() })
+      .eq('id', chatId);
+
+    res.json({ avatar_url: publicUrl });
+  } catch (e) {
+    console.error('Upload group avatar error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
 // Actualizar nombre y/o avatar de un grupo
 // ════════════════════════════════════════════════════════════════════
 app.put('/api/chats/:chatId', auth, async (req, res) => {
@@ -1732,41 +1658,49 @@ app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
 
+    // Verificar acceso
     const { data: myPart } = await supabase
       .from('chat_participants')
       .select('id')
       .eq('chat_id', chatId)
       .eq('user_id', req.user.id)
-      .single();
+      .maybeSingle();
 
     if (!myPart) return res.status(403).json({ message: 'No tienes acceso a este chat' });
 
-    const { data: chat } = await supabase
-      .from('chats')
-      .select('created_by')
-      .eq('id', chatId)
-      .single();
-
-    const creatorId = chat?.created_by?.toString();
-
-    const { data: parts } = await supabase
+    // Obtener IDs de participantes
+    const { data: parts, error: partsError } = await supabase
       .from('chat_participants')
-      .select('user_id, users:user_id(id, full_name, phone, avatar_url)')
+      .select('user_id')
       .eq('chat_id', chatId);
 
-    if (!parts) return res.json([]);
+    if (partsError) throw partsError;
+    if (!parts || parts.length === 0) return res.json([]);
+
+    // Obtener info completa de usuarios en consulta separada (más robusto que FK join)
+    const userIds = parts.map(p => p.user_id);
+    const { data: users, error: usersError } = await supabase
+      .from('users')
+      .select('id, full_name, phone, avatar_url, online_status, last_seen')
+      .in('id', userIds);
+
+    if (usersError) throw usersError;
+
+    const usersMap = {};
+    (users || []).forEach(u => { usersMap[String(u.id)] = u; });
 
     const members = parts.map(p => {
-      const u = p.users || {};
-      const uid = p.user_id?.toString();
+      const uid = String(p.user_id);
+      const u = usersMap[uid] || {};
       return {
         id: uid,
         user_id: uid,
         full_name: u.full_name || '',
         phone: u.phone || '',
         avatar_url: u.avatar_url || '',
-        online_status: false,
-        role: uid === creatorId ? 'admin' : 'member',
+        online_status: u.online_status || false,
+        last_seen: u.last_seen || null,
+        role: uid === String(req.user.id) ? 'admin' : 'member',
       };
     });
 
@@ -1777,210 +1711,189 @@ app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
   }
 });
 
-// ── PATCH /api/chats/:chatId/settings — Actualizar ajustes del grupo ──
-app.patch('/api/chats/:chatId/settings', auth, async (req, res) => {
-  try {
-    const { chatId } = req.params;
-    const userId = req.user.id;
-    const { broadcast_mode } = req.body;
+// ── Lecturas reales de un chat ────────────────────────────────────────────
+// Un solo camino para /read y /read-all: deja constancia en message_reads,
+// pone status='read' en los mensajes de otros y avisa a cada emisor por SSE
+// para que su doble check se vuelva azul.
+const applyChatRead = async (chatId, userId, upToMessageId) => {
+  const { data: part } = await supabase
+    .from('chat_participants')
+    .select('id')
+    .eq('chat_id', chatId)
+    .eq('user_id', userId)
+    .single();
+  if (!part) return { forbidden: true, messageIds: [] };
 
-    // Solo admins del grupo pueden cambiar ajustes
-    const { data: participant } = await supabase
-      .from('chat_participants')
-      .select('role').eq('chat_id', chatId).eq('user_id', userId).maybeSingle();
-    if (!participant || participant.role !== 'admin')
-      return res.status(403).json({ message: 'Solo los admins pueden cambiar ajustes' });
+  let boundaryId = upToMessageId || null;
+  let boundaryDate = null;
 
-    // Guardar en el campo settings (JSONB) del chat
-    const { data: current } = await supabase
-      .from('chats').select('settings').eq('id', chatId).single();
-    const settings = { ...(current?.settings || {}), broadcast_mode: !!broadcast_mode };
-    await supabase.from('chats').update({ settings }).eq('id', chatId);
-
-    res.json({ ok: true, settings });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── POST /api/chats/:chatId/invite-link — Generar enlace de invitación ──
-app.post('/api/chats/:chatId/invite-link', auth, async (req, res) => {
-  try {
-    const { chatId } = req.params;
-    const userId = req.user.id;
-
-    // Verificar que es admin
-    const { data: participant } = await supabase
-      .from('chat_participants')
-      .select('role').eq('chat_id', chatId).eq('user_id', userId).maybeSingle();
-    if (!participant || participant.role !== 'admin')
-      return res.status(403).json({ message: 'Solo los admins pueden generar el enlace' });
-
-    // Generar token único
-    const token = Buffer.from(`${chatId}:${Date.now()}`).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 20);
-    const link = `https://egchat.app/join/${token}`;
-
-    // Guardar en settings
-    const { data: current } = await supabase.from('chats').select('settings').eq('id', chatId).single();
-    const settings = { ...(current?.settings || {}), invite_token: token };
-    await supabase.from('chats').update({ settings }).eq('id', chatId);
-
-    res.json({ link, token });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Typing indicator — emite evento SSE al otro participante
-app.post('/api/chats/:chatId/typing', auth, async (req, res) => {
-  try {
-    const { chatId } = req.params;
-    const { is_typing } = req.body;
-    const senderId = String(req.user.id);
-    // Obtener los otros participantes del chat
-    const { data: parts } = await supabase
-      .from('chat_participants')
-      .select('user_id')
+  if (boundaryId) {
+    const { data: anchor } = await supabase
+      .from('messages')
+      .select('created_at')
+      .eq('id', boundaryId)
       .eq('chat_id', chatId)
-      .neq('user_id', senderId);
-    (parts || []).forEach(p => {
-      emitToUser(String(p.user_id), {
-        type: 'typing',
-        chatId,
-        userId: senderId,
-        isTyping: !!is_typing,
-        ts: Date.now(),
-      });
-    });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
+      .maybeSingle();
+    boundaryDate = anchor?.created_at || null;
+    if (!boundaryDate) return { messageIds: [] };
+  } else {
+    const { data: newest } = await supabase
+      .from('messages')
+      .select('id, created_at')
+      .eq('chat_id', chatId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (!newest) return { messageIds: [] };
+    boundaryId = newest.id;
+    boundaryDate = newest.created_at;
   }
-});
 
-// Marcar mensajes como leídos
+  // status es anidable: con .neq('status','read') los NULL quedarían fuera de
+  // la comparación en SQL y nunca se marcarían como leídos.
+  const { data: unread } = await supabase
+    .from('messages')
+    .select('id, sender_id, status')
+    .eq('chat_id', chatId)
+    .neq('sender_id', userId)
+    .lte('created_at', boundaryDate);
+
+  const unreadMsgs = (unread || []).filter(m => m.status !== 'read');
+  const messageIds = unreadMsgs.map(m => m.id);
+
+  if (messageIds.length > 0) {
+    const { error: statusError } = await supabase
+      .from('messages')
+      .update({ status: 'read' })
+      .in('id', messageIds);
+    if (statusError) throw statusError;
+  }
+
+  await supabase
+    .from('message_reads')
+    .upsert(
+      {
+        chat_id: chatId,
+        user_id: userId,
+        last_read_message_id: boundaryId,
+        read_at: new Date().toISOString(),
+      },
+      { onConflict: 'chat_id,user_id' }
+    );
+
+  await supabase
+    .from('chat_participants')
+    .update({ unread_count: 0 })
+    .eq('chat_id', chatId)
+    .eq('user_id', userId);
+
+  // Cada emisor recibe solo los ids de sus propios mensajes leídos
+  const bySender = {};
+  unreadMsgs.forEach(m => {
+    const key = String(m.sender_id);
+    if (!bySender[key]) bySender[key] = [];
+    bySender[key].push(m.id);
+  });
+  Object.keys(bySender).forEach(senderId => {
+    emitToUser(senderId, {
+      type: 'read',
+      chatId,
+      readerId: String(userId),
+      messageIds: bySender[senderId],
+    });
+  });
+
+  return { messageIds };
+};
+
+// Marcar hasta un mensaje concreto: lo usa el cliente al recibir un mensaje
 app.post('/api/chats/:chatId/read', auth, async (req, res) => {
   try {
-    const { chatId } = req.params;
-    const { message_id } = req.body;
-
-    // Verificar acceso al chat
-    const { data: part } = await supabase
-      .from('chat_participants')
-      .select('id')
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.id)
-      .single();
-
-    if (!part) {
-      return res.status(403).json({ message: 'No tienes acceso a este chat' });
-    }
-
-    // Marcar mensajes como leídos hasta el mensaje especificado
-    const { error: updateError } = await supabase
-      .from('message_reads')
-      .upsert({
-        chat_id: chatId,
-        user_id: req.user.id,
-        last_read_message_id: message_id,
-        read_at: new Date().toISOString()
-      }, {
-        onConflict: 'chat_id,user_id'
-      });
-
-    if (updateError) throw updateError;
-
-    // Resetear contador de no leÁƒÂ­dos
-    await supabase
-      .from('chat_participants')
-      .update({ unread_count: 0 })
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.id);
-
-    res.json({ message: 'Mensajes marcados como leÁƒÂ­dos' });
+    const r = await applyChatRead(req.params.chatId, req.user.id, req.body?.message_id);
+    if (r.forbidden) return res.status(403).json({ message: 'Sin acceso a este chat' });
+    res.json({ message: 'Mensajes marcados como leídos', read: r.messageIds.length });
   } catch (e) {
     console.error('Mark as read error:', e);
     res.status(500).json({ message: e.message });
   }
 });
 
-// ── Marcar TODOS los mensajes del chat como leídos (doble check real) ──
-// El receptor llama a este endpoint al abrir el chat.
-// Actualiza status → 'read' en chat_messages para los mensajes ajenos
-// y emite evento SSE a los emisores para que actualicen sus checks azules.
+// Marcar todo el chat como leído: lo usa el cliente al abrir el chat
 app.post('/api/chats/:chatId/read-all', auth, async (req, res) => {
   try {
-    const { chatId } = req.params;
-    const readerId = req.user.id;
-
-    // Verificar que el usuario pertenece al chat
-    const { data: part } = await supabase
-      .from('chat_participants')
-      .select('id')
-      .eq('chat_id', chatId)
-      .eq('user_id', readerId)
-      .single();
-
-    if (!part) return res.status(403).json({ message: 'No tienes acceso a este chat' });
-
-    // Obtener mensajes no leídos enviados por otros
-    const { data: unread } = await supabase
-      .from('chat_messages')
-      .select('id, sender_id')
-      .eq('chat_id', chatId)
-      .neq('sender_id', readerId)
-      .neq('status', 'read');
-
-    if (!unread || unread.length === 0) {
-      return res.json({ ok: true, updated: 0 });
-    }
-
-    const unreadIds = unread.map(m => m.id);
-
-    // Actualizar status a 'read' en BD
-    await supabase
-      .from('chat_messages')
-      .update({ status: 'read' })
-      .in('id', unreadIds);
-
-    // Resetear contador de no leídos del receptor
-    await supabase
-      .from('chat_participants')
-      .update({ unread_count: 0 })
-      .eq('chat_id', chatId)
-      .eq('user_id', readerId);
-
-    // Actualizar last_read en message_reads
-    await supabase
-      .from('message_reads')
-      .upsert({
-        chat_id: chatId,
-        user_id: readerId,
-        last_read_message_id: unreadIds[unreadIds.length - 1],
-        read_at: new Date().toISOString(),
-      }, { onConflict: 'chat_id,user_id' });
-
-    // Notificar a los emisores via SSE para que sus checks se pongan azules
-    const senderIds = [...new Set(unread.map(m => String(m.sender_id)))];
-    for (const senderId of senderIds) {
-      const senderMsgIds = unread
-        .filter(m => String(m.sender_id) === senderId)
-        .map(m => m.id);
-      emitToUser(senderId, {
-        type: 'read',
-        chatId,
-        messageIds: senderMsgIds,
-        readerId,
-        ts: Date.now(),
-      });
-    }
-
-    res.json({ ok: true, updated: unreadIds.length });
+    const r = await applyChatRead(req.params.chatId, req.user.id, null);
+    if (r.forbidden) return res.status(403).json({ message: 'Sin acceso a este chat' });
+    res.json({ message: 'Chat marcado como leído', read: r.messageIds.length });
   } catch (e) {
-    console.error('Read-all error:', e);
+    console.error('Mark chat as read error:', e);
     res.status(500).json({ message: e.message });
   }
 });
+
+// Silenciar / reactivar un chat en el servidor, para que el push lo respete
+// La columna la crea la migracion 2026-11-02_ledger_lote_b.sql; aquí solo se
+// comprueba que esté, porque exec_sql ya no existe en el esquema.
+const ensureChatMuteColumn = async () => {
+  try {
+    const { error } = await supabase.from('chat_participants').select('muted_until').limit(1);
+    if (error) console.warn('ensureChatMuteColumn: falta la migracion de esquema:', error.message);
+  } catch (e) {
+    console.warn('ensureChatMuteColumn:', e.message);
+  }
+};
+ensureChatMuteColumn();
+
+app.post('/api/chats/:chatId/mute', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const minutes = Number(req.body?.minutes ?? 0);
+
+    const patch = { muted_until: minutes > 0
+      ? new Date(Date.now() + minutes * 60000).toISOString()
+      : null };
+
+    const { data, error } = await supabase
+      .from('chat_participants')
+      .update(patch)
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id)
+      .select('chat_id, user_id, muted_until')
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) return res.status(403).json({ message: 'No tienes acceso a este chat' });
+    res.json({ muted: minutes > 0, muted_until: data.muted_until });
+  } catch (e) {
+    console.error('Mute chat error:', e);
+    res.status(501).json({ message: `Silencio no disponible en la base: ${e.message}` });
+  }
+});
+
+// Participantes con sus banderas de push; si muted_until aún no existe,
+// se degrada a no filtrar ninguno en vez de romper el envío.
+const getChatPushTargets = async (chatId, excludeUserId) => {
+  const withMute = await supabase
+    .from('chat_participants')
+    .select('user_id, unread_count, muted_until')
+    .eq('chat_id', chatId);
+
+  let rows = withMute.data;
+  if (!rows) {
+    const plain = await supabase
+      .from('chat_participants')
+      .select('user_id, unread_count')
+      .eq('chat_id', chatId);
+    rows = plain.data || [];
+  }
+
+  return (rows || [])
+    .filter(p => String(p.user_id) !== String(excludeUserId))
+    .map(p => ({
+      userId: p.user_id,
+      unread: Number(p.unread_count ?? 0) + 1,
+      muted: !!p.muted_until && new Date(p.muted_until).getTime() > Date.now(),
+    }));
+};
 
 // Subir archivo de chat — acepta multipart/form-data (Android/iOS) y raw buffer (web)
 app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
@@ -2072,7 +1985,7 @@ app.post('/api/chats/:chatId/upload', auth, async (req, res) => {
   }
 });
 
-// Eliminar mensaje para mí (soft-delete: oculta solo para el usuario — se retiene 5 años)
+// Eliminar mensaje para mí (solo oculta para el usuario actual)
 app.delete('/api/messages/:messageId/for-me', auth, async (req, res) => {
   try {
     const { messageId } = req.params;
@@ -2098,33 +2011,29 @@ app.delete('/api/messages/:messageId/for-me', auth, async (req, res) => {
 
     if (!part) return res.status(403).json({ message: 'Sin acceso a este chat' });
 
-    // Soft-delete: registrar eliminación para este usuario con timestamp
-    // El registro se purga automáticamente después de 5 años (retention_expires_at)
+    // Registrar la eliminación para este usuario (upsert para evitar duplicados)
     const { error: delError } = await supabase
       .from('message_deletions')
-      .upsert(
-        { message_id: messageId, user_id: req.user.id, deleted_at: new Date().toISOString() },
-        { onConflict: 'message_id,user_id' }
-      );
+      .upsert({ message_id: messageId, user_id: req.user.id }, { onConflict: 'message_id,user_id' });
 
-    // Tolerar tabla inexistente durante la migración (el cliente filtra localmente)
+    // Si la tabla no existe, ignorar el error (el cliente maneja el filtro localmente)
     if (delError && !delError.message?.includes('does not exist') && !delError.code?.includes('42P01')) {
       throw delError;
     }
 
-    res.json({ message: 'Mensaje eliminado para ti', retained_for_years: 5 });
+    res.json({ message: 'Mensaje eliminado para ti' });
   } catch (e) {
     console.error('Delete message for me error:', e);
     res.status(500).json({ message: e.message });
   }
 });
 
-// Eliminar mensaje para todos (soft-delete — el mensaje queda en BD 5 años)
+// Eliminar mensaje para todos (solo el remitente puede hacerlo)
 app.delete('/api/messages/:messageId', auth, async (req, res) => {
   try {
     const { messageId } = req.params;
 
-    // Verificar que el mensaje existe y pertenece al usuario
+    // Verificar que el mensaje pertenece al usuario
     const { data: message, error: msgError } = await supabase
       .from('messages')
       .select('id, sender_id, chat_id')
@@ -2139,120 +2048,17 @@ app.delete('/api/messages/:messageId', auth, async (req, res) => {
       return res.status(403).json({ message: 'No puedes eliminar mensajes de otros usuarios' });
     }
 
-    // Soft-delete: marcar como eliminado con timestamp
-    // retention_expires_at = deleted_at + 5 años (columna generada en BD)
-    const now = new Date().toISOString();
-    const { error: updateError } = await supabase
+    // Eliminar mensaje
+    const { error: deleteError } = await supabase
       .from('messages')
-      .update({ deleted_at: now, deleted_by: req.user.id, text: null, file_url: null })
+      .delete()
       .eq('id', messageId);
 
-    if (updateError) {
-      // Fallback: si las columnas nuevas aún no existen (pre-migración), hacer hard delete
-      if (updateError.message?.includes('column') || updateError.code === '42703') {
-        const { error: hardDeleteError } = await supabase
-          .from('messages')
-          .delete()
-          .eq('id', messageId);
-        if (hardDeleteError) throw hardDeleteError;
+    if (deleteError) throw deleteError;
 
-        // Notificar a todos los participantes del chat vía SSE
-        try {
-          const { data: parts } = await supabase
-            .from('chat_participants')
-            .select('user_id')
-            .eq('chat_id', message.chat_id);
-          const targetUsers = (parts || []).map((p) => p.user_id);
-          emitToUsers(targetUsers, { type: 'message_deleted', chatId: message.chat_id, messageId });
-        } catch (_) { /* silent — notificación best-effort */ }
-
-        return res.json({ message: 'Mensaje eliminado exitosamente', soft_delete: false });
-      }
-      throw updateError;
-    }
-
-    // Notificar a todos los participantes del chat vía SSE
-    try {
-      const { data: parts } = await supabase
-        .from('chat_participants')
-        .select('user_id')
-        .eq('chat_id', message.chat_id);
-      const targetUsers = (parts || []).map((p) => p.user_id);
-      emitToUsers(targetUsers, { type: 'message_deleted', chatId: message.chat_id, messageId });
-    } catch (_) { /* silent — notificación best-effort */ }
-
-    res.json({ message: 'Mensaje eliminado para todos', soft_delete: true, retained_for_years: 5 });
+    res.json({ message: 'Mensaje eliminado exitosamente' });
   } catch (e) {
     console.error('Delete message error:', e);
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Eliminar chat completamente (mensajes + participantes + chat + contacto asociado)
-app.delete('/api/chats/:chatId', auth, async (req, res) => {
-  try {
-    const { chatId } = req.params;
-    const userId = req.user.id;
-
-    // 1. Verificar que el usuario es participante del chat
-    const { data: myPart, error: partErr } = await supabase
-      .from('chat_participants')
-      .select('chat_id')
-      .eq('chat_id', chatId)
-      .eq('user_id', userId)
-      .single();
-
-    if (partErr || !myPart) {
-      return res.status(403).json({ message: 'No tienes acceso a este chat' });
-    }
-
-    // 2. Obtener el tipo de chat y el otro participante (solo para chats privados)
-    const { data: chat } = await supabase
-      .from('chats')
-      .select('id, type')
-      .eq('id', chatId)
-      .single();
-
-    let otherUserId = null;
-    if (chat?.type === 'private') {
-      const { data: allParts } = await supabase
-        .from('chat_participants')
-        .select('user_id')
-        .eq('chat_id', chatId)
-        .neq('user_id', userId);
-      otherUserId = allParts?.[0]?.user_id || null;
-    }
-
-    // 3. Borrar mensajes del chat (hard delete — permanente)
-    await supabase.from('message_deletions').delete().in(
-      'message_id',
-      (await supabase.from('messages').select('id').eq('chat_id', chatId)).data?.map(m => m.id) || []
-    );
-    await supabase.from('messages').delete().eq('chat_id', chatId);
-
-    // 4. Borrar participantes
-    await supabase.from('chat_participants').delete().eq('chat_id', chatId);
-
-    // 5. Borrar el chat
-    const { error: chatDelErr } = await supabase
-      .from('chats')
-      .delete()
-      .eq('id', chatId);
-
-    if (chatDelErr) throw chatDelErr;
-
-    // 6. Borrar el contacto asociado (solo chats privados, best-effort)
-    if (otherUserId) {
-      await supabase
-        .from('contacts')
-        .delete()
-        .eq('user_id', userId)
-        .eq('contact_user_id', otherUserId);
-    }
-
-    res.json({ message: 'Chat y contacto eliminados permanentemente' });
-  } catch (e) {
-    console.error('Delete chat error:', e);
     res.status(500).json({ message: e.message });
   }
 });
@@ -2261,11 +2067,59 @@ app.delete('/api/chats/:chatId', auth, async (req, res) => {
 // CONTACTOS - GESTIÁƒâ€œN COMPLETA
 // ════════════════════════════════════════════════════════════════════
 
+const phoneLookupCandidates = (phone = '') => {
+  const trimmed = String(phone || '').trim();
+  const digits = trimmed.replace(/\D/g, '');
+  const candidates = new Set([trimmed]);
+  if (digits) {
+    candidates.add(digits);
+    candidates.add(`+${digits}`);
+    if (digits.startsWith('240')) {
+      candidates.add(digits.slice(3));
+      candidates.add(`+${digits.slice(3)}`);
+    } else {
+      candidates.add(`240${digits}`);
+      candidates.add(`+240${digits}`);
+    }
+    if (digits.length > 9) {
+      const last9 = digits.slice(-9);
+      candidates.add(last9);
+      candidates.add(`240${last9}`);
+      candidates.add(`+240${last9}`);
+    }
+  }
+  return Array.from(candidates).filter(Boolean);
+};
+
+async function findUserByPhone(phone) {
+  const candidates = phoneLookupCandidates(phone);
+  if (!candidates.length) return null;
+  const { data: exact } = await supabase
+    .from('users')
+    .select('id, phone, full_name, avatar_url')
+    .in('phone', candidates)
+    .limit(1);
+  if (exact?.[0]) return exact[0];
+
+  const digits = String(phone || '').replace(/\D/g, '');
+  const suffixes = [digits, digits.slice(-9), digits.slice(-8)].filter(v => v && v.length >= 6);
+  for (const suffix of suffixes) {
+    const { data } = await supabase
+      .from('users')
+      .select('id, phone, full_name, avatar_url')
+      .ilike('phone', `%${suffix}`)
+      .limit(1);
+    if (data?.[0]) return data[0];
+  }
+  return null;
+}
+
 // Obtener todos los contactos del usuario
 app.get('/api/contacts', auth, async (req, res) => {
   try {
-    // Si Supabase está restringido por cuota, devolver lista vacía
-    if (!(await supabaseOk())) return res.json([]);
+    if (isLocalUserId(req.user.id)) {
+      return res.json(getDemoContactsFor(req.user.id));
+    }
 
     const { data: contacts, error } = await supabase
       .from('contacts')
@@ -2311,21 +2165,32 @@ app.post('/api/contacts', auth, async (req, res) => {
     console.log('[ADD CONTACT] body:', { contact_user_id, phone, nickname, caller: req.user?.id });
     let targetId = contact_user_id && contact_user_id.trim() ? contact_user_id.trim() : null;
 
+    if (isLocalUserId(req.user.id)) {
+      if (!targetId && phone) {
+        const target = getLocalAuthUser(phone, nickname || 'Usuario EGCHAT');
+        targetId = target?.id;
+      }
+      const target = getLocalUserById(targetId);
+      if (!target || target.id === req.user.id) return res.status(404).json({ message: 'Usuario no encontrado con ese número' });
+      return res.json({
+        id: `contact-${target.id}`,
+        contact_user_id: target.id,
+        name: nickname || target.full_name,
+        phone: target.phone,
+        avatar_url: target.avatar_url || '',
+        is_blocked: false,
+        is_favorite: false,
+        created_at: new Date().toISOString(),
+        user: target,
+      });
+    }
+
     if (!targetId && phone) {
-      // Normalizar teléfono: buscar con y sin prefijo +
-      const phoneNorm = phone.trim();
-      const phoneAlt = phoneNorm.startsWith('+') ? phoneNorm.slice(1) : '+' + phoneNorm;
-      console.log('[ADD CONTACT] searching by phone:', phoneNorm, 'or', phoneAlt);
+      const targetUser = await findUserByPhone(phone);
 
-      const { data: targetUser, error: userError } = await supabase
-        .from('users')
-        .select('id, phone, full_name')
-        .or(`phone.eq.${phoneNorm},phone.eq.${phoneAlt}`)
-        .single();
+      console.log('[ADD CONTACT] phone search result:', targetUser);
 
-      console.log('[ADD CONTACT] phone search result:', targetUser, 'error:', userError?.message);
-
-      if (userError || !targetUser) {
+      if (!targetUser) {
         return res.status(404).json({ message: 'Usuario no encontrado con ese número' });
       }
 
@@ -2537,6 +2402,8 @@ app.delete('/api/contacts/:contactId/favorite', auth, async (req, res) => {
 // Listar solo contactos favoritos
 app.get('/api/contacts/favorites', auth, async (req, res) => {
   try {
+    if (isLocalUserId(req.user.id)) return res.json([]);
+
     const { data: contacts, error } = await supabase
       .from('contacts')
       .select('*')
@@ -2570,6 +2437,15 @@ app.get('/api/contacts/favorites', auth, async (req, res) => {
 app.get('/api/contacts/search', auth, async (req, res) => {
   try {
     const { q } = req.query;
+    if (isLocalUserId(req.user.id)) {
+      const term = String(q || '').toLowerCase().trim();
+      const users = Array.from(localAuthUsers.values())
+        .filter(user => user.id !== req.user.id)
+        .filter(user => !term || user.phone.includes(term) || user.full_name.toLowerCase().includes(term))
+        .slice(0, 50)
+        .map(({ id, phone, full_name, avatar_url }) => ({ id, phone, full_name, avatar_url }));
+      return res.json(users);
+    }
 
     let query = supabase
       .from('users')
@@ -2595,223 +2471,383 @@ app.get('/api/contacts/search', auth, async (req, res) => {
 // WALLET
 // ════════════════════════════════════════════════════════════════════
 app.get('/api/wallet/balance', auth, async (req, res) => {
-  // Si Supabase está restringido por cuota, devolver balance de emergencia
-  if (!(await supabaseOk())) {
-    return res.json({ balance: 0, currency: 'XAF', _offline: true });
+  try {
+    let { data: wallet, error } = await supabase
+      .from('wallets')
+      .select('balance, currency')
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+
+    if (error) {
+      console.warn('Wallet lookup error:', error.message);
+    }
+
+    if (!wallet) {
+      const { data, error: insertError } = await supabase
+        .from('wallets')
+        .insert({ user_id: req.user.id, balance: 0, currency: WALLET_CURRENCY })
+        .select('balance, currency')
+        .maybeSingle();
+
+      if (insertError) {
+        console.warn('Wallet create error:', insertError.message);
+      }
+
+      wallet = data || { balance: 0, currency: WALLET_CURRENCY };
+    }
+
+    res.json({
+      balance: Number(wallet.balance || 0),
+      currency: wallet.currency || WALLET_CURRENCY,
+      mode: WALLET_MODE,
+      sandbox: WALLET_SANDBOX,
+    });
+  } catch (e) {
+    console.error('Wallet balance error:', e);
+    res.json({ balance: 0, currency: WALLET_CURRENCY, mode: WALLET_MODE, sandbox: WALLET_SANDBOX });
   }
-  let { data: wallet } = await supabase
-    .from('wallets').select('balance, currency').eq('user_id', req.user.id).single();
-  if (!wallet) {
-    const { data } = await supabase
-      .from('wallets').insert({ user_id: req.user.id, balance: 5000, currency: 'XAF' }).select().single();
-    wallet = data;
-  }
-  res.json({ balance: wallet.balance, currency: wallet.currency || 'XAF' });
 });
 
 app.get('/api/wallet/transactions', auth, async (req, res) => {
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 20;
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
   const from = (page - 1) * limit;
 
   const { data: transactions, count } = await supabase
     .from('transactions')
     .select('*', { count: 'exact' })
     .eq('user_id', req.user.id)
+    .eq('status', 'completed')
+    .neq('ledger_link', 'previa')
     .order('created_at', { ascending: false })
     .range(from, from + limit - 1);
 
   res.json({ transactions: transactions || [], total: count || 0 });
 });
 
-app.post('/api/wallet/deposit', auth, async (req, res) => {
-  const { amount, method, reference } = req.body;
-  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe invÁƒÂ¡lido' });
-
-  const { data: wallet } = await supabase
-    .from('wallets').select('balance').eq('user_id', req.user.id).single();
-  const newBalance = (wallet?.balance || 0) + amount;
-
-  await supabase.from('wallets').upsert({ user_id: req.user.id, balance: newBalance, currency: 'XAF' });
-
-  const { data: tx } = await supabase.from('transactions').insert({
-    user_id: req.user.id, type: 'deposit', amount, method,
-    reference, status: 'completed'
-  }).select().single();
-
-  res.json({ balance: newBalance, transaction: tx });
-});
-
-app.post('/api/wallet/withdraw', auth, async (req, res) => {
-  const { amount, method, destination } = req.body;
-  const { data: wallet } = await supabase
-    .from('wallets').select('balance').eq('user_id', req.user.id).single();
-
-  if (!amount || amount <= 0) return res.status(400).json({ message: 'Importe invÁƒÂ¡lido' });
-  if (!wallet || amount > wallet.balance) return res.status(400).json({ message: 'Saldo insuficiente' });
-
-  const newBalance = wallet.balance - amount;
-  await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
-
-  const { data: tx } = await supabase.from('transactions').insert({
-    user_id: req.user.id, type: 'withdraw', amount, method,
-    reference: destination, status: 'completed'
-  }).select().single();
-
-  res.json({ balance: newBalance, transaction: tx });
-});
-
-app.post('/api/wallet/transfer', auth, async (req, res) => {
+app.post('/api/wallet/deposit', auth, walletLimiter, async (req, res) => {
   try {
-    const { to, amount, concept } = req.body;
-    
-    // Validación básica
-    if (!to || !amount || amount <= 0) {
-      return res.status(400).json({ message: 'Destinatario y monto requeridos' });
-    }
-    if (amount > 10000000) {
-      return res.status(400).json({ message: 'Monto máximo: 10,000,000 XAF' });
-    }
+    const { method, reference } = req.body || {};
+    const amount = roundAmount(req.body?.amount);
+    if (!isValidTransferAmount(amount)) return res.status(400).json({ message: 'Importe inválido' });
 
-    // Obtener wallet del remitente
-    const { data: senderWallet, error: senderError } = await supabase
-      .from('wallets').select('balance').eq('user_id', req.user.id).single();
-
-    if (senderError || !senderWallet) {
-      return res.status(404).json({ message: 'Wallet no encontrado' });
-    }
-
-    if (amount > senderWallet.balance) {
-      return res.status(400).json({ message: 'Saldo insuficiente' });
-    }
-
-    // Buscar destinatario por teléfono, ID o nombre de usuario
-    let recipientId = null;
-    let recipientName = to;
-
-    // Intentar buscar por ID primero
-    if (to.match(/^[0-9a-f-]{36}$/i)) {
-      const { data: userById } = await supabase
-        .from('users').select('id, full_name').eq('id', to).single();
-      if (userById) {
-        recipientId = userById.id;
-        recipientName = userById.full_name;
-      }
-    }
-
-    // Si no se encontró, buscar por teléfono
-    if (!recipientId && to.match(/^\+?[0-9\s()-]+$/)) {
-      const cleanPhone = to.replace(/[^0-9+]/g, '');
-      const { data: userByPhone } = await supabase
-        .from('users').select('id, full_name').eq('phone', cleanPhone).single();
-      if (userByPhone) {
-        recipientId = userByPhone.id;
-        recipientName = userByPhone.full_name;
-      }
-    }
-
-    // Verificar que no sea auto-transferencia
-    if (recipientId && recipientId === req.user.id) {
-      return res.status(400).json({ message: 'No puedes transferir dinero a ti mismo' });
-    }
-
-    // Actualizar balance del remitente
-    const newBalance = senderWallet.balance - amount;
-    const { error: updateError } = await supabase
-      .from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
-
-    if (updateError) {
-      console.error('Error updating sender wallet:', updateError);
-      return res.status(500).json({ message: 'Error al procesar la transferencia' });
-    }
-
-    // Si se encontró destinatario, actualizar su wallet
-    if (recipientId) {
-      const { data: recipientWallet } = await supabase
-        .from('wallets').select('balance').eq('user_id', recipientId).single();
-      
-      if (recipientWallet) {
-        await supabase.from('wallets')
-          .update({ balance: recipientWallet.balance + amount })
-          .eq('user_id', recipientId);
-      }
-    }
-
-    // Registrar transacción del remitente
-    const { data: tx } = await supabase.from('transactions').insert({
-      user_id: req.user.id,
-      type: 'transfer_sent',
-      amount: -amount,
-      method: 'EGCHAT',
-      reference: `Transferencia a: ${recipientName}${concept ? ' · ' + concept : ''}`,
-      status: 'completed',
-      created_at: new Date().toISOString()
-    }).select().single();
-
-    // Si hay destinatario registrado, crear su transacción de ingreso
-    if (recipientId) {
-      await supabase.from('transactions').insert({
-        user_id: recipientId,
-        type: 'transfer_received',
-        amount: amount,
-        method: 'EGCHAT',
-        reference: `Transferencia de usuario${concept ? ' · ' + concept : ''}`,
-        status: 'completed',
-        created_at: new Date().toISOString()
+    if (!WALLET_SANDBOX) {
+      return res.status(501).json({
+        code: 'PAYMENTS_NOT_CONFIGURED',
+        message: 'Las recargas reales todavía no están disponibles. Usa el modo de pruebas o espera a la integración bancaria.',
       });
     }
 
-    res.json({
-      success: true,
-      balance: newBalance,
-      transaction: tx,
-      recipient: recipientName,
-      message: 'Transferencia completada exitosamente'
+    const quotaError = await walletQuotaError(req.user.id, 'deposit', amount);
+    if (quotaError) return res.status(400).json({ message: quotaError, code: 'LIMIT_EXCEEDED' });
+
+    const credit = await creditWallet(req.user.id, amount, {
+      operation: 'recarga',
+      account: 'SYS-CASH',
+      concept: `Recarga de ${method || 'monedero'}`,
+      reference,
     });
+    if (!credit.ok) return transferErrorResponse(res, credit.code);
+
+    const { data: tx } = await supabase.from('transactions').insert({
+      user_id: req.user.id, type: 'deposit', amount, method,
+      reference, status: 'completed', ledger_journal_id: credit.journal_id
+    }).select().single();
+
+    res.json({ balance: credit.balance, transaction: tx, sandbox: WALLET_SANDBOX });
   } catch (e) {
-    console.error('POST /api/wallet/transfer error:', e);
-    res.status(500).json({ message: e.message || 'Error al procesar la transferencia' });
+    console.error('Deposit error:', e.message);
+    res.status(500).json({ message: 'Error al procesar la recarga' });
   }
 });
 
-app.post('/api/wallet/recharge-code', auth, async (req, res) => {
-  const { code } = req.body;
-  if (!code || code.replace(/-/g, '').length !== 16)
-    return res.status(400).json({ message: 'CÁƒÂ³digo invÁƒÂ¡lido' });
+app.post('/api/wallet/withdraw', auth, walletLimiter, async (req, res) => {
+  try {
+    const { method, destination, pin } = req.body || {};
+    const amount = roundAmount(req.body?.amount);
+    if (!isValidTransferAmount(amount)) return res.status(400).json({ message: 'Importe inválido' });
 
-  // Verificar si el cÁƒÂ³digo ya fue usado
-  const { data: usedCode } = await supabase
-    .from('recharge_codes').select('*').eq('code', code).single();
+    if (!WALLET_SANDBOX) {
+      return res.status(501).json({
+        code: 'PAYMENTS_NOT_CONFIGURED',
+        message: 'Las retiradas reales todavía no están disponibles. Espera a la integración bancaria.',
+      });
+    }
 
-  if (!usedCode) return res.status(400).json({ message: 'CÁƒÂ³digo no vÁƒÂ¡lido' });
-  if (usedCode.used || usedCode.is_used) return res.status(400).json({ message: 'CÁƒÂ³digo ya utilizado' });
-  if (usedCode.expires_at && new Date(usedCode.expires_at) < new Date())
-    return res.status(400).json({ message: 'CÁƒÂ³digo expirado' });
+    const pinCheck = await checkPinForOperation(req.user.id, pin);
+    if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
 
-  const amount = usedCode?.amount || 5000;
+    const quotaError = await walletQuotaError(req.user.id, 'withdraw', amount);
+    if (quotaError) return res.status(400).json({ message: quotaError, code: 'LIMIT_EXCEEDED' });
 
-  // Marcar como usado
-  if (usedCode) {
-    await supabase.from('recharge_codes').update({ used: true, used_by: req.user.id, used_at: new Date().toISOString() }).eq('code', code);
+    const debit = await debitWallet(req.user.id, amount, {
+      operation: 'retiro',
+      account: 'SYS-CASH',
+      concept: `Retirada por ${method || 'pasarela'}`,
+      reference: destination,
+    });
+    if (!debit.ok) {
+      if (debit.code === 'WALLET_NOT_FOUND') return res.status(404).json({ message: 'Monedero no encontrado' });
+      return transferErrorResponse(res, debit.code);
+    }
+
+    const { data: tx } = await supabase.from('transactions').insert({
+      user_id: req.user.id, type: 'withdraw', amount, method,
+      reference: destination, status: 'completed', ledger_journal_id: debit.journal_id
+    }).select().single();
+
+    res.json({ balance: debit.balance, transaction: tx, sandbox: WALLET_SANDBOX });
+  } catch (e) {
+    console.error('Withdraw error:', e.message);
+    res.status(500).json({ message: 'Error al procesar la retirada' });
   }
+});
 
-  const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', req.user.id).single();
-  const newBalance = (wallet?.balance || 0) + amount;
-  await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
+// ── Transferencias entre usuarios ────────────────────────────────────
+const TRANSFER_TTL_MS = 72 * 60 * 60 * 1000; // 72 h para aceptar
+const MAX_TRANSFER_AMOUNT = 5000000;
+const PENDING_TRANSFER_PREFIX = 'P2P';
+// Cobros de servicios de la propia plataforma (no existe usuario receptor).
+const PLATFORM_MERCHANTS = new Set(['barcos']);
 
-  await supabase.from('transactions').insert({
-    user_id: req.user.id, type: 'deposit', amount, method: 'CÁƒÂ³digo de recarga',
-    reference: code, status: 'completed'
+const roundAmount = (value) => Math.round(Number(value) * 100) / 100;
+const isValidTransferAmount = (value) => {
+  const amount = Number(value);
+  return Number.isFinite(amount) && amount > 0 && amount <= MAX_TRANSFER_AMOUNT;
+};
+
+const findUserByRef = async (ref) => {
+  const raw = String(ref || '').trim();
+  if (!raw) return null;
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw);
+  const phone = raw.replace(/[^\d+]/g, '');
+  const base = supabase.from('users').select('id, phone, full_name, avatar_url');
+  const { data } = isUuid
+    ? await base.eq('id', raw).maybeSingle()
+    : await base.eq('phone', phone).maybeSingle();
+  return data || null;
+};
+
+const getWallet = async (userId) => {
+  const { data } = await supabase.from('wallets').select('id, balance').eq('user_id', userId).maybeSingle();
+  return data || null;
+};
+
+const ensureWallet = async (userId) => {
+  const existing = await getWallet(userId);
+  if (existing) return existing;
+  const { data, error } = await supabase
+    .from('wallets')
+    .insert({ user_id: userId, balance: 0, currency: 'XAF' })
+    .select('id, balance')
+    .maybeSingle();
+  return error ? null : data;
+};
+
+// El libro mayor es lo que mueve wallets.balance (el disparador
+// ledger_journal_apply_wallets de la migracion 2026-11-02_ledger_lote_b.sql
+// aplica el delta al cerrar el asiento). Debitar o abonar desde JS es, por
+// tanto, crear su asiento: si el JS escribiera el saldo aparte, el mismo euro
+// se movería dos veces.
+// Criterio contable: el saldo de un cliente es pasivo del operador (crece al
+// Haber); SYS-CASH es activo (crece al Debe), SYS-FEES ingreso y SYS-SUSPENSE
+// es lo que se debe a proveedores y lo retenido en pendientes.
+const ledgerPost = async ({ userId, operation, key = null, concept, lines, reference = null, requiresApproval = false }) => {
+  const { data, error } = await supabase.rpc('ledger_post', {
+    p_user_id: userId,
+    p_operation: String(operation),
+    p_idempotency_key: key,
+    p_concept: String(concept || operation).slice(0, 200),
+    p_lines: lines,
+    p_reference: reference ? String(reference).slice(0, 120) : null,
+    p_requires_approval: requiresApproval === true,
   });
+  if (error) {
+    const msg = String(error.message || '');
+    const code = /saldo insuficiente/i.test(msg) ? 'INSUFFICIENT_BALANCE'
+      : /no tiene monedero|unificarlos antes/i.test(msg) ? 'WALLET_NOT_FOUND'
+      : 'LEDGER_REJECTED';
+    if (code === 'LEDGER_REJECTED') console.error('[LEDGER] asiento rechazado:', operation, key, msg);
+    return { ok: false, code, message: msg };
+  }
+  if (!data?.journal_id) return { ok: false, code: 'LEDGER_REJECTED', message: 'El libro mayor no devolvió ningún asiento' };
+  if (data.status === 'pending_approval') {
+    return { ok: false, code: 'PENDING_APPROVAL', journal_id: data.journal_id };
+  }
+  return { ok: true, journal_id: data.journal_id, already_posted: data.already_posted === true };
+};
 
-  res.json({ balance: newBalance, amount, message: `${amount.toLocaleString()} XAF aÁƒÂ±adidos` });
-});
+const readWalletBalance = async (userId) => {
+  const wallet = await getWallet(userId);
+  return Number(wallet?.balance || 0);
+};
+
+// La misma puerta, pero con la plantilla de asiento resuelta dentro de la base
+// de datos (migracion 2026-11-03_ledger_lote_b2.sql). La usan los canales sin
+// telefono inteligente: un menu USSD no puede reconstruir el debe y el haber,
+// asi que pide el asiento por su tipo y el libro lo diseña.
+const ledgerPostKind = async ({ kind, userId, amount, fee = 0, counterpartyUserId = null, key = null, concept = null, reference = null, provider = null, requiresApproval = false }) => {
+  const { data, error } = await supabase.rpc('ledger_post_kind', {
+    p_kind: String(kind),
+    p_user_id: userId,
+    p_amount: roundAmount(amount),
+    p_idempotency_key: key ? String(key) : null,
+    p_fee: roundAmount(fee),
+    p_counterparty_id: counterpartyUserId,
+    p_concept: String(concept || kind).slice(0, 200),
+    p_reference: reference ? String(reference).slice(0, 120) : null,
+    p_provider: provider ? String(provider).slice(0, 60) : null,
+    p_requires_approval: requiresApproval === true,
+  });
+  if (error) {
+    const msg = String(error.message || '');
+    const code = /saldo insuficiente/i.test(msg) ? 'INSUFFICIENT_BALANCE'
+      : /no tiene monedero|unificarlos antes/i.test(msg) ? 'WALLET_NOT_FOUND'
+      : 'LEDGER_REJECTED';
+    if (code === 'LEDGER_REJECTED') console.error('[LEDGER] plantilla rechazada:', kind, key, msg);
+    return { ok: false, code, message: msg };
+  }
+  if (!data?.journal_id) return { ok: false, code: 'LEDGER_REJECTED', message: 'El libro mayor no devolvió ningún asiento' };
+  if (data.status === 'pending_approval') return { ok: false, code: 'PENDING_APPROVAL', journal_id: data.journal_id };
+  return { ok: true, journal_id: data.journal_id, already_posted: data.already_posted === true };
+};
+
+const debitWallet = async (userId, amount, opts = {}) => {
+  const amt = roundAmount(Number(amount || 0));
+  if (!(amt > 0)) return { ok: false, code: 'INVALID_AMOUNT' };
+  const wallet = await getWallet(userId);
+  if (!wallet) return { ok: false, code: 'WALLET_NOT_FOUND' };
+  const res = await ledgerPost({
+    userId,
+    operation: opts.operation || 'pago_servicio',
+    key: opts.key || null,
+    concept: opts.concept || `Cargo de ${amt} XAF`,
+    reference: opts.reference || null,
+    lines: [
+      { wallet_user_id: userId, entry_type: 'debit', amount: amt },
+      { account: opts.account || 'SYS-SUSPENSE', entry_type: 'credit', amount: amt },
+    ],
+  });
+  if (!res.ok) return res;
+  return { ok: true, balance: await readWalletBalance(userId), journal_id: res.journal_id, already_posted: res.already_posted };
+};
+
+const creditWallet = async (userId, amount, opts = {}) => {
+  const amt = roundAmount(Number(amount || 0));
+  if (!(amt > 0)) return { ok: false, code: 'INVALID_AMOUNT' };
+  const wallet = await ensureWallet(userId);
+  if (!wallet) return { ok: false, code: 'WALLET_NOT_FOUND' };
+  const res = await ledgerPost({
+    userId,
+    operation: opts.operation || 'recarga',
+    key: opts.key || null,
+    concept: opts.concept || `Abono de ${amt} XAF`,
+    reference: opts.reference || null,
+    lines: [
+      { wallet_user_id: userId, entry_type: 'credit', amount: amt },
+      { account: opts.account || 'SYS-CASH', entry_type: 'debit', amount: amt },
+    ],
+  });
+  if (!res.ok) return res;
+  return { ok: true, balance: await readWalletBalance(userId), journal_id: res.journal_id, already_posted: res.already_posted };
+};
+
+// Traspaso entre dos monederos: un solo asiento de dos patas. Si se hiciera con
+// un débito y un crédito separados, cada mitad quedaría obligada con una cuenta
+// del operador y el libro mentiría sobre de dónde vino el dinero.
+const moveWallets = async (fromUserId, toUserId, amount, opts = {}) => {
+  const amt = roundAmount(Number(amount || 0));
+  if (!(amt > 0)) return { ok: false, code: 'INVALID_AMOUNT' };
+  const wallet = await getWallet(fromUserId);
+  if (!wallet) return { ok: false, code: 'WALLET_NOT_FOUND' };
+  await ensureWallet(toUserId);
+  const res = await ledgerPost({
+    userId: fromUserId,
+    operation: opts.operation || 'transferencia_p2p',
+    key: opts.key || null,
+    concept: opts.concept || `Transferencia de ${amt} XAF`,
+    reference: opts.reference || null,
+    lines: [
+      { wallet_user_id: toUserId, entry_type: 'credit', amount: amt },
+      { wallet_user_id: fromUserId, entry_type: 'debit', amount: amt },
+    ],
+  });
+  if (!res.ok) return res;
+  return {
+    ok: true,
+    balance: await readWalletBalance(fromUserId),
+    to_balance: await readWalletBalance(toUserId),
+    journal_id: res.journal_id,
+    already_posted: res.already_posted,
+  };
+};
+
+// Traspaso por plantilla SQL: el mismo asiento `p2p_send` que dibuja
+// ledger_lines(), pero pedido por su tipo. Es la primitiva de dinero de los
+// canales sin telefono inteligente, donde no hay codigo cliente que decida
+// cuantas patas tiene un pago.
+const sendP2PByKind = async (fromUserId, toUserId, amount, opts = {}) => {
+  const amt = roundAmount(Number(amount || 0));
+  if (!(amt > 0)) return { ok: false, code: 'INVALID_AMOUNT' };
+  const wallet = await getWallet(fromUserId);
+  if (!wallet) return { ok: false, code: 'WALLET_NOT_FOUND' };
+  await ensureWallet(toUserId);
+  const res = await ledgerPostKind({
+    kind: 'p2p_send',
+    userId: fromUserId,
+    amount: amt,
+    counterpartyUserId: toUserId,
+    key: opts.key || null,
+    concept: opts.concept || `Transferencia de ${amt} XAF`,
+    reference: opts.reference || null,
+    provider: opts.provider || null,
+  });
+  if (!res.ok) return { ...res, balance: await readWalletBalance(fromUserId) };
+  return {
+    ok: true,
+    balance: await readWalletBalance(fromUserId),
+    to_balance: await readWalletBalance(toUserId),
+    journal_id: res.journal_id,
+    already_posted: res.already_posted,
+  };
+};
+
+const buildPendingReference = (recipientId, concept) =>
+  `${PENDING_TRANSFER_PREFIX}:${recipientId}:${Buffer.from(String(concept || ''), 'utf8').toString('base64')}`;
+
+const parsePendingReference = (reference) => {
+  const parts = String(reference || '').split(':');
+  if (parts.length < 3 || parts[0] !== PENDING_TRANSFER_PREFIX) return null;
+  let concept = '';
+  try { concept = Buffer.from(parts.slice(2).join(':'), 'base64').toString('utf8'); } catch {}
+  return { recipientId: parts[1], concept };
+};
+
+const transferErrorResponse = (res, code) => {
+  if (code === 'INSUFFICIENT_BALANCE') {
+    return res.status(400).json({ message: 'Saldo insuficiente', code });
+  }
+  if (code === 'WALLET_NOT_FOUND') {
+    return res.status(409).json({ message: 'Necesitas un monedero antes de operar con dinero', code });
+  }
+  if (code === 'PENDING_APPROVAL') {
+    return res.status(202).json({ message: 'El asiento quedó pendiente de la segunda firma de un administrador', code });
+  }
+  return res.status(409).json({ message: 'No se pudo completar la operación. Inténtalo de nuevo.', code });
+};
+
+// ── Modo del monedero ────────────────────────────────────────────────
+// sandbox: saldo de prueba, pasarelas simuladas. live: solo dinero real,
+// activado cuando existan las integraciones bancarias.
+const WALLET_MODE = process.env.WALLET_MODE === 'live' ? 'live' : 'sandbox';
+const WALLET_SANDBOX = WALLET_MODE === 'sandbox';
+const WALLET_CURRENCY = 'XAF';
 
 const WALLET_LIMITS = {
   dailyDeposit: 5000000,
   dailyWithdraw: 3000000,
   dailyTransfer: 3000000,
-  perTxTransfer: 1000000
+  perTxTransfer: 1000000,
 };
 
 const startOfTodayIso = () => {
@@ -2820,35 +2856,795 @@ const startOfTodayIso = () => {
   return d.toISOString();
 };
 
-const getWalletSafe = async (userId) => {
-  let { data: wallet } = await supabase.from('wallets').select('*').eq('user_id', userId).maybeSingle();
-  if (!wallet) {
-    const { data } = await supabase
-      .from('wallets')
-      .insert({ user_id: userId, balance: 5000, currency: 'XAF' })
-      .select()
-      .single();
-    wallet = data;
-  }
-  return wallet;
-};
-
 const sumTodayByType = async (userId) => {
   const { data } = await supabase
     .from('transactions')
     .select('type, amount')
     .eq('user_id', userId)
     .gte('created_at', startOfTodayIso())
-    .in('type', ['deposit', 'withdraw', 'transfer']);
+    .in('type', ['deposit', 'withdraw', 'transfer_sent']);
 
   const totals = { deposit: 0, withdraw: 0, transfer: 0 };
   (data || []).forEach((tx) => {
     const type = String(tx.type || '').toLowerCase();
-    if (type in totals) {
-      totals[type] += Number(tx.amount || 0);
-    }
+    if (type === 'transfer_sent') totals.transfer += Number(tx.amount || 0);
+    else if (type in totals) totals[type] += Number(tx.amount || 0);
   });
   return totals;
+};
+
+const walletQuotaError = async (userId, kind, amount) => {
+  if (kind === 'transfer' && amount > WALLET_LIMITS.perTxTransfer) {
+    return `El máximo por transferencia es ${WALLET_LIMITS.perTxTransfer.toLocaleString('es-ES')} XAF`;
+  }
+  const limit = {
+    deposit: WALLET_LIMITS.dailyDeposit,
+    withdraw: WALLET_LIMITS.dailyWithdraw,
+    transfer: WALLET_LIMITS.dailyTransfer,
+  }[kind];
+  if (!limit) return null;
+  const totals = await sumTodayByType(userId);
+  const used = kind === 'transfer' ? totals.transfer : totals[kind];
+  if (used + amount <= limit) return null;
+  return `Has alcanzado el límite diario de ${limit.toLocaleString('es-ES')} XAF para esta operación`;
+};
+
+const checkPinForOperation = async (userId, pin) => {
+  const { data: user } = await supabase
+    .from('users').select('pin_hash').eq('id', userId).maybeSingle();
+  if (!user || !user.pin_hash) return { ok: true, configured: false };
+  if (!pin) return { ok: false, code: 'PIN_REQUIRED' };
+  const valid = await bcrypt.compare(String(pin), user.pin_hash);
+  return valid ? { ok: true, configured: true } : { ok: false, code: 'PIN_INVALID' };
+};
+
+const pinErrorResponse = (res, code) => res.status(403).json({
+  code,
+  message: code === 'PIN_REQUIRED'
+    ? 'Introduce tu PIN de seguridad para continuar'
+    : 'PIN incorrecto',
+});
+
+const notifyMoney = (userId, title, body, extra = {}) => {
+  sendPushToUser(userId, {
+    title,
+    body,
+    notificationType: 'wallet',
+    ...extra,
+  }).catch((e) => console.warn('[WALLET] push error:', e.message));
+};
+
+app.post('/api/wallet/transfer', auth, walletLimiter, async (req, res) => {
+  try {
+    const { to, concept, pin } = req.body || {};
+    const amount = roundAmount(req.body?.amount);
+
+    if (!isValidTransferAmount(amount)) return res.status(400).json({ message: 'Importe inválido' });
+    if (!to) return res.status(400).json({ message: 'Destinatario requerido' });
+
+    const pinCheck = await checkPinForOperation(req.user.id, pin);
+    if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
+
+    const quotaError = await walletQuotaError(req.user.id, 'transfer', amount);
+    if (quotaError) return res.status(400).json({ message: quotaError, code: 'LIMIT_EXCEEDED' });
+
+    const isPlatformMerchant = PLATFORM_MERCHANTS.has(String(to).trim().toLowerCase());
+    const recipient = isPlatformMerchant ? null : await findUserByRef(to);
+    if (!recipient && !isPlatformMerchant) return res.status(404).json({ message: 'Destinatario no encontrado' });
+    if (recipient && String(recipient.id) === String(req.user.id)) {
+      return res.status(400).json({ message: 'No puedes transferirte a ti mismo' });
+    }
+
+    // Un traspaso entre personas es un solo asiento: sale de un monedero y entra
+    // en el otro. El pago a un comercio de la plataforma sí pasa por la cuenta
+    // puente, porque la deuda con ese proveedor todavía no está liquidada.
+    const key = req.body?.client_ref ? `P2P-${String(req.body.client_ref)}` : null;
+    const detailRef = concept ? String(concept).slice(0, 140) : null;
+    const traspaso = recipient
+      ? await moveWallets(req.user.id, recipient.id, amount, {
+          key,
+          concept: `Transferencia a ${recipient.phone || recipient.full_name || recipient.id}`,
+          reference: detailRef,
+        })
+      : await debitWallet(req.user.id, amount, {
+          operation: 'pago_servicio',
+          account: 'SYS-SUSPENSE',
+          concept: `Pago a ${to}`,
+          key,
+          reference: detailRef,
+        });
+    if (!traspaso.ok) return transferErrorResponse(res, traspaso.code);
+
+    const detail = concept ? ` · ${String(concept).slice(0, 140)}` : '';
+    // El libro ya conocia este client_ref: el asiento se devolvio sin mover
+    // dinero, asi que tampoco hay que escribir una segunda vez la historia.
+    const yaHecho = traspaso.already_posted === true;
+    let sent = null;
+    if (yaHecho) {
+      const { data: previa } = await supabase.from('transactions')
+        .select('*').eq('user_id', req.user.id).eq('type', 'transfer_sent')
+        .eq('ledger_journal_id', traspaso.journal_id).maybeSingle();
+      sent = previa;
+    } else {
+      const { data: creada } = await supabase.from('transactions').insert({
+        user_id: req.user.id,
+        type: 'transfer_sent',
+        amount,
+        method: 'EGCHAT',
+        reference: recipient ? `A: ${recipient.phone || recipient.id}${detail}` : `Servicio: ${to}${detail}`,
+        status: 'completed',
+        ledger_journal_id: traspaso.journal_id,
+      }).select().single();
+      sent = creada;
+    }
+
+    if (recipient && !yaHecho) {
+      await supabase.from('transactions').insert({
+        user_id: recipient.id,
+        type: 'transfer_received',
+        amount,
+        method: 'EGCHAT',
+        reference: `DE: ${req.user.phone || req.user.id}${detail}`,
+        status: 'completed',
+        ledger_journal_id: traspaso.journal_id,
+      });
+      notifyMoney(
+        recipient.id,
+        'Has recibido dinero',
+        `${req.user.phone || 'Un contacto'} te envió ${amount.toLocaleString('es-ES')} XAF`,
+        { amount, senderPhone: req.user.phone || '', transactionId: sent?.id || '' },
+      );
+    }
+
+    res.json({
+      balance: traspaso.balance,
+      transaction: sent,
+      recipient: recipient
+        ? { id: recipient.id, name: recipient.full_name }
+        : { id: String(to), name: String(to) },
+      sandbox: WALLET_SANDBOX,
+    });
+  } catch (e) {
+    console.error('Transfer error:', e.message);
+    res.status(500).json({ message: 'Error al procesar la transferencia' });
+  }
+});
+
+// Transferencia pendiente: el emisor aparta el saldo y el receptor acepta.
+app.post('/api/wallet/transfer/pending', auth, walletLimiter, async (req, res) => {
+  try {
+    const { to, concept, pin } = req.body || {};
+    const amount = roundAmount(req.body?.amount);
+
+    if (!isValidTransferAmount(amount)) return res.status(400).json({ message: 'Importe inválido' });
+    if (!to) return res.status(400).json({ message: 'Destinatario requerido' });
+
+    const pinCheck = await checkPinForOperation(req.user.id, pin);
+    if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
+
+    const quotaError = await walletQuotaError(req.user.id, 'transfer', amount);
+    if (quotaError) return res.status(400).json({ message: quotaError, code: 'LIMIT_EXCEEDED' });
+
+    const recipient = await findUserByRef(to);
+    if (!recipient) return res.status(404).json({ message: 'Destinatario no encontrado' });
+    if (String(recipient.id) === String(req.user.id)) {
+      return res.status(400).json({ message: 'No puedes transferirte a ti mismo' });
+    }
+
+    // Primero se crea la transferencia y después se aparta el saldo, con el id
+    // del movimiento como clave de idempotencia: un reintento del mismo pedido
+    // devuelve el asiento ya hecho en vez de apartar el dinero otra vez.
+    const { data: transfer, error } = await supabase.from('transactions').insert({
+      user_id: req.user.id,
+      type: 'transfer_sent',
+      amount,
+      method: 'EGCHAT',
+      reference: buildPendingReference(recipient.id, concept),
+      status: 'pending',
+    }).select().single();
+
+    if (error || !transfer) {
+      return res.status(500).json({ message: 'No se pudo crear la transferencia' });
+    }
+
+    const debit = await debitWallet(req.user.id, amount, {
+      operation: 'transferencia_p2p',
+      account: 'SYS-SUSPENSE',
+      concept: `Saldo apartado para ${recipient.phone || recipient.full_name || recipient.id}`,
+      key: `PEND-${transfer.id}`,
+      reference: `PEND:${transfer.id}`,
+    });
+    if (!debit.ok) {
+      await supabase.from('transactions').update({ status: 'cancelled' }).eq('id', transfer.id).eq('status', 'pending');
+      return transferErrorResponse(res, debit.code);
+    }
+    await supabase.from('transactions')
+      .update({ ledger_journal_id: debit.journal_id })
+      .eq('id', transfer.id);
+
+    notifyMoney(
+      recipient.id,
+      'Tienes una transferencia pendiente',
+      `${req.user.phone || 'Un contacto'} quiere enviarte ${amount.toLocaleString('es-ES')} XAF`,
+      { amount, transferId: transfer.id, senderPhone: req.user.phone || '', pending: true },
+    );
+
+    res.json({
+      success: true,
+      transferId: transfer.id,
+      balance: debit.balance,
+      recipient: recipient.full_name || recipient.phone,
+      message: 'Transferencia enviada. El destinatario debe aceptarla.',
+      sandbox: WALLET_SANDBOX,
+    });
+  } catch (e) {
+    console.error('Pending transfer error:', e.message);
+    res.status(500).json({ message: 'Error al procesar la transferencia' });
+  }
+});
+
+// Devuelve al emisor las transferencias pendientes que caducaron.
+const expirePendingTransfer = async (transfer) => {
+  const { data: claimed } = await supabase.from('transactions')
+    .update({ status: 'expired' })
+    .eq('id', transfer.id)
+    .eq('status', 'pending')
+    .select('id, user_id, amount')
+    .maybeSingle();
+  if (claimed) {
+    // Se libera la retención: la cuenta puente era la que guardaba el saldo.
+    await creditWallet(claimed.user_id, Number(claimed.amount), {
+      operation: 'ajuste',
+      account: 'SYS-SUSPENSE',
+      concept: 'Transferencia pendiente caducada',
+      key: `PEND-EXP-${claimed.id}`,
+      reference: `PEND-EXP:${claimed.id}`,
+    });
+  }
+  return Boolean(claimed);
+};
+
+app.get('/api/wallet/pending-transfers', auth, async (req, res) => {
+  try {
+    const userId = String(req.user.id);
+    const [{ data: outgoing }, { data: incoming }] = await Promise.all([
+      supabase.from('transactions')
+        .select('id, user_id, amount, reference, status, created_at')
+        .eq('user_id', req.user.id).eq('status', 'pending').like('reference', `${PENDING_TRANSFER_PREFIX}:%`)
+        .order('created_at', { ascending: false }).limit(50),
+      supabase.from('transactions')
+        .select('id, user_id, amount, reference, status, created_at')
+        .eq('status', 'pending')
+        .like('reference', `${PENDING_TRANSFER_PREFIX}:${userId}:%`)
+        .order('created_at', { ascending: false }).limit(50),
+    ]);
+
+    const now = Date.now();
+    const active = [];
+    for (const tx of [...(outgoing || []), ...(incoming || [])]) {
+      const createdAt = new Date(tx.created_at).getTime();
+      const isExpired = Number.isFinite(createdAt) && now - createdAt > TRANSFER_TTL_MS;
+      if (isExpired) {
+        await expirePendingTransfer(tx);
+        continue;
+      }
+      active.push({ tx, isExpired });
+    }
+
+    const ids = new Set();
+    for (const { tx } of active) {
+      ids.add(String(tx.user_id));
+      const parsed = parsePendingReference(tx.reference);
+      if (parsed) ids.add(String(parsed.recipientId));
+    }
+    const { data: users } = ids.size
+      ? await supabase.from('users').select('id, full_name, avatar_url').in('id', Array.from(ids))
+      : { data: [] };
+    const userMap = new Map((users || []).map((u) => [String(u.id), u]));
+
+    const transfers = active
+      .filter(({ tx }) => tx.status === 'pending')
+      .map(({ tx }) => {
+        const parsed = parsePendingReference(tx.reference) || {};
+        const isIncoming = String(parsed.recipientId || '') === userId;
+        const sender = userMap.get(String(tx.user_id)) || {};
+        const recipient = userMap.get(String(parsed.recipientId)) || {};
+        const createdAt = new Date(tx.created_at);
+        return {
+          id: tx.id,
+          direction: isIncoming ? 'incoming' : 'outgoing',
+          amount: Number(tx.amount),
+          concept: parsed.concept || null,
+          status: tx.status,
+          expiresAt: new Date(createdAt.getTime() + TRANSFER_TTL_MS).toISOString(),
+          createdAt: tx.created_at,
+          isExpired: false,
+          senderName: sender.full_name || '',
+          senderAvatar: sender.avatar_url || null,
+          recipientName: recipient.full_name || '',
+          recipientAvatar: recipient.avatar_url || null,
+        };
+      });
+
+    res.json({ transfers });
+  } catch (e) {
+    console.error('Pending transfers list error:', e.message);
+    res.status(500).json({ message: 'Error al obtener las transferencias pendientes' });
+  }
+});
+
+app.post('/api/wallet/transfer/accept/:id', auth, walletLimiter, async (req, res) => {
+  try {
+    const { data: transfer } = await supabase.from('transactions')
+      .select('id, user_id, amount, reference, status, created_at')
+      .eq('id', req.params.id).eq('status', 'pending')
+      .maybeSingle();
+
+    if (!transfer) return res.status(404).json({ message: 'Transferencia no encontrada o ya procesada' });
+
+    const parsed = parsePendingReference(transfer.reference);
+    if (!parsed) return res.status(404).json({ message: 'Transferencia no encontrada o ya procesada' });
+    if (String(parsed.recipientId) !== String(req.user.id)) {
+      return res.status(403).json({ message: 'Esta transferencia no está dirigida a ti' });
+    }
+    if (Date.now() - new Date(transfer.created_at).getTime() > TRANSFER_TTL_MS) {
+      await expirePendingTransfer(transfer);
+      return res.status(410).json({ message: 'La transferencia ha caducado' });
+    }
+
+    // Reclamo atómico: solo una petición puede pasar de pending a completed.
+    const { data: claimed } = await supabase.from('transactions')
+      .update({ status: 'completed' })
+      .eq('id', transfer.id).eq('status', 'pending')
+      .select('id').maybeSingle();
+    if (!claimed) return res.status(409).json({ message: 'La transferencia ya fue procesada' });
+
+    const amount = Number(transfer.amount);
+    // El dinero sale de la cuenta puente donde quedó apartado al crear la
+    // transferencia; la clave la fija el id del movimiento, así un doble clic
+    // del receptor no puede cobrarla dos veces.
+    const credit = await creditWallet(req.user.id, amount, {
+      operation: 'transferencia_p2p',
+      account: 'SYS-SUSPENSE',
+      concept: `Transferencia recibida de ${transfer.user_id}`,
+      key: `PEND-ACK-${transfer.id}`,
+      reference: `PEND-ACK:${transfer.id}`,
+    });
+    if (!credit.ok) {
+      // Se devuelve a pendiente para que el receptor pueda reintentar: si el
+      // asiento se rechaza, el abono tampoco llegó al monedero.
+      await supabase.from('transactions').update({ status: 'pending' }).eq('id', transfer.id);
+      return transferErrorResponse(res, credit.code);
+    }
+
+    await supabase.from('transactions').insert({
+      user_id: req.user.id,
+      type: 'transfer_received',
+      amount,
+      method: 'EGCHAT',
+      reference: `DE: ${transfer.user_id}${parsed.concept ? ` · ${parsed.concept.slice(0, 140)}` : ''}`,
+      status: 'completed',
+      ledger_journal_id: credit.journal_id,
+    });
+
+    notifyMoney(
+      transfer.user_id,
+      'Transferencia aceptada',
+      `${req.user.phone || 'El destinatario'} aceptó tu transferencia de ${amount.toLocaleString('es-ES')} XAF`,
+      { amount, transferId: transfer.id, accepted: true },
+    );
+
+    res.json({ success: true, balance: credit.balance, message: 'Transferencia aceptada', sandbox: WALLET_SANDBOX });
+  } catch (e) {
+    console.error('Accept transfer error:', e.message);
+    res.status(500).json({ message: 'Error al aceptar la transferencia' });
+  }
+});
+
+app.post('/api/wallet/transfer/cancel/:id', auth, walletLimiter, async (req, res) => {
+  try {
+    const { data: transfer } = await supabase.from('transactions')
+      .select('id, user_id, amount, reference, status')
+      .eq('id', req.params.id).eq('user_id', req.user.id)
+      .eq('status', 'pending')
+      .maybeSingle();
+
+    if (!transfer || !parsePendingReference(transfer.reference)) {
+      return res.status(404).json({ message: 'Transferencia no encontrada o ya procesada' });
+    }
+
+    const { data: claimed } = await supabase.from('transactions')
+      .update({ status: 'cancelled' })
+      .eq('id', transfer.id).eq('status', 'pending')
+      .select('id').maybeSingle();
+    if (!claimed) return res.status(409).json({ message: 'La transferencia ya fue procesada' });
+
+    // Devolución del saldo apartado: mismo asiento en sentido contrario que el
+    // de la aceptación, y clave fija por el id para no poder devolver dos veces.
+    const devolucion = await creditWallet(req.user.id, Number(transfer.amount), {
+      operation: 'ajuste',
+      account: 'SYS-SUSPENSE',
+      concept: 'Transferencia pendiente cancelada',
+      key: `PEND-CANCEL-${transfer.id}`,
+      reference: `PEND-CANCEL:${transfer.id}`,
+    });
+    if (!devolucion.ok) {
+      await supabase.from('transactions').update({ status: 'pending' }).eq('id', transfer.id).eq('status', 'cancelled');
+      return transferErrorResponse(res, devolucion.code);
+    }
+    res.json({ success: true, message: 'Transferencia cancelada y saldo devuelto', balance: devolucion.balance });
+  } catch (e) {
+    console.error('Cancel transfer error:', e.message);
+    res.status(500).json({ message: 'Error al cancelar la transferencia' });
+  }
+});
+
+// Redención de un código de recarga. Un único camino para la app y para los
+// canales sin teléfono inteligente: si el canal tuviera su propia versión, el
+// histórico y el libro mayor se escribirían distinto según por dónde entrara.
+// Devuelve códigos, no respuestas HTTP.
+const redeemRechargeCode = async ({ userId, code }) => {
+  const raw = String(code || '').trim();
+  if (raw.replace(/-/g, '').length !== 16) return { ok: false, code: 'CODE_INVALID' };
+
+  const { data: row } = await supabase
+    .from('recharge_codes').select('*').eq('code', raw).maybeSingle();
+  if (!row) return { ok: false, code: 'CODE_NOT_FOUND' };
+  if (row.used || row.is_used) return { ok: false, code: 'CODE_USED' };
+  if (row.expires_at && new Date(row.expires_at) < new Date()) return { ok: false, code: 'CODE_EXPIRED' };
+
+  const amount = roundAmount(Number(row.amount || 5000));
+
+  // Reclamo atómico: solo la primera petición que encuentre el código sin usar
+  // consigue la fila actualizada; las demás reciben data = null.
+  const { data: claimed } = await supabase
+    .from('recharge_codes')
+    .update({ used: true, used_by: userId, used_at: new Date().toISOString() })
+    .eq('code', raw)
+    .or('used.eq.false,used.is.null')
+    .select('id')
+    .maybeSingle();
+  if (!claimed) return { ok: false, code: 'CODE_USED' };
+
+  // El código ya está reclamado (used=true) antes de abonar: la clave del
+  // asiento es el id del código, así que aunque la petición se repita el
+  // importe entra una sola vez.
+  const credit = await creditWallet(userId, amount, {
+    operation: 'recarga',
+    account: 'SYS-CASH',
+    concept: `Recarga con código ${raw}`,
+    key: `RECHARGE-${claimed.id}`,
+    reference: raw,
+  });
+  if (!credit.ok) {
+    await supabase.from('recharge_codes')
+      .update({ used: false, used_by: null, used_at: null })
+      .eq('code', raw);
+    return { ok: false, code: credit.code };
+  }
+
+  await supabase.from('transactions').insert({
+    user_id: userId, type: 'deposit', amount, method: 'Código de recarga',
+    reference: raw, status: 'completed', ledger_journal_id: credit.journal_id,
+  });
+  return { ok: true, amount, balance: credit.balance };
+};
+
+app.post('/api/wallet/recharge-code', auth, walletLimiter, async (req, res) => {
+  const out = await redeemRechargeCode({ userId: req.user.id, code: req.body?.code });
+  if (!out.ok) {
+    const messages = {
+      CODE_INVALID: 'Código inválido',
+      CODE_NOT_FOUND: 'Código no válido',
+      CODE_USED: 'Código ya utilizado',
+      CODE_EXPIRED: 'Código expirado',
+    };
+    return res.status(400).json({
+      message: messages[out.code] || 'No se pudo completar la recarga',
+      code: out.code,
+    });
+  }
+  res.json({
+    balance: out.balance,
+    amount: out.amount,
+    message: `${out.amount.toLocaleString()} XAF añadidos`,
+    sandbox: WALLET_SANDBOX,
+  });
+});
+
+// ── Pasarela de pagos ────────────────────────────────────────────────
+// Mientras WALLET_MODE=sandbox las pasarelas se simulan sobre
+// payment_transactions. En modo live rechazan la operación hasta que
+// exista la integración real con el banco u operador.
+const PAYMENT_GATEWAYS = new Set([
+  'stripe', 'orange_money', 'mtn_mobile', 'bank_transfer',
+  'cash_agent', 'recharge_code', 'egchat_transfer',
+]);
+const MIN_DEPOSIT_AMOUNT = 500;
+const SANDBOX_USSD = { orange_money: '*144#', mtn_mobile: '*126#' };
+
+const createPaymentId = (prefix) =>
+  `${prefix}_${Date.now().toString(36)}${crypto.randomBytes(4).toString('hex')}`;
+
+const sandboxPaymentsOnly = (res) => {
+  if (WALLET_SANDBOX) return true;
+  res.status(501).json({
+    code: 'PAYMENTS_NOT_CONFIGURED',
+    message: 'Los pagos reales todavía no están disponibles. Espera a la integración bancaria.',
+  });
+  return false;
+};
+
+const getPaymentRow = async (id, userId) => {
+  const { data } = await supabase
+    .from('payment_transactions')
+    .select('*')
+    .eq('id', id)
+    .eq('user_id', userId)
+    .maybeSingle();
+  return data || null;
+};
+
+app.post('/api/payments/deposit/intent', auth, walletLimiter, async (req, res) => {
+  try {
+    if (!sandboxPaymentsOnly(res)) return;
+    const gateway = String(req.body?.gateway || '');
+    const amount = roundAmount(req.body?.amount);
+    const phone = req.body?.phone ? String(req.body.phone) : null;
+
+    if (!PAYMENT_GATEWAYS.has(gateway)) return res.status(400).json({ message: 'Pasarela no válida' });
+    if (!Number.isFinite(amount) || amount < MIN_DEPOSIT_AMOUNT || amount > MAX_TRANSFER_AMOUNT) {
+      return res.status(400).json({ message: `El importe debe estar entre ${MIN_DEPOSIT_AMOUNT} y ${MAX_TRANSFER_AMOUNT.toLocaleString('es-ES')} XAF` });
+    }
+    if ((gateway === 'orange_money' || gateway === 'mtn_mobile') && !phone) {
+      return res.status(400).json({ message: 'Número de teléfono requerido' });
+    }
+
+    const quotaError = await walletQuotaError(req.user.id, 'deposit', amount);
+    if (quotaError) return res.status(400).json({ message: quotaError, code: 'LIMIT_EXCEEDED' });
+
+    const id = createPaymentId('pay');
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    const { error } = await supabase.from('payment_transactions').insert({
+      id,
+      user_id: req.user.id,
+      type: 'deposit',
+      amount,
+      currency: WALLET_CURRENCY,
+      gateway,
+      status: 'processing',
+      metadata: {
+        sandbox: true,
+        phone,
+        description: req.body?.description || 'Recarga EGChat',
+        expires_at: expiresAt,
+      },
+    });
+    if (error) throw error;
+
+    res.json({
+      id,
+      amount,
+      currency: WALLET_CURRENCY,
+      gateway,
+      status: 'processing',
+      clientSecret: gateway === 'stripe' ? `sbx_${id}_secret` : undefined,
+      ussdCode: SANDBOX_USSD[gateway],
+      expiresAt,
+      sandbox: true,
+    });
+  } catch (e) {
+    console.error('Payment intent error:', e.message);
+    res.status(500).json({ message: 'No se pudo crear la operación de pago' });
+  }
+});
+
+app.post('/api/payments/deposit/confirm', auth, walletLimiter, async (req, res) => {
+  try {
+    if (!sandboxPaymentsOnly(res)) return;
+    const intentId = String(req.body?.intentId || '');
+    if (!intentId) return res.status(400).json({ message: 'intentId requerido' });
+
+    const intent = await getPaymentRow(intentId, req.user.id);
+    if (!intent || intent.type !== 'deposit') return res.status(404).json({ message: 'Operación no encontrada' });
+
+    const wallet = await ensureWallet(req.user.id);
+    if (intent.status === 'completed') {
+      return res.json({ ok: true, transactionId: intent.id, newBalance: Number(wallet?.balance || 0), sandbox: true });
+    }
+    if (intent.status !== 'processing') {
+      return res.status(409).json({ message: 'La operación ya no está pendiente' });
+    }
+
+    const { data: claimed } = await supabase.from('payment_transactions')
+      .update({ status: 'completed', updated_at: new Date().toISOString() })
+      .eq('id', intent.id).eq('status', 'processing')
+      .select('id').maybeSingle();
+    if (!claimed) return res.status(409).json({ message: 'La operación ya fue procesada' });
+
+    const credit = await creditWallet(req.user.id, roundAmount(intent.amount), {
+      operation: 'recarga',
+      account: 'SYS-CASH',
+      concept: `Recarga por ${intent.gateway || 'pasarela'}`,
+      key: `PAY-${intent.id}`,
+      reference: intent.id,
+    });
+    if (!credit.ok) {
+      await supabase.from('payment_transactions')
+        .update({ status: 'processing', updated_at: new Date().toISOString() })
+        .eq('id', intent.id);
+      return transferErrorResponse(res, credit.code);
+    }
+
+    const { data: tx } = await supabase.from('transactions').insert({
+      user_id: req.user.id,
+      type: 'deposit',
+      amount: roundAmount(intent.amount),
+      method: intent.gateway,
+      reference: intent.id,
+      status: 'completed',
+      ledger_journal_id: credit.journal_id,
+    }).select().single();
+
+    res.json({ ok: true, transactionId: tx?.id || intent.id, newBalance: credit.balance, sandbox: true });
+  } catch (e) {
+    console.error('Payment confirm error:', e.message);
+    res.status(500).json({ message: 'No se pudo confirmar el pago' });
+  }
+});
+
+app.get('/api/payments/status/:id', auth, async (req, res) => {
+  try {
+    const intent = await getPaymentRow(req.params.id, req.user.id);
+    if (!intent) return res.status(404).json({ message: 'Operación no encontrada' });
+    const wallet = await getWallet(req.user.id);
+    res.json({
+      status: intent.status,
+      balance: Number(wallet?.balance || 0),
+      transactionId: intent.status === 'completed' ? intent.id : undefined,
+      sandbox: WALLET_SANDBOX,
+    });
+  } catch (e) {
+    res.status(500).json({ message: 'No se pudo consultar el estado' });
+  }
+});
+
+app.post('/api/payments/withdraw/intent', auth, walletLimiter, async (req, res) => {
+  try {
+    if (!sandboxPaymentsOnly(res)) return;
+    const gateway = String(req.body?.gateway || '');
+    const amount = roundAmount(req.body?.amount);
+    const destination = req.body?.destination || {};
+
+    if (!PAYMENT_GATEWAYS.has(gateway)) return res.status(400).json({ message: 'Pasarela no válida' });
+    if (!isValidTransferAmount(amount)) return res.status(400).json({ message: 'Importe inválido' });
+
+    const quotaError = await walletQuotaError(req.user.id, 'withdraw', amount);
+    if (quotaError) return res.status(400).json({ message: quotaError, code: 'LIMIT_EXCEEDED' });
+
+    const wallet = await getWallet(req.user.id);
+    if (Number(wallet?.balance || 0) < amount) {
+      return res.status(400).json({ message: 'Saldo insuficiente', code: 'INSUFFICIENT_BALANCE' });
+    }
+
+    const id = createPaymentId('wd');
+    const { error } = await supabase.from('payment_transactions').insert({
+      id,
+      user_id: req.user.id,
+      type: 'withdrawal',
+      amount,
+      currency: WALLET_CURRENCY,
+      gateway,
+      status: 'processing',
+      metadata: { sandbox: true, destination },
+    });
+    if (error) throw error;
+
+    res.json({
+      id,
+      amount,
+      currency: WALLET_CURRENCY,
+      gateway,
+      status: 'processing',
+      estimatedTime: 'Inmediato',
+      fee: 0,
+      netAmount: amount,
+      sandbox: true,
+    });
+  } catch (e) {
+    console.error('Withdraw intent error:', e.message);
+    res.status(500).json({ message: 'No se pudo crear la retirada' });
+  }
+});
+
+app.post('/api/payments/withdraw/confirm/:id', auth, walletLimiter, async (req, res) => {
+  try {
+    if (!sandboxPaymentsOnly(res)) return;
+    const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+    if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
+
+    const intent = await getPaymentRow(req.params.id, req.user.id);
+    if (!intent || intent.type !== 'withdrawal') return res.status(404).json({ message: 'Operación no encontrada' });
+    if (intent.status !== 'processing') return res.status(409).json({ message: 'La operación ya no está pendiente' });
+
+    const { data: claimed } = await supabase.from('payment_transactions')
+      .update({ status: 'completed', updated_at: new Date().toISOString() })
+      .eq('id', intent.id).eq('status', 'processing')
+      .select('id').maybeSingle();
+    if (!claimed) return res.status(409).json({ message: 'La operación ya fue procesada' });
+
+    const debit = await debitWallet(req.user.id, roundAmount(intent.amount), {
+      operation: 'retiro',
+      account: 'SYS-CASH',
+      concept: `Retirada por ${intent.gateway || 'pasarela'}`,
+      key: `PAY-${intent.id}`,
+      reference: intent.id,
+    });
+    if (!debit.ok) {
+      await supabase.from('payment_transactions')
+        .update({ status: 'processing', updated_at: new Date().toISOString() })
+        .eq('id', intent.id);
+      return transferErrorResponse(res, debit.code);
+    }
+
+    const { data: tx } = await supabase.from('transactions').insert({
+      user_id: req.user.id,
+      type: 'withdraw',
+      amount: roundAmount(intent.amount),
+      method: intent.gateway,
+      reference: intent.id,
+      status: 'completed',
+      ledger_journal_id: debit.journal_id,
+    }).select().single();
+
+    res.json({ ok: true, transactionId: tx?.id || intent.id, newBalance: debit.balance, sandbox: true });
+  } catch (e) {
+    console.error('Withdraw confirm error:', e.message);
+    res.status(500).json({ message: 'No se pudo confirmar la retirada' });
+  }
+});
+
+app.get('/api/payments/history', auth, async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const from = (page - 1) * limit;
+
+    const { data } = await supabase
+      .from('payment_transactions')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false })
+      .range(from, from + limit - 1);
+
+    res.json((data || []).map((row) => ({
+      id: row.id,
+      type: row.type === 'withdrawal' ? 'withdrawal' : 'deposit',
+      amount: Number(row.amount),
+      currency: row.currency || WALLET_CURRENCY,
+      gateway: row.gateway,
+      gatewayTxnId: row.gateway_txn_id || undefined,
+      status: row.status,
+      description: row.metadata?.description || '',
+      createdAt: row.created_at,
+    })));
+  } catch (e) {
+    console.error('Payment history error:', e.message);
+    res.status(500).json({ message: 'No se pudo obtener el historial' });
+  }
+});
+
+const getWalletSafe = async (userId) => {
+  let { data: wallet } = await supabase.from('wallets').select('*').eq('user_id', userId).maybeSingle();
+  if (!wallet) {
+    const { data } = await supabase
+      .from('wallets')
+      .insert({ user_id: userId, balance: 0, currency: WALLET_CURRENCY })
+      .select()
+      .single();
+    wallet = data;
+  }
+  return wallet;
 };
 
 app.get('/api/wallet/limits', auth, async (req, res) => {
@@ -2883,7 +3679,7 @@ app.get('/api/wallet/summary', auth, async (req, res) => {
   });
 });
 
-app.post('/api/wallet/hold', auth, async (req, res) => {
+app.post('/api/wallet/hold', auth, walletLimiter, async (req, res) => {
   const amount = Number(req.body?.amount || 0);
   const reference = req.body?.reference || `HOLD-${Date.now()}`;
   if (amount <= 0) return res.status(400).json({ message: 'Importe inválido' });
@@ -2895,23 +3691,43 @@ app.post('/api/wallet/hold', auth, async (req, res) => {
   res.status(201).json({ hold: tx, balance: Number(wallet.balance || 0) });
 });
 
-app.post('/api/wallet/hold/:id/capture', auth, async (req, res) => {
+app.post('/api/wallet/hold/:id/capture', auth, walletLimiter, async (req, res) => {
   const holdId = req.params.id;
   const { data: hold } = await supabase.from('transactions').select('*')
     .eq('id', holdId).eq('user_id', req.user.id).eq('type', 'hold').maybeSingle();
   if (!hold) return res.status(404).json({ message: 'Retención no encontrada' });
   if (hold.status !== 'pending') return res.status(400).json({ message: 'Retención ya procesada' });
-  const wallet = await getWalletSafe(req.user.id);
+
+  const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+  if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
+
   const amount = Number(hold.amount || 0);
-  if (amount > Number(wallet.balance || 0)) return res.status(400).json({ message: 'Saldo insuficiente para captura' });
-  const newBalance = Number(wallet.balance || 0) - amount;
-  await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
-  await supabase.from('transactions').update({ status: 'captured' }).eq('id', holdId);
+  // Reclamar la retención antes de mover dinero: dos peticiones simultáneas no
+  // pueden capturar la misma retención dos veces.
+  const { data: claimed } = await supabase.from('transactions')
+    .update({ status: 'captured' })
+    .eq('id', holdId).eq('user_id', req.user.id).eq('status', 'pending')
+    .select().maybeSingle();
+  if (!claimed) return res.status(409).json({ message: 'Retención ya en proceso' });
+
+  const debit = await debitWallet(req.user.id, amount, {
+    operation: 'pago_servicio',
+    account: 'SYS-SUSPENSE',
+    concept: `Captura de retención ${hold.reference || holdId}`,
+    key: `HOLD-CAP-${holdId}`,
+    reference: `CAPTURE:${hold.reference || holdId}`,
+  });
+  if (!debit.ok) {
+    await supabase.from('transactions').update({ status: 'pending' }).eq('id', holdId);
+    return transferErrorResponse(res, debit.code);
+  }
+
   const { data: tx } = await supabase.from('transactions').insert({
     user_id: req.user.id, type: 'payment_capture', amount, method: 'EGCHAT',
-    reference: `CAPTURE:${hold.reference || holdId}`, status: 'completed'
+    reference: `CAPTURE:${hold.reference || holdId}`, status: 'completed',
+    ledger_journal_id: debit.journal_id
   }).select().single();
-  res.json({ balance: newBalance, transaction: tx });
+  res.json({ balance: debit.balance, transaction: tx });
 });
 
 app.post('/api/wallet/hold/:id/cancel', auth, async (req, res) => {
@@ -2924,58 +3740,28 @@ app.post('/api/wallet/hold/:id/cancel', auth, async (req, res) => {
   res.json({ message: 'Retención cancelada' });
 });
 
-app.post('/api/wallet/reverse/:txId', auth, async (req, res) => {
-  const txId = req.params.txId;
-  const { data: tx } = await supabase.from('transactions').select('*')
-    .eq('id', txId).eq('user_id', req.user.id).maybeSingle();
-  if (!tx) return res.status(404).json({ message: 'Transacción no encontrada' });
-  if (tx.status === 'reversed') return res.status(400).json({ message: 'Transacción ya revertida' });
-  const reversible = ['withdraw', 'transfer_sent', 'payment', 'payment_capture'];
-  if (!reversible.includes(tx.type)) return res.status(400).json({ message: 'Tipo no reversible' });
-  const wallet = await getWalletSafe(req.user.id);
-  const amount = Number(tx.amount || 0);
-  const newBalance = Number(wallet.balance || 0) + amount;
-  await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', req.user.id);
-  await supabase.from('transactions').update({ status: 'reversed' }).eq('id', txId);
-  await supabase.from('transactions').insert({
-    user_id: req.user.id, type: 'reversal_credit', amount, method: 'EGCHAT',
-    reference: `REV:${txId}`, status: 'completed'
-  });
-  res.json({ balance: newBalance, message: 'Reverso aplicado' });
-});
+// No existe ya una ruta de reversión para el usuario: acreditaba el importe al
+// emisor sin descontarlo del receptor, que ya lo había cobrado, y cualquiera con
+// sesión podía ejecutarla. Las devoluciones se harán por el libro mayor, como
+// asiento de dos patas y con aprobación de administrador.
 
 const LEDGER_APPROVAL_THRESHOLD = Number(process.env.LEDGER_APPROVAL_THRESHOLD || 1000000);
 
-const ensureSystemLedgerAccounts = async () => {
-  const baseAccounts = [
-    { code: 'SYS-CASH', name: 'Caja Operativa', account_type: 'asset' },
-    { code: 'SYS-FEES', name: 'Ingresos por Comisiones', account_type: 'income' },
-    { code: 'SYS-SUSPENSE', name: 'Cuenta Puente', account_type: 'liability' }
-  ];
-  for (const a of baseAccounts) {
-    await supabase.from('ledger_accounts').upsert({
-      code: a.code,
-      name: a.name,
-      account_type: a.account_type,
-      currency: 'XAF',
-      is_system: true,
-      is_active: true
-    }, { onConflict: 'code' });
-  }
-};
-
+// El plan contable del operador (SYS-CASH, SYS-FEES, SYS-SUSPENSE,
+// SYS-DISCREPANCY) lo siembra la migracion 2026-11-02_ledger_lote_b.sql. Antes
+// lo upserteaba este código sin índice unico en ledger_accounts.code: fallaba en
+// silencio y no quedaba ni plan contable.
 const makeAccountCode = (userId) => `USR-${String(userId).slice(0, 8)}-${Date.now()}`;
 
 app.get('/api/wallet/ledger/config', auth, async (_req, res) => {
   res.json({
     approval_threshold: LEDGER_APPROVAL_THRESHOLD,
     currency: 'XAF',
-    modes: ['draft', 'posted', 'pending_approval', 'rejected']
+    modes: ['draft', 'posted', 'pending_approval', 'rejected', 'reversed']
   });
 });
 
 app.get('/api/wallet/ledger/accounts', auth, async (req, res) => {
-  await ensureSystemLedgerAccounts();
   const scope = String(req.query.scope || 'mine');
   let query = supabase.from('ledger_accounts').select('*').order('created_at', { ascending: false });
   if (scope === 'system') query = query.eq('is_system', true);
@@ -2986,12 +3772,14 @@ app.get('/api/wallet/ledger/accounts', auth, async (req, res) => {
   res.json(data || []);
 });
 
-app.post('/api/wallet/ledger/accounts', auth, async (req, res) => {
-  const { name, account_type, currency } = req.body || {};
+// Alta de cuentas del plan contable: solo administrador. La cuenta-monedero de
+// un cliente la crea ledger_post() en su primera operación, no esta ruta.
+app.post('/api/wallet/ledger/accounts', requireAdmin, async (req, res) => {
+  const { name, account_type, currency, user_id } = req.body || {};
   if (!name || !account_type) return res.status(400).json({ message: 'name y account_type son requeridos' });
   const payload = {
-    user_id: req.user.id,
-    code: makeAccountCode(req.user.id),
+    user_id: user_id || null,
+    code: makeAccountCode(user_id || req.admin.id),
     name: String(name).trim(),
     account_type: String(account_type).trim(),
     currency: String(currency || 'XAF'),
@@ -3040,9 +3828,12 @@ app.get('/api/wallet/ledger/journals/:id', auth, async (req, res) => {
   res.json({ journal, entries: entries || [], approval: approval || null });
 });
 
-app.post('/api/wallet/ledger/journals', auth, async (req, res) => {
-  await ensureSystemLedgerAccounts();
-  const { concept, reference, lines } = req.body || {};
+// Único camino para abrir un asiento desde fuera del monedero: ledger_post, que
+// cuadra, sella y mueve los monederos en la misma transacción. Antes esta ruta
+// insertaba journal + entries a mano con cualquier token de usuario, así que un
+// cliente podía asentarse el saldo que quisiera.
+app.post('/api/wallet/ledger/journals', requireAdmin, async (req, res) => {
+  const { concept, reference, lines, operation, idempotency_key, user_id } = req.body || {};
   if (!concept || !Array.isArray(lines) || lines.length < 2) {
     return res.status(400).json({ message: 'concept y al menos 2 líneas son requeridos' });
   }
@@ -3051,96 +3842,97 @@ app.post('/api/wallet/ledger/journals', auth, async (req, res) => {
   let credit = 0;
   const normalized = [];
   for (const l of lines) {
-    const amount = Number(l?.amount || 0);
-    const entryType = String(l?.entry_type || '');
-    const accountId = String(l?.account_id || '');
-    if (!accountId || !['debit', 'credit'].includes(entryType) || amount <= 0) {
-      return res.status(400).json({ message: 'Líneas inválidas: account_id, entry_type y amount son obligatorios' });
+    const amount = roundAmount(Number(l?.amount || 0));
+    const entryType = String(l?.entry_type || '').toLowerCase();
+    const code = String(l?.account || '').trim().toUpperCase();
+    const walletUser = String(l?.wallet_user_id || '').trim();
+    if (!['debit', 'credit'].includes(entryType) || !(amount > 0) || (!code && !walletUser)) {
+      return res.status(400).json({
+        message: 'Líneas inválidas: cada una necesita account (código) o wallet_user_id, entry_type y amount > 0',
+      });
     }
     if (entryType === 'debit') debit += amount;
     else credit += amount;
     normalized.push({
-      account_id: accountId,
+      ...(code ? { account: code } : { wallet_user_id: walletUser }),
       entry_type: entryType,
       amount,
       currency: String(l?.currency || 'XAF'),
       memo: l?.memo ? String(l.memo) : null,
-      counterparty_user_id: l?.counterparty_user_id || null
+      counterparty_user_id: l?.counterparty_user_id || null,
     });
   }
-  if (Math.abs(debit - credit) > 0.00001) {
-    return res.status(400).json({ message: 'Asiento no balanceado: total debit debe igualar total credit' });
+  if (Math.abs(roundAmount(debit) - roundAmount(credit)) >= 0.005) {
+    return res.status(400).json({ message: `Asiento no balanceado: debe ${debit} / haber ${credit}` });
   }
 
-  const totalAmount = debit;
-  const requiresApproval = totalAmount >= LEDGER_APPROVAL_THRESHOLD;
-  const status = requiresApproval ? 'pending_approval' : 'posted';
-
-  const { data: journal, error: jErr } = await supabase.from('ledger_journals').insert({
-    user_id: req.user.id,
-    reference: reference || `JR-${Date.now()}`,
+  const total = roundAmount(debit);
+  const asiento = await ledgerPost({
+    userId: user_id || req.admin.id,
+    operation: String(operation || 'ajuste'),
+    key: idempotency_key ? String(idempotency_key) : `MANUAL-${req.admin.id}-${Date.now()}`,
     concept,
-    total_amount: totalAmount,
-    status,
-    requires_approval: requiresApproval,
-    created_by: req.user.id
-  }).select().single();
-  if (jErr) return res.status(500).json({ message: jErr.message });
+    reference,
+    lines: normalized,
+    requiresApproval: total >= LEDGER_APPROVAL_THRESHOLD,
+  });
+  if (!asiento.ok) return transferErrorResponse(res, asiento.code);
 
-  const entriesPayload = normalized.map((e) => ({ ...e, journal_id: journal.id }));
-  const { error: eErr } = await supabase.from('ledger_entries').insert(entriesPayload);
-  if (eErr) return res.status(500).json({ message: eErr.message });
-
-  if (requiresApproval) {
-    await supabase.from('ledger_approvals').upsert({
-      journal_id: journal.id,
-      requested_by: req.user.id,
-      status: 'pending'
-    }, { onConflict: 'journal_id' });
-  }
-
+  const { data: journal } = await supabase.from('ledger_journals')
+    .select('id, status, total_amount, requires_approval, posted_at')
+    .eq('id', asiento.journal_id)
+    .maybeSingle();
   res.status(201).json({
-    journal_id: journal.id,
-    status: journal.status,
-    requires_approval: journal.requires_approval,
-    total_amount: totalAmount
+    ...(journal || { id: asiento.journal_id }),
+    already_posted: asiento.already_posted === true,
   });
 });
 
-app.post('/api/wallet/ledger/journals/:id/approve', auth, async (req, res) => {
-  const id = req.params.id;
+// Devolver un asiento cerrado: asiento espejo, el original queda 'reversed' y
+// sigue visible. Solo administrador y con la segunda firma de otro administrador.
+app.post('/api/wallet/ledger/journals/:id/reverse', requireAdmin, async (req, res) => {
   const { reason } = req.body || {};
-  const { data: journal } = await supabase
-    .from('ledger_journals')
-    .select('*')
-    .eq('id', id)
-    .maybeSingle();
-  if (!journal) return res.status(404).json({ message: 'Asiento no encontrado' });
-  if (journal.status !== 'pending_approval') return res.status(400).json({ message: 'El asiento no está pendiente de aprobación' });
-  if (String(journal.created_by) === String(req.user.id)) {
-    return res.status(403).json({ message: 'Maker-checker activo: el creador no puede aprobar su propio asiento' });
-  }
-
-  const approvedAt = new Date().toISOString();
-  await supabase.from('ledger_journals').update({
-    status: 'posted',
-    approved_by: req.user.id,
-    approved_at: approvedAt
-  }).eq('id', id);
-
-  await supabase.from('ledger_approvals').upsert({
-    journal_id: id,
-    requested_by: journal.created_by,
-    approved_by: req.user.id,
-    status: 'approved',
-    reason: reason || null,
-    updated_at: approvedAt
-  }, { onConflict: 'journal_id' });
-
-  res.json({ message: 'Asiento aprobado y contabilizado', journal_id: id, approved_at: approvedAt });
+  if (!reason) return res.status(400).json({ message: 'reason es obligatorio en una reversión' });
+  const { data, error } = await supabase.rpc('ledger_reverse_journal', {
+    p_journal_id: req.params.id,
+    p_admin_id: req.admin.id,
+    p_reason: String(reason).slice(0, 200),
+  });
+  if (error) return res.status(400).json({ message: error.message, code: 'REVERSE_FAILED' });
+  res.json(data || { journal_id: req.params.id });
 });
 
-app.post('/api/wallet/ledger/journals/:id/reject', auth, async (req, res) => {
+// Cuadre monedero-libro: los monederos cuyo saldo no tiene asiento detrás.
+app.get('/api/wallet/ledger/reconciliation', requireAdmin, async (_req, res) => {
+  const { data, error } = await supabase.from('ledger_wallet_reconciliation_v')
+    .select('user_id, currency, wallet_balance, ledger_balance, drift')
+    .order('drift', { ascending: false })
+    .limit(500);
+  if (error) return res.status(500).json({ message: error.message });
+  const desfases = (data || []).filter((r) => Math.abs(Number(r.drift || 0)) >= 0.005);
+  res.json({ total: (data || []).length, con_desfase: desfases.length, filas: desfases.slice(0, 100) });
+});
+
+app.post('/api/wallet/ledger/journals/:id/approve', requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  const { reason } = req.body || {};
+
+  // La comprobación maker-checker y el cierre del asiento los hace la base de
+  // datos en ledger_approve_journal: desde aquí no se puede aprobar moviendo el
+  // saldo a mano.
+  const { data, error } = await supabase.rpc('ledger_approve_journal', {
+    p_journal_id: id,
+    p_admin_id: req.admin.id,
+    p_reason: reason ? String(reason).slice(0, 200) : null,
+  });
+  if (error) return res.status(400).json({ message: error.message, code: 'APPROVE_FAILED' });
+  if (data?.approved === false) {
+    return res.status(400).json({ message: 'El asiento no está pendiente de aprobación', status: data.status });
+  }
+  res.json({ message: 'Asiento aprobado y contabilizado', journal_id: id, status: data.status });
+});
+
+app.post('/api/wallet/ledger/journals/:id/reject', requireAdmin, async (req, res) => {
   const id = req.params.id;
   const { reason } = req.body || {};
   const { data: journal } = await supabase
@@ -3150,51 +3942,46 @@ app.post('/api/wallet/ledger/journals/:id/reject', auth, async (req, res) => {
     .maybeSingle();
   if (!journal) return res.status(404).json({ message: 'Asiento no encontrado' });
   if (journal.status !== 'pending_approval') return res.status(400).json({ message: 'El asiento no está pendiente de aprobación' });
-  if (String(journal.created_by) === String(req.user.id)) {
+  if (String(journal.created_by) === String(req.admin.id)) {
     return res.status(403).json({ message: 'Maker-checker activo: el creador no puede rechazar su propio asiento' });
   }
 
   const updatedAt = new Date().toISOString();
-  await supabase.from('ledger_journals').update({ status: 'rejected' }).eq('id', id);
+  // Rechazar no mueve dinero: el asiento nunca llegó a cerrarse, así que el
+  // disparador de aplicación no intervino. Las líneas quedan intactas y
+  // selladas como 'rejected' para que el intento quede auditable.
+  const { error } = await supabase.from('ledger_journals').update({
+    status: 'rejected',
+    approved_by: req.admin.id,
+    approved_at: updatedAt,
+  }).eq('id', id).eq('status', 'pending_approval');
   await supabase.from('ledger_approvals').upsert({
     journal_id: id,
     requested_by: journal.created_by,
-    approved_by: req.user.id,
+    approved_by: req.admin.id,
     status: 'rejected',
     reason: reason || 'Rechazado por validador',
-    updated_at: updatedAt
+    updated_at: updatedAt,
   }, { onConflict: 'journal_id' });
 
+  if (error) return res.status(500).json({ message: error.message });
   res.json({ message: 'Asiento rechazado', journal_id: id });
 });
 
-const ensureUserCashAccount = async (userId) => {
-  const code = `USR-CASH-${String(userId).slice(0, 8)}`;
-  let { data: acc } = await supabase.from('ledger_accounts').select('*').eq('code', code).maybeSingle();
-  if (!acc) {
-    const { data } = await supabase.from('ledger_accounts').insert({
-      user_id: userId,
-      code,
-      name: 'Caja Usuario EGCHAT',
-      account_type: 'asset',
-      currency: 'XAF',
-      is_system: false,
-      is_active: true
-    }).select().single();
-    acc = data;
-  }
-  return acc;
-};
+// Anuncio y exigencia son los mismos numeros: una llamada directa no pasa por la pantalla.
+const CEMAC_MIN_AMOUNT = 1000;
+const CEMAC_MAX_AMOUNT = 1000000;
 
 app.get('/api/cemac/rates', auth, async (_req, res) => {
   try {
+    const comision = await readTariff('cemac', 'fee');
     res.json({
       base: 'XAF',
       countries: ['GQ', 'CM', 'GA', 'CG', 'TD', 'CF'],
-      transfer_fee_flat: 750,
+      transfer_fee_flat: comision ? Number(comision.amount) : null,
       sandbox: true,
-      max_amount: 1000000,
-      min_amount: 1000
+      max_amount: CEMAC_MAX_AMOUNT,
+      min_amount: CEMAC_MIN_AMOUNT
     });
   } catch (error) {
     console.error('CEMAC rates error:', error);
@@ -3202,15 +3989,7 @@ app.get('/api/cemac/rates', auth, async (_req, res) => {
   }
 });
 
-const taxiFallbackStore = new Map();
-const cemacFallbackStore = new Map();
-const getUserStore = (store, userId) => {
-  const key = String(userId);
-  if (!store.has(key)) store.set(key, []);
-  return store.get(key);
-};
-
-app.post('/api/cemac/transfers', auth, async (req, res) => {
+app.post('/api/cemac/transfers', auth, walletLimiter, async (req, res) => {
   try {
     const { from_country, to_country, beneficiary_name, beneficiary_account, amount, external_id } = req.body || {};
     
@@ -3224,119 +4003,84 @@ app.post('/api/cemac/transfers', auth, async (req, res) => {
     if (!validCountries.includes(from_country) || !validCountries.includes(to_country)) {
       return res.status(400).json({ message: 'Paises no soportados', code: 'INVALID_COUNTRY' });
     }
+
+    const importeCemac = Number(amount);
+    if (!Number.isFinite(importeCemac) || importeCemac < CEMAC_MIN_AMOUNT || importeCemac > CEMAC_MAX_AMOUNT) {
+      return res.status(400).json({
+        message: `El importe debe estar entre ${CEMAC_MIN_AMOUNT} y ${CEMAC_MAX_AMOUNT.toLocaleString('es-ES')} XAF`,
+        code: 'AMOUNT_OUT_OF_RANGE',
+      });
+    }
     
-    // Verificar transferencia existente con fallback
+    // Reintentar el mismo pedido devuelve la transferencia ya creada.
     if (external_id) {
-      try {
-        const { data: existing } = await supabase.from('cemac_transfers').select('*').eq('transfer_ref', external_id).eq('user_id', req.user.id).maybeSingle();
-        if (existing) return res.json({ transfer: existing, idempotent: true });
-      } catch (checkError) {
-        console.warn('Existing transfer check failed:', checkError.message);
-      }
+      const { data: existing } = await supabase.from('cemac_transfers')
+        .select('*').eq('transfer_ref', external_id).eq('user_id', req.user.id).maybeSingle();
+      if (existing) return res.json({ transfer: existing, idempotent: true });
     }
 
-    const fee = 750;
-    const total = Number(amount) + fee;
-    
-    // Debitar wallet con fallback
-    let deb = { ok: false, balance: 0, message: 'Error wallet' };
-    try {
-      deb = await debitWalletWithTx(req.user.id, total, 'EGCHAT', `CEMAC-${to_country}-${beneficiary_account}`, 'cemac_transfer');
-    } catch (walletError) {
-      console.warn('Wallet debit failed:', walletError.message);
-    }
-    
-    if (!deb.ok) {
-      return res.status(400).json({ message: deb.message || 'Saldo insuficiente', code: 'INSUFFICIENT_BALANCE' });
-    }
-
+    const comision = await readTariff('cemac', 'fee');
+    if (!comision) return res.status(502).json({ message: 'Comision CEMAC no disponible', code: 'TARIFF_UNAVAILABLE' });
+    const fee = Number(comision.amount);
+    const total = roundAmount(Number(amount) + fee);
     const transferRef = external_id || safeRef('CEMAC');
-    let transfer = null;
-    
-    // Insert con manejo de columnas y fallback
-    try {
-      const insertData = {
-        transfer_ref: transferRef,
-        user_id: req.user.id,
-        from_country,
-        to_country,
-        beneficiary_name,
-        beneficiary_account,
-        amount: Number(amount),
-        fee,
-        status: 'processing',
-        metadata: { sandbox: true },
-        created_by: req.user.id
-      };
-      
-      const { data } = await supabase.from('cemac_transfers').insert(insertData).select().single();
-      transfer = data;
-    } catch (insertError) {
-      console.warn('CEMAC transfer insert failed, using fallback:', insertError.message);
-      
-      // Fallback a memoria local
-      const fallbackTransfer = {
-        id: transferRef,
-        transfer_ref: transferRef,
-        user_id: req.user.id,
-        from_country,
-        to_country,
-        beneficiary_name,
-        beneficiary_account,
-        amount: Number(amount),
-        fee,
-        status: 'processing',
-        metadata: { sandbox: true },
-        created_at: new Date().toISOString(),
-        created_by: req.user.id
-      };
-      getUserStore(cemacFallbackStore, req.user.id).push(fallbackTransfer);
-      transfer = fallbackTransfer;
+
+    // Sin fila no hay cargo: antes el dinero salia del monedero aunque la
+    // transferencia solo existiera en la memoria del proceso.
+    const { data: transfer, error: insertError } = await supabase.from('cemac_transfers').insert({
+      transfer_ref: transferRef,
+      user_id: req.user.id,
+      from_country,
+      to_country,
+      beneficiary_name,
+      beneficiary_account,
+      amount: Number(amount),
+      fee,
+      status: 'processing',
+      metadata: { sandbox: true },
+      created_by: req.user.id
+    }).select().single();
+    if (insertError || !transfer) {
+      console.error('CEMAC transfer insert:', insertError?.message);
+      return res.status(502).json({ message: 'No se pudo registrar la transferencia', code: 'TRANSFER_NOT_SAVED' });
     }
 
-    // Ledger con fallback
-    let journalId = null;
-    try {
-      await ensureSystemLedgerAccounts();
-      const userCash = await ensureUserCashAccount(req.user.id);
-      const { data: suspense } = await supabase.from('ledger_accounts').select('*').eq('code', 'SYS-SUSPENSE').single();
-      
-      if (suspense?.id && userCash?.id) {
-        const { data: journal } = await supabase.from('ledger_journals').insert({
-          user_id: req.user.id,
-          reference: `CEMAC:${transferRef}`,
-          concept: `Transferencia CEMAC ${from_country}->${to_country}`,
-          total_amount: Number(amount),
-          status: 'posted',
-          requires_approval: false,
-          created_by: req.user.id
-        }).select().single();
-        
-        journalId = journal?.id || null;
-        
-        if (journalId) {
-          try {
-            await supabase.from('ledger_entries').insert([
-              { journal_id: journal.id, account_id: suspense.id, entry_type: 'debit', amount: Number(amount), currency: 'XAF', memo: 'Salida CEMAC' },
-              { journal_id: journal.id, account_id: userCash.id, entry_type: 'credit', amount: Number(amount), currency: 'XAF', memo: 'Debito usuario CEMAC' }
-            ]);
-          } catch (entriesError) {
-            console.warn('Ledger entries failed:', entriesError.message);
-          }
-        }
-      }
-    } catch (ledgerError) {
-      console.warn('Ledger creation failed:', ledgerError.message);
+    // El cargo se asienta después de crear la transferencia y con su referencia
+    // como clave de idempotencia: repetir el mismo pedido devuelve el asiento ya
+    // hecho en lugar de volver a cobrar. La comisión se reconoce como ingreso
+    // del operador y solo lo enviado al beneficiario queda obligado en la cuenta
+    // puente; antes se debitaba el total y se asentaba solo el importe.
+    const asiento = await ledgerPost({
+      userId: req.user.id,
+      operation: 'pago_servicio',
+      key: `CEMAC-${transferRef}`,
+      concept: `Transferencia CEMAC ${from_country}->${to_country} a ${beneficiary_name}`,
+      reference: `CEMAC:${transferRef}`,
+      lines: [
+        { wallet_user_id: req.user.id, entry_type: 'debit', amount: total },
+        { account: 'SYS-SUSPENSE', entry_type: 'credit', amount: roundAmount(Number(amount)) },
+        { account: 'SYS-FEES', entry_type: 'credit', amount: fee },
+      ],
+    });
+    if (!asiento.ok) {
+      await supabase.from('cemac_transfers').update({ status: 'failed' }).eq('transfer_ref', transferRef);
+      return transferErrorResponse(res, asiento.code);
     }
+    const journalId = asiento.journal_id;
+    await supabase.from('cemac_transfers').update({ journal_id: journalId }).eq('id', transfer.id);
+    await supabase.from('transactions').insert({
+      user_id: req.user.id,
+      type: 'cemac_transfer',
+      amount: total,
+      method: 'EGCHAT',
+      reference: `CEMAC:${transferRef}`,
+      status: 'completed',
+      ledger_journal_id: journalId,
+    });
     
-    // Audit logging con fallback
-    try {
-      await logAudit(req.user.id, 'cemac_transfer_create', 'cemac', transfer?.id || transferRef, { transfer_ref: transferRef, amount: Number(amount), fee });
-    } catch (auditError) {
-      console.warn('Audit logging failed:', auditError.message);
-    }
+    await logAudit(req.user.id, 'cemac_transfer_create', 'cemac', transfer.id, { transfer_ref: transferRef, amount: Number(amount), fee });
 
-    res.status(201).json({ transfer, ledger_journal_id: journalId, balance: deb.balance });
+    res.status(201).json({ transfer, ledger_journal_id: journalId, balance: await readWalletBalance(req.user.id) });
   } catch (e) {
     console.error('CEMAC transfer error:', e);
     res.status(500).json({ message: e?.message || 'Error interno', code: 'INTERNAL_ERROR' });
@@ -3345,31 +4089,11 @@ app.post('/api/cemac/transfers', auth, async (req, res) => {
 
 app.get('/api/cemac/transfers', auth, async (req, res) => {
   try {
-    let transfers = [];
-    
-    // Intentar obtener de Supabase
-    try {
-      const { data } = await supabase.from('cemac_transfers')
-        .select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
-      transfers = data || [];
-    } catch (dbError) {
-      console.warn('CEMAC transfers query failed, using fallback:', dbError.message);
-    }
-    
-    // Combinar con fallback store
-    const fallbackTransfers = getUserStore(cemacFallbackStore, req.user.id);
-    const combined = [...transfers, ...fallbackTransfers];
-    
-    // Eliminar duplicados por transfer_ref y ordenar
-    const uniqueTransfers = combined.filter((transfer, index, self) => 
-      index === self.findIndex(t => t.transfer_ref === transfer.transfer_ref)
-    );
-    
-    uniqueTransfers.sort((a, b) => 
-      new Date(b.created_at || 0) - new Date(a.created_at || 0)
-    );
-    
-    res.json(uniqueTransfers);
+    const { data: transfers, error } = await supabase.from('cemac_transfers')
+      .select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
+    if (error) return res.status(502).json({ message: 'No se pudieron listar las transferencias', code: 'TRANSFERS_UNAVAILABLE' });
+
+    res.json(transfers || []);
   } catch (e) {
     console.error('CEMAC transfers error:', e);
     res.status(500).json({ message: e?.message || 'Error interno', code: 'INTERNAL_ERROR' });
@@ -3377,43 +4101,1127 @@ app.get('/api/cemac/transfers', auth, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
-// LIA-25
+// LIA-25 — asistente de EGCHAT
+// Responde con datos reales de la app (saldo, movimientos, noticias,
+// tiempo, salud, supermercados, taxi, transferencias). Si el servidor
+// tiene GROQ_API_KEY u OPENAI_API_KEY, usa el modelo para preguntas
+// abiertas; si no, responde con el motor de intenciones.
 // ════════════════════════════════════════════════════════════════════
+const LIA_LANGS = ['es', 'fr', 'en', 'pt'];
+const LIA_LANG_NAMES = { es: 'español', fr: 'francés', en: 'inglés', pt: 'portugués' };
+
+const liaNorm = (value) => String(value || '')
+  .toLowerCase()
+  .normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '');
+
+const liaMoney = (amount) => `${String(Math.round(Number(amount) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ')} XAF`;
+
+const liaFill = (template, vars) =>
+  String(template).replace(/\{(\w+)\}/g, (_match, key) => (vars[key] === undefined ? '' : vars[key]));
+
+const LIA_COPY = {
+  es: {
+    emptyMessage: 'Escribe un mensaje para Lia-25.',
+    tooLong: 'El mensaje es demasiado largo (máximo 2000 caracteres).',
+    greeting: '¡Hola! Soy Lia-25, tu asistente de EGCHAT. Puedo consultar tu saldo y tus movimientos, darte las noticias y el tiempo, buscar hospitales, farmacias y supermercados, y guiarte para pedir un taxi o enviar dinero. ¿Qué necesitas?',
+    balance: 'Tu saldo actual es *{balance}*.',
+    balanceWithMovements: 'Tu saldo actual es *{balance}*.\n\nTus últimos movimientos:\n{movements}',
+    movementsTitle: 'Tus últimos movimientos:\n{movements}',
+    noMovements: 'Todavía no tienes movimientos registrados. Puedes recargar desde Cartera → Recargar.',
+    newsTitle: 'Noticias de hoy:\n{list}',
+    noNews: 'Ahora mismo no hay noticias publicadas. Vuelve a mirar más tarde.',
+    weather: 'El tiempo en {city}: {temp} °C, {desc}. Viento de {wind} km/h y humedad del {humidity} %.',
+    weatherError: 'No he podido consultar el tiempo ahora mismo. Inténtalo de nuevo en un minuto.',
+    healthTitle: 'Centros de salud y farmacias:\n{list}',
+    marketTitle: 'Supermercados disponibles:\n{list}',
+    atmTitle: 'Cajeros disponibles:\n{list}',
+    ratesTitle: 'Tipo de cambio:\n{list}',
+    card: 'Puedes ver y gestionar tus tarjetas en Cartera → Tarjetas. Si pierdes una, bloquéala ahí mismo al instante.',
+    bank: 'Consulta las entidades y cajeros disponibles en Servicios → Bancos.',
+    closed: 'cerrado',
+    taxi: 'Para pedir un taxi abre MiTaxi, indica el origen y el destino y confirma.\nTarifas: moto 800 XAF, básico 1 500 XAF, premium 3 500 XAF.',
+    transfer: 'Para enviar dinero entra en Cartera → Enviar; para retirar, Cartera → Retirar; para recargar, Cartera → Recargar.\nSi quieres, antes te digo tu saldo.',
+    thanks: '¡De nada! Estoy aquí para lo que necesites.',
+    help: 'Puedo hacer esto por ti:\n• Consultar tu saldo y tus últimos movimientos.\n• Darte las noticias del día y el tiempo de tu ciudad.\n• Buscar hospitales, farmacias y supermercados.\n• Explicarte cómo pedir un taxi o enviar dinero.\nEscríbemelo o usa los botones de abajo.',
+    unknown: 'No estoy seguro de haberte entendido. Prueba con: "mi saldo", "últimos movimientos", "noticias", "el tiempo", "taxi" o "hospitales".',
+    serviceError: 'No he podido obtener esa información ahora mismo. Inténtalo de nuevo en unos segundos.',
+    movementTypes: { deposit: 'Recarga', withdraw: 'Retiro', transfer: 'Transferencia', transfer_sent: 'Envío', transfer_received: 'Recibido', shopping_payment: 'Compra', payment: 'Pago', refund: 'Reembolso', default: 'Movimiento' },
+  },
+  fr: {
+    emptyMessage: 'Écrivez un message à Lia-25.',
+    tooLong: 'Le message est trop long (2000 caractères maximum).',
+    greeting: 'Bonjour ! Je suis Lia-25, votre assistante EGCHAT. Je peux consulter votre solde et vos transactions, vous donner les actualités et la météo, chercher des hôpitaux, pharmacies et supermarchés, et vous guider pour commander un taxi ou envoyer de l\'argent. Que puis-je faire ?',
+    balance: 'Votre solde actuel est de *{balance}*.',
+    balanceWithMovements: 'Votre solde actuel est de *{balance}*.\n\nVos dernières transactions :\n{movements}',
+    movementsTitle: 'Vos dernières transactions :\n{movements}',
+    noMovements: 'Vous n\'avez pas encore de transactions. Vous pouvez recharger depuis Portefeuille → Recharger.',
+    newsTitle: 'Actualités du jour :\n{list}',
+    noNews: 'Aucune actualité publiée pour le moment. Revenez plus tard.',
+    weather: 'Météo à {city} : {temp} °C, {desc}. Vent de {wind} km/h et humidité de {humidity} %.',
+    weatherError: 'Impossible de consulter la météo pour le moment. Réessayez dans une minute.',
+    healthTitle: 'Centres de santé et pharmacies :\n{list}',
+    marketTitle: 'Supermarchés disponibles :\n{list}',
+    atmTitle: 'Distributeurs disponibles :\n{list}',
+    ratesTitle: 'Taux de change :\n{list}',
+    card: 'Vous pouvez consulter et gérer vos cartes dans Portefeuille → Cartes. En cas de perte, bloquez-la immédiatement depuis cet écran.',
+    bank: 'Consultez les banques et distributeurs disponibles dans Services → Banques.',
+    closed: 'fermé',
+    taxi: 'Pour commander un taxi, ouvrez MiTaxi, indiquez le départ et la destination puis confirmez.\nTarifs : moto 800 XAF, basique 1 500 XAF, premium 3 500 XAF.',
+    transfer: 'Pour envoyer de l\'argent, allez dans Portefeuille → Envoyer ; pour retirer, Portefeuille → Retirer ; pour recharger, Portefeuille → Recharger.\nJe peux d\'abord vous indiquer votre solde.',
+    thanks: 'Avec plaisir ! Je suis là pour vous aider.',
+    help: 'Voici ce que je peux faire :\n• Consulter votre solde et vos dernières transactions.\n• Donner les actualités du jour et la météo de votre ville.\n• Chercher des hôpitaux, pharmacies et supermarchés.\n• Vous expliquer comment commander un taxi ou envoyer de l\'argent.\nÉcrivez-moi ou utilisez les boutons ci-dessous.',
+    unknown: 'Je ne suis pas sûr de comprendre. Essayez : « mon solde », « dernières transactions », « actualités », « météo », « taxi » ou « hôpitaux ».',
+    serviceError: 'Je n\'ai pas pu obtenir cette information. Réessayez dans quelques secondes.',
+    movementTypes: { deposit: 'Rechargement', withdraw: 'Retrait', transfer: 'Transfert', transfer_sent: 'Envoi', transfer_received: 'Reçu', shopping_payment: 'Achat', payment: 'Paiement', refund: 'Remboursement', default: 'Mouvement' },
+  },
+  en: {
+    emptyMessage: 'Write a message to Lia-25.',
+    tooLong: 'The message is too long (2000 characters maximum).',
+    greeting: 'Hi! I am Lia-25, your EGCHAT assistant. I can check your balance and transactions, give you today\'s news and weather, find hospitals, pharmacies and supermarkets, and guide you to request a taxi or send money. What do you need?',
+    balance: 'Your current balance is *{balance}*.',
+    balanceWithMovements: 'Your current balance is *{balance}*.\n\nYour latest transactions:\n{movements}',
+    movementsTitle: 'Your latest transactions:\n{movements}',
+    noMovements: 'You have no transactions yet. You can top up from Wallet → Top up.',
+    newsTitle: 'Today\'s news:\n{list}',
+    noNews: 'There is no news published right now. Check again later.',
+    weather: 'Weather in {city}: {temp} °C, {desc}. Wind {wind} km/h, humidity {humidity}%.',
+    weatherError: 'I could not check the weather right now. Please try again in a minute.',
+    healthTitle: 'Health centers and pharmacies:\n{list}',
+    marketTitle: 'Available supermarkets:\n{list}',
+    atmTitle: 'Available ATMs:\n{list}',
+    ratesTitle: 'Exchange rates:\n{list}',
+    card: 'You can view and manage your cards in Wallet → Cards. If a card is lost, block it there right away.',
+    bank: 'Check available banks and ATMs in Services → Banks.',
+    closed: 'closed',
+    taxi: 'To request a taxi, open MiTaxi, set your pickup and destination, then confirm.\nFares: moto 800 XAF, basic 1 500 XAF, premium 3 500 XAF.',
+    transfer: 'To send money go to Wallet → Send; to withdraw, Wallet → Withdraw; to top up, Wallet → Top up.\nI can tell you your balance first.',
+    thanks: 'You are welcome! I am here to help.',
+    help: 'Here is what I can do:\n• Check your balance and latest transactions.\n• Give you today\'s news and your city\'s weather.\n• Find hospitals, pharmacies and supermarkets.\n• Guide you to request a taxi or send money.\nType it or use the buttons below.',
+    unknown: 'I am not sure I understood. Try: "my balance", "latest transactions", "news", "weather", "taxi" or "hospitals".',
+    serviceError: 'I could not get that information right now. Please try again in a few seconds.',
+    movementTypes: { deposit: 'Top-up', withdraw: 'Withdrawal', transfer: 'Transfer', transfer_sent: 'Sent', transfer_received: 'Received', shopping_payment: 'Purchase', payment: 'Payment', refund: 'Refund', default: 'Transaction' },
+  },
+  pt: {
+    emptyMessage: 'Escreva uma mensagem para a Lia-25.',
+    tooLong: 'A mensagem é demasiado longa (máximo 2000 caracteres).',
+    greeting: 'Olá! Sou a Lia-25, a sua assistente EGCHAT. Posso consultar o seu saldo e as suas transações, dar as notícias e o tempo, procurar hospitais, farmácias e supermercados, e orientá-lo para pedir um táxi ou enviar dinheiro. O que precisa?',
+    balance: 'O seu saldo atual é *{balance}*.',
+    balanceWithMovements: 'O seu saldo atual é *{balance}*.\n\nÚltimas transações:\n{movements}',
+    movementsTitle: 'Últimas transações:\n{movements}',
+    noMovements: 'Ainda não tem transações. Pode recarregar em Carteira → Recarregar.',
+    newsTitle: 'Notícias de hoje:\n{list}',
+    noNews: 'Não há notícias publicadas neste momento. Volte mais tarde.',
+    weather: 'Tempo em {city}: {temp} °C, {desc}. Vento de {wind} km/h e humidade de {humidity} %.',
+    weatherError: 'Não consegui consultar o tempo agora. Tente novamente num minuto.',
+    healthTitle: 'Centros de saúde e farmácias:\n{list}',
+    marketTitle: 'Supermercados disponíveis:\n{list}',
+    atmTitle: 'Caixas automáticos disponíveis:\n{list}',
+    ratesTitle: 'Taxas de câmbio:\n{list}',
+    card: 'Pode ver e gerir os seus cartões em Carteira → Cartões. Se perder um cartão, bloqueie-o de imediato nesse ecrã.',
+    bank: 'Consulte os bancos e caixas automáticos disponíveis em Serviços → Bancos.',
+    closed: 'fechado',
+    taxi: 'Para pedir um táxi, abra o MiTaxi, indique a origem e o destino e confirme.\nTarifas: moto 800 XAF, básico 1 500 XAF, premium 3 500 XAF.',
+    transfer: 'Para enviar dinheiro vá a Carteira → Enviar; para levantar, Carteira → Levantar; para recarregar, Carteira → Recarregar.\nPosso dizer-lhe primeiro o seu saldo.',
+    thanks: 'De nada! Estou aqui para ajudar.',
+    help: 'Posso fazer isto por si:\n• Consultar o saldo e as últimas transações.\n• Dar as notícias do dia e o tempo da sua cidade.\n• Procurar hospitais, farmácias e supermercados.\n• Explicar como pedir um táxi ou enviar dinheiro.\nEscreva ou use os botões abaixo.',
+    unknown: 'Não tenho a certeza de ter entendido. Tente: "o meu saldo", "últimas transações", "notícias", "tempo", "táxi" ou "hospitais".',
+    serviceError: 'Não consegui obter essa informação agora. Tente novamente em alguns segundos.',
+    movementTypes: { deposit: 'Recarregamento', withdraw: 'Levantamento', transfer: 'Transferência', transfer_sent: 'Envio', transfer_received: 'Recebido', shopping_payment: 'Compra', payment: 'Pagamento', refund: 'Reembolso', default: 'Movimento' },
+  },
+};
+
+const LIA_INTENTS = [
+  ['activity', ['actividad', 'movimiento', 'movimientos', 'transaccion', 'transacciones', 'resumen', 'historico', 'extracto', 'transaction', 'transactions', 'activity', 'summary', 'historique', 'activite', 'atividade', 'movimentos', 'resumo']],
+  ['balance', ['saldo', 'balance', 'solde', 'sald', 'dinero', 'cuanto tengo', 'cuanto dinero', 'tengo en la cuenta', 'cartera', 'wallet', 'argent', 'money', 'dinheiro', 'carteira', 'portefeuille', 'efectivo', 'cash']],
+  ['news', ['noticia', 'noticias', 'actualidad', 'actualite', 'actualites', 'news', 'novidade', 'novidades', 'partido', 'futbol', 'deporte', 'deportes', 'match', 'football', 'esporte', 'esportes', 'jogo']],
+  ['weather', ['tiempo', 'clima', 'meteo', 'weather', 'tempo', 'temps', 'lluvia', 'chuva', 'pluie', 'rain', 'temperatura', 'climat']],
+  ['health', ['salud', 'hospital', 'hospitales', 'hopital', 'hopitaux', 'medico', 'doctor', 'clinica', 'urgencias', 'farmacia', 'farmacias', 'sante', 'health', 'saude', 'pharmacie', 'pharmacy', 'medical']],
+  ['markets', ['supermercado', 'supermercados', 'supermarche', 'mercado', 'mercados', 'market', 'compra', 'compras', 'achat', 'shopping', 'supermarket']],
+  ['atm', ['cajero', 'cajeros', 'atm', 'distributeur', 'cash machine', 'caixa automatico', 'multibanco']],
+  ['rates', ['tipo de cambio', 'cotizacion', 'exchange rate', 'exchange', 'taux de change', 'taxa de cambio', 'divisa', 'divisas', 'currency', 'moeda estrangeira', 'moneda', 'cuanto esta', 'cuanto estan', 'cuanto vale', 'cuanto valen', 'how much is', 'how much are', 'a cuanto', 'conversion', 'euro', 'dolar', 'dollar', 'pound', 'libra', 'franco', 'yuan', 'xaf', 'xof', 'fcfa']],
+  ['card', ['tarjeta', 'tarjetas', 'card', 'cards', 'carte', 'cartes', 'cartao', 'cartoes']],
+  ['banks', ['banco', 'bancos', 'bank', 'banque', 'sucursal', 'agence']],
+  ['taxi', ['taxi', 'carrera', 'ride', 'course', 'corrida']],
+  ['transfer', ['transferir', 'transferencia', 'enviar', 'envoyer', 'send', 'transfer', 'recargar', 'recargo', 'recharger', 'recarregar', 'recharge', 'recarga', 'top up', 'topup', 'deposito', 'deposit', 'retirar', 'retrait', 'withdraw', 'pagar', 'payer', 'pay', 'pagamento', 'factura', 'facture', 'invoice', 'fatura']],
+  ['thanks', ['gracias', 'merci', 'thanks', 'thank', 'obrigado', 'obrigada', 'valeu']],
+  ['help', ['ayuda', 'ayudame', 'help', 'aide', 'ajuda', 'capacidades', 'funciones', 'que puedes', 'que sabes', 'quien eres', 'que eres', 'como te llamas', 'tu nombre', 'who are you', 'what can you', 'what do you do', 'how can you help', 'qui es tu', 'qui etes vous', 'quem es tu', 'quem e voce', 'que podes fazer', 'o que voce faz', 'o que fazes']],
+  ['greeting', ['hola', 'buenas', 'buenos dias', 'buenas tardes', 'bonjour', 'salut', 'hello', 'hey', 'ola', 'bom dia', 'boa tarde', 'boa noite']],
+];
+
+// Frases completas que deben ganar a las palabras sueltas de otras intenciones
+// ("enviar dinero" contiene "dinero", que por sí sola es de saldo).
+const LIA_PRIORITY_INTENTS = [
+  ['transfer', ['send money', 'i want to send', 'i need to send', 'transfer money', 'withdraw money', 'enviar dinero', 'enviar plata', 'enviar dinheiro', 'hacer una transferencia', 'transferir dinero', 'retirar dinero', 'retirar dinheiro', 'levantar dinheiro', 'envoyer de l argent', 'faire un virement', 'je veux envoyer']],
+];
+
+// Operaciones sencillas que se responden localmente, sin pasar por la IA:
+// así una pregunta matemática nunca arrastra el tema anterior.
+const LIA_MATH_NUMBERS = {
+  cero: 0, zero: 0,
+  un: 1, uno: 1, una: 1, une: 1, one: 1, um: 1, uma: 1,
+  dos: 2, deux: 2, dois: 2, duas: 2, two: 2,
+  tres: 3, trois: 3, three: 3,
+  cuatro: 4, quatre: 4, quatro: 4, four: 4,
+  cinco: 5, cinq: 5, five: 5,
+  seis: 6, six: 6,
+  siete: 7, sept: 7, seven: 7, sete: 7,
+  ocho: 8, huit: 8, eight: 8, oito: 8,
+  nueve: 9, neuf: 9, nine: 9, nove: 9,
+  diez: 10, dix: 10, ten: 10, dez: 10,
+  once: 11, onze: 11, eleven: 11,
+  doce: 12, douze: 12, twelve: 12, doze: 12,
+  trece: 13, treize: 13, thirteen: 13, treze: 13,
+  catorce: 14, quatorze: 14, fourteen: 14, catorze: 14,
+  quince: 15, quinze: 15, fifteen: 15,
+  dieciseis: 16, seize: 16, sixteen: 16, dezesseis: 16,
+  diecisiete: 17, dixsept: 17, seventeen: 17, dezessete: 17,
+  dieciocho: 18, dixhuit: 18, eighteen: 18, dezoito: 18,
+  diecinueve: 19, dixneuf: 19, nineteen: 19, dezenove: 19,
+  veinte: 20, vingt: 20, twenty: 20, vinte: 20,
+  veintiuno: 21, veintiun: 21, veintiuna: 21, veintidos: 22, veintitres: 23,
+  veinticuatro: 24, veinticinco: 25, veintiseis: 26, veintisiete: 27,
+  veintiocho: 28, veintinueve: 29,
+  treinta: 30, trente: 30, thirty: 30, trinta: 30,
+  cuarenta: 40, quarante: 40, forty: 40, quarenta: 40,
+  cincuenta: 50, cinquante: 50, fifty: 50, cinquenta: 50,
+  sesenta: 60, soixante: 60, sixty: 60, sessenta: 60,
+  setenta: 70, seventy: 70,
+  ochenta: 80, eighty: 80, oitenta: 80,
+  noventa: 90, ninety: 90,
+  cien: 100, ciento: 100, cent: 100, cem: 100, cento: 100, hundred: 100,
+  mil: 1000, mille: 1000, thousand: 1000,
+};
+
+const LIA_MATH_COPY = {
+  es: { divideByZero: 'No se puede dividir entre cero.' },
+  fr: { divideByZero: 'La division par zéro est impossible.' },
+  en: { divideByZero: 'Division by zero is not possible.' },
+  pt: { divideByZero: 'Não é possível dividir por zero.' },
+};
+
+const liaDetectMath = (message) => {
+  const raw = liaNorm(message).replace(/[^a-z0-9+\-*/()., x×]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!raw) return null;
+  let expr = ` ${raw} `;
+  Object.entries(LIA_MATH_NUMBERS)
+    .sort((a, b) => b[0].length - a[0].length)
+    .forEach(([word, value]) => {
+      expr = expr.replace(new RegExp(`\\b${word}\\b`, 'g'), ` ${value} `);
+    });
+  expr = expr
+    .replace(/\b(plus|mas|mais|sumado a|additionne|ajouter)\b/g, ' + ')
+    .replace(/\b(menos|moins|minus|sustraido|retirer)\b/g, ' - ')
+    .replace(/\b(por|fois|times|multiplie|vezes)\b/g, ' * ')
+    .replace(/\b(entre|divise|divided by|dividido por|dividir)\b/g, ' / ')
+    .replace(/(\d)\s*[x×]\s*(\d)/g, '$1 * $2')
+    .replace(/(\d),(\d)/g, '$1.$2');
+  const match = expr.match(/(\d+(?:\.\d+)?)\s*([+\-*/])\s*(\d+(?:\.\d+)?)/);
+  if (!match) return null;
+  const asksResult = /(cuanto|cuanta|combien|how much|how many|quanto|quantos|resultado|resuelve|resolve|calcula|calcule|calculate|solve|compute)/.test(raw);
+  if (!asksResult && !/^\d/.test(raw)) return null;
+  return { a: Number(match[1]), op: match[2], b: Number(match[3]) };
+};
+
+const liaMathReply = (message, lang) => {
+  const parsed = liaDetectMath(message);
+  if (!parsed) return null;
+  const { a, op, b } = parsed;
+  if (op === '/' && b === 0) return LIA_MATH_COPY[lang].divideByZero;
+  const result = op === '+' ? a + b : op === '-' ? a - b : op === '*' ? a * b : a / b;
+  const rounded = Math.round(result * 1e6) / 1e6;
+  const symbol = op === '*' ? '×' : op === '/' ? '÷' : op;
+  const fmt = (value) => (lang === 'en' ? String(value) : String(value).replace('.', ','));
+  return `${fmt(a)} ${symbol} ${fmt(b)} = ${fmt(rounded)}`;
+};
+
+const liaDetectIntent = (message) => {
+  if (liaDetectMath(message)) return 'math';
+  const norm = ` ${liaNorm(message).replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()} `;
+  for (const [intent, phrases] of LIA_PRIORITY_INTENTS) {
+    if (phrases.some((phrase) => norm.includes(phrase))) return intent;
+  }
+  for (const [intent, words] of LIA_INTENTS) {
+    if (words.some((word) => (word.length > 3 ? norm.includes(word) : norm.includes(` ${word} `)))) {
+      return intent;
+    }
+  }
+  return 'unknown';
+};
+
+const LIA_WEATHER_DESC = {
+  clear: { es: 'cielo despejado', fr: 'ciel dégagé', en: 'clear sky', pt: 'céu limpo' },
+  partly: { es: 'parcialmente nublado', fr: 'partiellement nuageux', en: 'partly cloudy', pt: 'parcialmente nublado' },
+  cloudy: { es: 'nublado', fr: 'nuageux', en: 'cloudy', pt: 'nublado' },
+  fog: { es: 'niebla', fr: 'brouillard', en: 'fog', pt: 'nevoeiro' },
+  drizzle: { es: 'llovizna', fr: 'bruine', en: 'drizzle', pt: 'chuvisco' },
+  rain: { es: 'lluvia', fr: 'pluie', en: 'rain', pt: 'chuva' },
+  snow: { es: 'nieve', fr: 'neige', en: 'snow', pt: 'neve' },
+  showers: { es: 'chubascos', fr: 'averses', en: 'showers', pt: 'aguaceiros' },
+  storm: { es: 'tormenta', fr: 'orage', en: 'thunderstorm', pt: 'trovoada' },
+};
+
+const liaWeatherKey = (code) => {
+  const c = Number(code);
+  if (c === 0) return 'clear';
+  if (c <= 2) return 'partly';
+  if (c === 3) return 'cloudy';
+  if (c <= 48) return 'fog';
+  if (c <= 55) return 'drizzle';
+  if (c <= 65) return 'rain';
+  if (c <= 77) return 'snow';
+  if (c <= 82) return 'showers';
+  return 'storm';
+};
+
+const LIA_CITIES = [
+  { name: 'Malabo', lat: 3.75, lon: 8.78 },
+  { name: 'Bata', lat: 1.86, lon: 9.77 },
+  { name: 'Mongomo', lat: 1.63, lon: 11.31 },
+  { name: 'Ebebiyín', lat: 2.15, lon: 11.32 },
+  { name: 'Annobón', lat: -1.44, lon: 5.63 },
+];
+
+const LIA_ATMS = [
+  { bank: 'BANGE', addr: 'Av. de la Independencia 12, Malabo', fee: '500 XAF' },
+  { bank: 'CCEI Bank', addr: 'Centro Comercial Malabo', fee: '0 XAF' },
+  { bank: 'BGFI Bank', addr: 'Calle Rey Malabo 45', fee: '750 XAF' },
+  { bank: 'Ecobank', addr: 'Aeropuerto Internacional de Malabo', fee: '1 000 XAF' },
+];
+
+const LIA_RATES = { EUR: 0.001524, USD: 0.001648, GBP: 0.001302, CHF: 0.001489, CNY: 0.011920 };
+
+const liaPickCity = (message, city) => {
+  const norm = liaNorm(message);
+  const fromMessage = LIA_CITIES.find((item) => norm.includes(liaNorm(item.name)));
+  if (fromMessage) return fromMessage;
+  const fromProfile = city && LIA_CITIES.find((item) => liaNorm(item.name) === liaNorm(city));
+  return fromProfile || LIA_CITIES[0];
+};
+
+const liaProvider = () => {
+  if (process.env.GROQ_API_KEY) {
+    return {
+      name: 'groq',
+      key: process.env.GROQ_API_KEY,
+      base: 'https://api.groq.com/openai/v1',
+      chatModel: process.env.LIA_CHAT_MODEL || 'openai/gpt-oss-120b',
+      sttModel: process.env.LIA_STT_MODEL || 'whisper-large-v3-turbo',
+    };
+  }
+  if (process.env.OPENAI_API_KEY) {
+    return {
+      name: 'openai',
+      key: process.env.OPENAI_API_KEY,
+      base: 'https://api.openai.com/v1',
+      chatModel: process.env.LIA_CHAT_MODEL || 'gpt-4o-mini',
+      sttModel: 'whisper-1',
+    };
+  }
+  return null;
+};
+
+const liaGetWallet = async (userId) => {
+  try {
+    const { data } = await supabase.from('wallets').select('balance, currency').eq('user_id', userId).maybeSingle();
+    return { balance: Number(data?.balance || 0), currency: data?.currency || 'XAF' };
+  } catch (e) {
+    console.warn('LIA wallet error:', e?.message || e);
+    return { balance: 0, currency: 'XAF' };
+  }
+};
+
+const liaGetTransactions = async (userId, limit) => {
+  try {
+    const { data } = await supabase
+      .from('transactions')
+      .select('type, amount, description, reference, created_at')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    return Array.isArray(data) ? data : [];
+  } catch (e) {
+    console.warn('LIA transactions error:', e?.message || e);
+    return [];
+  }
+};
+
+const liaExpenseSummary = async (userId, days) => {
+  const windowMs = days * 86400000;
+  const now = Date.now();
+  const { data } = await supabase
+    .from('transactions')
+    .select('type, amount, description, created_at')
+    .eq('user_id', userId)
+    .gte('created_at', new Date(now - 2 * windowMs).toISOString())
+    .order('created_at', { ascending: false })
+    .limit(2000);
+  const rows = Array.isArray(data) ? data : [];
+  const inTypes = ['transfer_received', 'deposit', 'refund'];
+  const outTypes = ['transfer_sent', 'withdraw', 'payment'];
+  const inWindow = (from, to) => rows.filter((row) => {
+    const at = new Date(row.created_at).getTime();
+    return !Number.isNaN(at) && at >= from && at < to;
+  });
+  const current = inWindow(now - windowMs, now + 1);
+  const previous = inWindow(now - 2 * windowMs, now - windowMs);
+  const sum = (list, types) => list.filter((row) => types.includes(row.type)).reduce((acc, row) => acc + Number(row.amount || 0), 0);
+  const byType = {};
+  current.forEach((row) => {
+    const key = String(row.type || 'otros');
+    byType[key] = byType[key] || { total: 0, operaciones: 0 };
+    byType[key].total += Number(row.amount || 0);
+    byType[key].operaciones += 1;
+  });
+  const entradas = sum(current, inTypes);
+  const salidas = sum(current, outTypes);
+  const salidasPrevias = sum(previous, outTypes);
+  const porConcepto = {};
+  current
+    .filter((row) => outTypes.includes(row.type))
+    .forEach((row) => {
+      const key = String(row.description || 'sin descripción').slice(0, 60);
+      porConcepto[key] = (porConcepto[key] || 0) + Number(row.amount || 0);
+    });
+  return {
+    periodo_dias: days,
+    entradas,
+    salidas,
+    neto: entradas - salidas,
+    operaciones: current.length,
+    por_tipo: byType,
+    top_conceptos: Object.entries(porConcepto)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([concepto, total]) => ({ concepto, total })),
+    variacion_salidas_pct: salidasPrevias > 0 ? Math.round(((salidas - salidasPrevias) / salidasPrevias) * 1000) / 10 : null,
+  };
+};
+
+const liaContactSearch = async (userId, term) => {
+  const clean = String(term || '').trim().replace(/[^A-Za-zÁ-ÿ0-9 ]+/g, ' ').trim();
+  if (clean.length < 2) return [];
+  const { data: links } = await supabase
+    .from('contacts')
+    .select('contact_user_id')
+    .eq('user_id', userId)
+    .limit(500);
+  const ids = (links || []).map((row) => row.contact_user_id).filter(Boolean);
+  if (!ids.length) return [];
+  const { data } = await supabase
+    .from('users')
+    .select('id, full_name, phone')
+    .in('id', ids)
+    .or(`full_name.ilike.%${clean}%,phone.ilike.%${clean}%`)
+    .limit(5);
+  return Array.isArray(data) ? data : [];
+};
+
+const liaMovementLine = (tx, lang) => {
+  const types = LIA_COPY[lang].movementTypes;
+  const label = types[tx?.type] || types.default;
+  const date = tx?.created_at ? new Date(tx.created_at) : null;
+  const when = date && !Number.isNaN(date.getTime())
+    ? ` · ${date.getDate()}/${date.getMonth() + 1}`
+    : '';
+  return `• ${label}: ${liaMoney(tx?.amount)}${when}`;
+};
+
+const liaWeatherData = async (cityName, lang) => {
+  const target = (cityName && LIA_CITIES.find((item) => liaNorm(item.name) === liaNorm(cityName))) || LIA_CITIES[0];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 6000);
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${target.lat}&longitude=${target.lon}`
+      + '&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code&timezone=Africa%2FMalabo';
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`weather ${response.status}`);
+    const current = (await response.json())?.current || {};
+    if (typeof current.temperature_2m !== 'number') throw new Error('weather empty');
+    return {
+      ciudad: target.name,
+      temperatura_c: Math.round(current.temperature_2m),
+      descripcion: LIA_WEATHER_DESC[liaWeatherKey(current.weather_code)][lang],
+      viento_kmh: Math.round(Number(current.wind_speed_10m) || 0),
+      humedad_pct: Math.round(Number(current.relative_humidity_2m) || 0),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const liaWeatherReply = async (message, lang, city) => {
+  const copy = LIA_COPY[lang];
+  const target = liaPickCity(message, city);
+  try {
+    const data = await liaWeatherData(target.name, lang);
+    return liaFill(copy.weather, {
+      city: data.ciudad,
+      temp: data.temperatura_c,
+      desc: data.descripcion,
+      wind: data.viento_kmh,
+      humidity: data.humedad_pct,
+    });
+  } catch (e) {
+    console.warn('LIA weather error:', e?.message || e);
+    return copy.weatherError;
+  }
+};
+
+const liaBuildSystem = (lang, profile, wallet) => [
+  `Eres Lia-25, la asistente de EGCHAT, una superapp de Guinea Ecuatorial: dinero móvil en XAF, chat, MiTaxi, Salud, Supermercados, Noticias, Seguros y zona CEMAC.`,
+  `Forma de trabajar:`,
+  `1. Antes de dar cualquier dato de la cuenta, precios, noticias o lugares, consulta la herramienta correspondiente y responde con lo que devuelva. No inventes cifras, direcciones, teléfonos, horarios ni comisiones.`,
+  `2. Si falta un dato imprescindible para resolver o ejecutar (importe, destinatario, ciudad), haz una sola pregunta corta con las opciones concretas.`,
+  `3. Si piden varias cosas, resuélvelas en orden. Si la petición es ambigua, interpreta la opción más probable dentro de EGCHAT y dilo en una frase.`,
+  `4. Para enviar dinero: si el destinatario es un nombre, resuélvelo antes con buscar_destinatario y, si hay varios iguales, pregunta cuál; luego usa preparar_transferencia, muestra el resumen y pide confirmación con el PIN en la app. Nunca afirmes que ya enviaste, pediste o compraste algo.`,
+  `5. Para abrir una pantalla usa abrir_pantalla y dile al usuario que la tiene lista; no digas que ya está abierta.`,
+  `6. Para «en qué he gastado», «cuánto entra/sale» o comparar periodos usa analizar_gastos. Para «cuánto puedo enviar/retirar hoy» usa consultar_limites. Para cualquier conversión usa convertir_moneda: no hagas la cuenta de memoria.`,
+  `7. Responde solo a la última petición del usuario; si el tema cambió, ignora el anterior por completo.`,
+  `8. Sé precisa y breve (máximo 90 palabras salvo que pidan detalle). No expliques tu proceso, no menciones herramientas, JSON, errores técnicos ni el modelo.`,
+  `Datos reales del usuario (no los inventes ni los cambies): saldo ${liaMoney(wallet.balance)}; nombre ${profile?.full_name || 'no indicado'}; ciudad ${profile?.city || 'no indicada'}.`,
+  `Datos de referencia de la app: tarifas MiTaxi moto 800 XAF, básico 1 500 XAF, premium 3 500 XAF (tarifa plana por viaje, no por km).`,
+  `Pantallas de la app: Cartera (saldo, recargar, retirar, enviar), MiTaxi, Salud, Supermercados, Noticias, Seguros, CEMAC, Bancos, Tarjetas.`,
+  `Responde SIEMPRE en ${LIA_LANG_NAMES[lang] || 'español'}, de forma clara y amable, con negritas solo cuando aporten.`,
+  `Si no puedes resolver algo, dilo en una frase y ofrece la pantalla exacta donde se hace.`,
+].join('\n');
+
+// ── Herramientas de LIA ─────────────────────────────────────────────
+// Cada herramienta devuelve datos reales y el modelo decide cuál usar.
+const LIA_TOOL_DEFS = [
+  {
+    type: 'function',
+    function: {
+      name: 'consultar_saldo',
+      description: 'Saldo actual y moneda del usuario.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'consultar_movimientos',
+      description: 'Últimos movimientos de la cartera, del más reciente al más antiguo.',
+      parameters: {
+        type: 'object',
+        properties: {
+          limite: { type: 'integer', description: 'Cantidad de movimientos, entre 1 y 10.', minimum: 1, maximum: 10 },
+          tipo: { type: 'string', description: 'Filtro opcional por tipo: deposit, withdraw, transfer_sent, transfer_received, payment, refund.' },
+        },
+        required: ['limite'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'consultar_noticias',
+      description: 'Titulares de noticias del día, con fuente y categoría.',
+      parameters: {
+        type: 'object',
+        properties: {
+          limite: { type: 'integer', description: 'Cantidad de titulares, entre 1 y 6.' },
+          categoria: { type: 'string', description: 'Categoría opcional: Política, Finanzas, Salud, Tecnología, Deportes.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'consultar_tiempo',
+      description: 'Tiempo actual (temperatura, viento, humedad) en una ciudad de Guinea Ecuatorial.',
+      parameters: {
+        type: 'object',
+        properties: {
+          ciudad: { type: 'string', description: 'Malabo, Bata, Mongomo, Ebebiyín o Annobón.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'buscar_centros_salud',
+      description: 'Hospitales y farmacias con ciudad y teléfono.',
+      parameters: {
+        type: 'object',
+        properties: {
+          tipo: { type: 'string', enum: ['hospital', 'farmacia', 'todos'] },
+          ciudad: { type: 'string' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'buscar_supermercados',
+      description: 'Supermercados disponibles con dirección, teléfono y si están abiertos.',
+      parameters: {
+        type: 'object',
+        properties: { ciudad: { type: 'string' } },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'consultar_cajeros',
+      description: 'Cajeros automáticos con banco, dirección y comisión.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'consultar_tasas_cambio',
+      description: 'Tipo de cambio de las divisas frente al XAF.',
+      parameters: {
+        type: 'object',
+        properties: { moneda: { type: 'string', description: 'EUR, USD, GBP, CHF o CNY.' } },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'preparar_transferencia',
+      description: 'Valida un envío de dinero y devuelve el resumen para que el usuario lo confirme con su PIN. No ejecuta el envío.',
+      parameters: {
+        type: 'object',
+        properties: {
+          monto: { type: 'number', description: 'Importe en XAF.' },
+          destinatario: { type: 'string', description: 'Teléfono, nombre de usuario o nombre del destinatario.' },
+          concepto: { type: 'string', description: 'Motivo opcional del envío.' },
+        },
+        required: ['monto', 'destinatario'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'analizar_gastos',
+      description: 'Resume el dinero que entró y salió en un periodo, con desglose por tipo, los conceptos más caros y la variación frente al periodo anterior.',
+      parameters: {
+        type: 'object',
+        properties: {
+          dias: { type: 'integer', description: 'Días a analizar, entre 1 y 180. Por defecto 30.', minimum: 1, maximum: 180 },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'consultar_limites',
+      description: 'Límites de la cartera, lo usado y lo que queda disponible hoy, más el estado de verificación de la cuenta.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'buscar_destinatario',
+      description: 'Busca entre los contactos del usuario por nombre o teléfono para resolver un envío. Devuelve candidatos, nunca datos de desconocidos.',
+      parameters: {
+        type: 'object',
+        properties: {
+          consulta: { type: 'string', description: 'Nombre o parte del nombre, o teléfono del contacto.' },
+        },
+        required: ['consulta'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'convertir_moneda',
+      description: 'Convierte un importe entre XAF, XOF y las divisas soportadas con las tasas que usa la app.',
+      parameters: {
+        type: 'object',
+        properties: {
+          monto: { type: 'number', description: 'Importe a convertir.' },
+          desde: { type: 'string', description: 'Moneda de origen: XAF, XOF, EUR, USD, GBP, CHF, CNY.' },
+          a: { type: 'string', description: 'Moneda de destino: XAF, XOF, EUR, USD, GBP, CHF, CNY.' },
+        },
+        required: ['monto', 'desde', 'a'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'abrir_pantalla',
+      description: 'Prepara la pantalla de la app que resuelve la petición (ej. cartera, enviar, recargar, taxi).',
+      parameters: {
+        type: 'object',
+        properties: {
+          pantalla: {
+            type: 'string',
+            enum: ['cartera', 'enviar', 'recargar', 'retirar', 'taxi', 'salud', 'supermercados', 'noticias', 'bancos', 'tarjetas', 'seguros', 'cemac'],
+          },
+        },
+        required: ['pantalla'],
+      },
+    },
+  },
+];
+
+const LIA_TOOL_NAMES = LIA_TOOL_DEFS.map((tool) => tool.function.name);
+
+// El modelo a veces escribe un nombre de herramienta con una letra de más o de
+// menos; si la diferencia es mínima se ejecuta la correcta en lugar de fallar.
+const liaResolveToolName = (raw) => {
+  const wanted = String(raw || '').trim().toLowerCase();
+  if (!wanted) return raw;
+  if (LIA_TOOL_NAMES.includes(wanted)) return wanted;
+  const distance = (a, b) => {
+    let prev = Array.from({ length: b.length + 1 }, (_v, i) => i);
+    for (let y = 1; y <= a.length; y += 1) {
+      const row = [y];
+      for (let x = 1; x <= b.length; x += 1) {
+        row[x] = Math.min(prev[x] + 1, row[x - 1] + 1, prev[x - 1] + (a[y - 1] === b[x - 1] ? 0 : 1));
+      }
+      prev = row;
+    }
+    return prev[b.length];
+  };
+  let best = null;
+  let bestScore = 3;
+  LIA_TOOL_NAMES.forEach((candidate) => {
+    const score = distance(wanted, candidate);
+    if (score < bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  });
+  return best || raw;
+};
+
+const liaRunTool = async (name, args, userId, lang) => {
+  const a = args && typeof args === 'object' ? args : {};
+  const cityFilter = (item) => !a.ciudad || liaNorm(item.city || '') === liaNorm(a.ciudad);
+
+  switch (name) {
+    case 'consultar_saldo': {
+      const wallet = await liaGetWallet(userId);
+      return { saldo: wallet.balance, moneda: wallet.currency };
+    }
+    case 'consultar_movimientos': {
+      const limite = Math.min(Math.max(Number(a.limite) || 5, 1), 10);
+      let rows = await liaGetTransactions(userId, a.tipo ? 40 : limite);
+      if (a.tipo) rows = rows.filter((tx) => String(tx.type) === String(a.tipo)).slice(0, limite);
+      return rows.map((tx) => ({
+        tipo: tx.type, importe: tx.amount, descripcion: tx.description || tx.reference || '',
+        fecha: tx.created_at,
+      }));
+    }
+    case 'consultar_noticias': {
+      const limite = Math.min(Math.max(Number(a.limite) || 5, 1), 6);
+      const items = NOTICIAS.filter((n) => !a.categoria || liaNorm(n.category) === liaNorm(a.categoria)).slice(0, limite);
+      return items.map((n) => ({ titulo: n.title, fuente: n.source, categoria: n.category, hora: n.time }));
+    }
+    case 'consultar_tiempo':
+      return liaWeatherData(a.ciudad || '', lang);
+    case 'buscar_centros_salud': {
+      const tipo = a.tipo || 'todos';
+      const items = [];
+      if (tipo !== 'farmacia') {
+        HOSPITALES.filter(cityFilter).forEach((h) => items.push({
+          tipo: 'hospital', nombre: h.name, ciudad: h.city, telefono: h.phone, urgencias: Boolean(h.emergency),
+        }));
+      }
+      if (tipo !== 'hospital') {
+        FARMACIAS.filter(cityFilter).forEach((f) => items.push({
+          tipo: 'farmacia', nombre: f.name, ciudad: f.city, telefono: f.phone, abierto_24h: Boolean(f.open24h),
+        }));
+      }
+      return items;
+    }
+    case 'buscar_supermercados':
+      return SUPERMERCADOS.filter(cityFilter).map((s) => ({
+        nombre: s.name, ciudad: s.city, direccion: s.address, telefono: s.phone, abierto: s.open !== false,
+      }));
+    case 'consultar_cajeros':
+      return LIA_ATMS.map((item) => ({ banco: item.bank, direccion: item.addr, comision: item.fee }));
+    case 'consultar_tasas_cambio': {
+      const entries = Object.entries(LIA_RATES)
+        .filter(([currency]) => !a.moneda || currency === String(a.moneda).toUpperCase());
+      return entries.map(([currency, rate]) => ({ moneda: currency, xaf_por_unidad: Math.round(1 / rate) }));
+    }
+    case 'preparar_transferencia': {
+      const amount = Math.round(Number(a.monto) || 0);
+      if (!(amount > 0)) return { error: 'Importe inválido', falta: 'monto' };
+      if (!a.destinatario) return { error: 'Falta el destinatario', falta: 'destinatario' };
+      const to = String(a.destinatario).trim();
+      const recipient = PLATFORM_MERCHANTS.has(to.toLowerCase()) ? null : await findUserByRef(to);
+      const wallet = await liaGetWallet(userId);
+      if (!recipient) {
+        return { error: 'Destinatario no encontrado', destinatario_buscado: to, saldo: wallet.balance };
+      }
+      if (String(recipient.id) === String(userId)) return { error: 'No puedes enviarte dinero a ti mismo' };
+      return {
+        destinatario: recipient.full_name || recipient.phone || to,
+        telefono: recipient.phone || null,
+        importe: amount,
+        concepto: a.concepto ? String(a.concepto).slice(0, 140) : null,
+        saldo_actual: wallet.balance,
+        saldo_despues: wallet.balance - amount,
+        requiere_pin: true,
+        ejecutado: false,
+        siguiente_paso: 'El usuario confirma con el PIN en Cartera → Enviar.',
+      };
+    }
+    case 'analizar_gastos': {
+      const dias = Math.min(Math.max(Number(a.dias) || 30, 1), 180);
+      return await liaExpenseSummary(userId, dias);
+    }
+    case 'consultar_limites': {
+      const today = await sumTodayByType(userId);
+      const { data: perfil } = await supabase
+        .from('users')
+        .select('wallet_kyc_status')
+        .eq('id', userId)
+        .maybeSingle();
+      return {
+        limites: WALLET_LIMITS,
+        usado_hoy: today,
+        disponible_hoy: {
+          deposit: Math.max(0, WALLET_LIMITS.dailyDeposit - today.deposit),
+          withdraw: Math.max(0, WALLET_LIMITS.dailyWithdraw - today.withdraw),
+          transfer: Math.max(0, WALLET_LIMITS.dailyTransfer - today.transfer),
+        },
+        verificacion: perfil?.wallet_kyc_status || 'sin_datos',
+      };
+    }
+    case 'buscar_destinatario': {
+      const found = await liaContactSearch(userId, a.consulta);
+      if (!found.length) {
+        return { contactos: [], nota: 'Ningún contacto coincide. Pide el teléfono exacto o usa la agenda de la app.' };
+      }
+      return {
+        contactos: found.map((row) => ({ nombre: row.full_name || 'sin nombre', telefono: row.phone })),
+      };
+    }
+    case 'convertir_moneda': {
+      const amount = Number(a.monto);
+      const from = String(a.desde || 'XAF').toUpperCase();
+      const to = String(a.a || 'XAF').toUpperCase();
+      const supported = ['XAF', 'XOF', ...Object.keys(LIA_RATES)];
+      if (!Number.isFinite(amount) || amount <= 0) return { error: 'Importe inválido' };
+      if (!supported.includes(from) || !supported.includes(to)) {
+        return { error: `Divisa no soportada. Disponibles: ${supported.join(', ')}` };
+      }
+      const toXaf = (code) => (code === 'XAF' || code === 'XOF' ? 1 : 1 / LIA_RATES[code]);
+      const xafValue = amount * toXaf(from);
+      const result = xafValue * (to === 'XAF' || to === 'XOF' ? 1 : LIA_RATES[to]);
+      const decimals = to === 'XAF' || to === 'XOF' ? 0 : 2;
+      return {
+        desde: from,
+        monto_desde: amount,
+        a: to,
+        monto_a: Number(result.toFixed(decimals)),
+        tasa: `1 ${from} = ${(toXaf(from) * (to === 'XAF' || to === 'XOF' ? 1 : LIA_RATES[to])).toFixed(decimals)} ${to}`,
+      };
+    }
+    case 'abrir_pantalla':
+      return { pantalla: a.pantalla, abrir_en_app: true, ejecutado: false };
+    default:
+      return { error: `Herramienta desconocida: ${name}` };
+  }
+};
+
+const LIA_AGENT_ROUNDS = 4;
+
+const liaAgent = async ({ lang, message, history, userId, profile, wallet }) => {
+  const provider = liaProvider();
+  if (!provider) return null;
+  const system = liaBuildSystem(lang, profile, wallet);
+  const safeHistory = (Array.isArray(history) ? history : [])
+    .filter((item) => item && (item.role === 'user' || item.role === 'assistant') && typeof item.content === 'string')
+    .slice(-6)
+    .map((item) => ({ role: item.role, content: item.content.slice(0, 600) }));
+  const messages = [{ role: 'system', content: system }, ...safeHistory, { role: 'user', content: message.slice(0, 1000) }];
+  const used = [];
+  let nav = null;
+  let transfer = null;
+  let lastStatus = 0;
+  let toolGlitch = false;
+
+  const call = async (withTools) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 25000);
+    try {
+      const response = await fetch(`${provider.base}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.key}` },
+        body: JSON.stringify({
+          model: provider.chatModel,
+          temperature: 0.2,
+          max_tokens: 700,
+          messages,
+          ...(withTools ? { tools: LIA_TOOL_DEFS, tool_choice: 'auto' } : {}),
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        lastStatus = response.status;
+        const body = (await response.text().catch(() => '')) || '';
+        // Groq anula toda la respuesta si el modelo escribe mal un nombre de herramienta.
+        toolGlitch = withTools && body.includes('tool_use_failed');
+        console.warn('LIA agent error:', provider.name, response.status, body.slice(0, 200));
+        return null;
+      }
+      return (await response.json())?.choices?.[0]?.message || null;
+    } catch (e) {
+      console.warn('LIA agent exception:', e?.message || e);
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  for (let round = 0; round < LIA_AGENT_ROUNDS; round += 1) {
+    toolGlitch = false;
+    let reply = await call(true);
+    if (!reply && toolGlitch) reply = await call(true);
+    if (!reply) {
+      // Solo se reintenta sin herramientas si el proveedor las rechazó de forma explícita.
+      const toolsRejected = lastStatus >= 400 && lastStatus < 500 && lastStatus !== 429;
+      if (toolsRejected) {
+        const plain = await call(false);
+        const plainText = typeof plain?.content === 'string' ? plain.content.trim() : '';
+        return plainText ? { text: plainText, used, nav, transfer } : null;
+      }
+      return null;
+    }
+    const toolCalls = Array.isArray(reply.tool_calls) ? reply.tool_calls : [];
+    if (!toolCalls.length) {
+      const text = typeof reply.content === 'string' ? reply.content.trim() : '';
+      return text ? { text, used, nav, transfer } : null;
+    }
+    messages.push({ role: 'assistant', content: reply.content || '', tool_calls: toolCalls });
+    for (const toolCall of toolCalls) {
+      const name = liaResolveToolName(toolCall?.function?.name);
+      let args = {};
+      try { args = JSON.parse(toolCall?.function?.arguments || '{}'); } catch { args = {}; }
+      let result;
+      try {
+        result = await liaRunTool(name, args, userId, lang);
+      } catch (e) {
+        console.warn('LIA tool failed:', name, e?.message || e);
+        result = { error: 'No se pudo consultar ese dato ahora mismo' };
+      }
+      used.push(name);
+      if (name === 'abrir_pantalla' && result && result.pantalla) nav = result.pantalla;
+      if (name === 'preparar_transferencia' && result && !result.error && result.ejecutado === false) {
+        transfer = {
+          destinatario: result.destinatario,
+          telefono: result.telefono || null,
+          importe: result.importe,
+          concepto: result.concepto || null,
+        };
+      }
+      const payload = JSON.stringify(result);
+      messages.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        content: payload.length > 4000 ? JSON.stringify({ resultado_recortado: payload.slice(0, 3500) }) : payload,
+      });
+    }
+  }
+
+  // Se agotaron las rondas: pedir una respuesta final sin herramientas.
+  const finalReply = await call(false);
+  const text = typeof finalReply?.content === 'string' ? finalReply.content.trim() : '';
+  return text ? { text, used, nav, transfer } : null;
+};
+
+const liaAnswer = async (intent, message, lang, userId, history) => {
+  const copy = LIA_COPY[lang];
+  switch (intent) {
+    case 'balance': {
+      const [wallet, movements] = await Promise.all([liaGetWallet(userId), liaGetTransactions(userId, 3)]);
+      if (!movements.length) return liaFill(copy.balance, { balance: liaMoney(wallet.balance) });
+      return liaFill(copy.balanceWithMovements, {
+        balance: liaMoney(wallet.balance),
+        movements: movements.map((tx) => liaMovementLine(tx, lang)).join('\n'),
+      });
+    }
+    case 'activity': {
+      const movements = await liaGetTransactions(userId, 5);
+      if (!movements.length) return copy.noMovements;
+      return liaFill(copy.movementsTitle, { movements: movements.map((tx) => liaMovementLine(tx, lang)).join('\n') });
+    }
+    case 'news': {
+      if (!Array.isArray(NOTICIAS) || !NOTICIAS.length) return copy.noNews;
+      const list = NOTICIAS.slice(0, 5).map((item) => `• ${item.title} (${item.source})`).join('\n');
+      return liaFill(copy.newsTitle, { list });
+    }
+    case 'weather': {
+      let city = '';
+      try {
+        const { data: profile } = await supabase.from('users').select('city').eq('id', userId).maybeSingle();
+        city = profile?.city || '';
+      } catch (e) {
+        console.warn('LIA profile lookup failed:', e?.message || e);
+      }
+      return liaWeatherReply(message, lang, city);
+    }
+    case 'health': {
+      const list = [
+        ...HOSPITALES.map((item) => `• ${item.name} (${item.city}) · ${item.phone}`),
+        ...FARMACIAS.map((item) => `• ${item.name} (${item.city}) · ${item.phone}`),
+      ].join('\n');
+      return liaFill(copy.healthTitle, { list });
+    }
+    case 'markets': {
+      const list = SUPERMERCADOS
+        .map((item) => `• ${item.name} · ${item.city} · ${item.address}${item.open === false ? ` (${copy.closed})` : ''}`)
+        .join('\n');
+      return liaFill(copy.marketTitle, { list });
+    }
+    case 'atm': {
+      const list = LIA_ATMS.map((item) => `• ${item.bank} · ${item.addr} · ${item.fee}`).join('\n');
+      return liaFill(copy.atmTitle, { list });
+    }
+    case 'rates': {
+      const list = Object.entries(LIA_RATES)
+        .map(([currency, rate]) => `• 1 ${currency} = ${Math.round(1 / rate)} XAF`)
+        .concat('• 1 XAF = 1 XOF')
+        .join('\n');
+      return liaFill(copy.ratesTitle, { list });
+    }
+    case 'card':
+      return copy.card;
+    case 'banks':
+      return copy.bank;
+    case 'taxi':
+      return copy.taxi;
+    case 'transfer':
+      return copy.transfer;
+    case 'thanks':
+      return copy.thanks;
+    case 'help':
+      return copy.help;
+    case 'greeting':
+      return copy.greeting;
+    case 'math':
+      return liaMathReply(message, lang) || copy.unknown;
+    default: {
+      return copy.unknown;
+    }
+  }
+};
+
 app.post('/api/lia/chat', auth, async (req, res) => {
-  const { message } = req.body;
-  const lower = message.toLowerCase();
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  const requestedLang = String(req.body?.lang || '').toLowerCase();
+  const lang = LIA_LANGS.includes(requestedLang) ? requestedLang : 'es';
+  const copy = LIA_COPY[lang];
 
-  const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', req.user.id).single();
-  const balance = wallet?.balance || 0;
+  if (!message) return res.status(400).json({ message: copy.emptyMessage, code: 'VALIDATION_ERROR' });
+  if (message.length > 2000) return res.status(400).json({ message: copy.tooLong, code: 'VALIDATION_ERROR' });
 
-  let reply = '';
-  if (lower.includes('saldo') || lower.includes('balance'))
-    reply = `Tu saldo actual es **${balance.toLocaleString()} XAF**. Á‚Â¿Deseas recargar o retirar?`;
-  else if (lower.includes('hola') || lower.includes('buenos'))
-    reply = 'Á‚Â¡Hola! Soy Lia-25, tu asistente inteligente de EGCHAT. Á‚Â¿En quÁƒÂ© puedo ayudarte hoy?';
-  else if (lower.includes('taxi'))
-    reply = 'Puedo ayudarte a pedir un taxi. Ve a la secciÁƒÂ³n MiTaxi desde el menÁƒÂº principal.';
-  else if (lower.includes('salud') || lower.includes('hospital'))
-    reply = 'En la secciÁƒÂ³n Salud encontrarÁƒÂ¡s hospitales, farmacias y puedes pedir citas mÁƒÂ©dicas.';
-  else if (lower.includes('supermercado') || lower.includes('compra'))
-    reply = 'Puedes hacer compras en lÁƒÂ­nea desde la secciÁƒÂ³n Supermercados. Tenemos tiendas en Malabo y Bata.';
-  else if (lower.includes('transferir') || lower.includes('enviar dinero'))
-    reply = 'Para enviar dinero, ve a Mi Monedero ââ€ â€™ Enviar, o dime el nÁƒÂºmero y el importe.';
-  else if (lower.includes('seguro'))
-    reply = 'Puedes contratar seguros de salud, vehÁƒÂ­culo, vida y hogar en la secciÁƒÂ³n Seguros.';
-  else if (lower.includes('noticias'))
-    reply = 'Las ÁƒÂºltimas noticias de Guinea Ecuatorial y del mundo estÁƒÂ¡n en la secciÁƒÂ³n Noticias.';
-  else if (lower.includes('gracias'))
-    reply = 'Á‚Â¡De nada! Estoy aquÁƒÂ­ para ayudarte. Á‚Â¿Hay algo mÁƒÂ¡s?';
-  else
-    reply = `Entendido: "${message}". Puedo ayudarte con saldo, transferencias, taxi, salud, supermercados, seguros y noticias.`;
+  const intent = liaDetectIntent(message);
+  let reply = copy.serviceError;
+  let action = intent;
+  let tools = [];
+  let nav = null;
+  let transfer = null;
 
-  // Guardar conversaciÁƒÂ³n en Supabase
-  await supabase.from('lia_conversations').insert({
-    user_id: req.user.id, message, reply
-  }).catch(() => {});
+  try {
+    if (intent === 'math') {
+      reply = liaMathReply(message, lang) || copy.unknown;
+    } else {
+      // El modelo es el cerebro: decide qué consultar y con qué argumentos.
+      // El motor de intenciones queda solo como respaldo si el proveedor falla.
+      const [{ data: profile }, wallet] = await Promise.all([
+        supabase.from('users').select('full_name, city').eq('id', req.user.id).maybeSingle(),
+        liaGetWallet(req.user.id),
+      ]);
+      const agent = await liaAgent({
+        lang, message, history: req.body?.history, userId: req.user.id, profile, wallet,
+      });
+      if (agent) {
+        reply = agent.text;
+        tools = agent.used;
+        nav = agent.nav || null;
+        transfer = agent.transfer || null;
+        action = tools.length ? tools[tools.length - 1] : 'ai';
+      } else {
+        reply = await liaAnswer(intent, message, lang, req.user.id, req.body?.history);
+        action = 'rules';
+      }
+    }
+  } catch (e) {
+    console.error('LIA chat error:', e);
+    action = 'error';
+  }
 
-  res.json({ reply, timestamp: new Date().toISOString() });
+  // La persistencia nunca debe bloquear ni romper la respuesta.
+  // Los usuarios locales de demostración tienen id no-uuid y no se pueden guardar.
+  if (!isLocalUserId(req.user.id)) {
+    try {
+      const { error } = await supabase.from('lia_conversations').insert({ user_id: req.user.id, message, reply });
+      if (error) console.warn('LIA history save failed:', error.message);
+    } catch (e) {
+      console.warn('LIA history save failed:', e?.message || e);
+    }
+  }
+
+  res.json({ reply, action, tools, nav, transfer, lang, timestamp: new Date().toISOString() });
+});
+
+app.get('/api/lia/history', auth, async (req, res) => {
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
+  if (isLocalUserId(req.user.id)) return res.json({ messages: [] });
+  const readHistory = async (columns) => supabase
+    .from('lia_conversations')
+    .select(columns)
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  try {
+    let rows = [];
+    let result = await readHistory('message, reply, created_at');
+    if (result.error) {
+      // Instalaciones antiguas pueden no tener created_at: no perder el historial.
+      result = await supabase
+        .from('lia_conversations')
+        .select('message, reply')
+        .eq('user_id', req.user.id)
+        .limit(limit);
+    }
+    if (result.error) throw result.error;
+    rows = result.data || [];
+
+    const messages = [];
+    rows.slice().reverse().forEach((row) => {
+      if (row.message) messages.push({ role: 'user', content: row.message, time: row.created_at });
+      if (row.reply) messages.push({ role: 'assistant', content: row.reply, time: row.created_at });
+    });
+    res.json({ messages });
+  } catch (e) {
+    console.warn('LIA history error:', e?.message || e);
+    res.json({ messages: [] });
+  }
+});
+
+app.get('/api/lia/status', auth, (_req, res) => {
+  const provider = liaProvider();
+  res.json({
+    engine: provider ? provider.name : 'rules',
+    model: provider ? provider.chatModel : null,
+    mode: provider ? 'agent' : 'rules',
+    tools: LIA_TOOL_DEFS.map((tool) => tool.function.name),
+    dictation: Boolean(provider),
+    languages: LIA_LANGS,
+    features: ['balance', 'movements', 'spending_analysis', 'limits', 'contacts', 'conversion', 'news', 'weather', 'health', 'markets', 'atm', 'banks', 'rates', 'cards', 'taxi', 'transfers', 'help', 'attachments', 'vision', 'documents'],
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════
@@ -3450,7 +5258,7 @@ app.post('/api/user/change-password', auth, async (req, res) => {
 // Reset de contraseña por admin (protegido con ADMIN_RESET_KEY)
 app.post('/api/admin/reset-password', async (req, res) => {
   const key = req.headers['x-admin-key'] || req.body?.adminKey;
-  if (!key || key !== adminResetKey) return res.status(403).json({ message: 'No autorizado' });
+  if (!isAdminKeyValid(key)) return res.status(403).json({ message: 'No autorizado' });
   const { phone, newPassword } = req.body;
   if (!phone || !newPassword) return res.status(400).json({ message: 'phone y newPassword requeridos' });
   const hashed = await bcrypt.hash(newPassword, 10);
@@ -3469,13 +5277,19 @@ const safeRef = (prefix) => `${prefix}-${Date.now()}-${Math.floor(Math.random() 
 const toNum = (v) => Number(v || 0);
 
 const logAudit = async (userId, action, module, entityId, details) => {
-  await supabase.from('audit_logs').insert({
-    user_id: userId,
-    action,
-    module,
-    entity_id: entityId || null,
-    details: details || {}
-  }).catch(() => {});
+  // try/catch y no `.catch()`: el constructor de consultas de supabase-js 2.101
+  // es thenable pero no tiene método catch, así que encadenarlo lanza TypeError.
+  try {
+    await supabase.from('audit_logs').insert({
+      user_id: userId,
+      action,
+      module,
+      entity_id: entityId || null,
+      details: details || {}
+    });
+  } catch (e) {
+    console.warn('[audit] registro no guardado:', e.message);
+  }
 };
 
 const createServiceOrder = async (userId, provider, serviceType, amount, contractRef, payload, response) => {
@@ -3496,337 +5310,387 @@ const createServiceOrder = async (userId, provider, serviceType, amount, contrac
   return { orderRef, record: data || insert };
 };
 
-const debitWalletWithTx = async (userId, amount, method, reference, txType = 'payment') => {
-  const { data: wallet } = await supabase.from('wallets').select('balance').eq('user_id', userId).single();
-  if (!wallet || amount > Number(wallet.balance || 0)) return { ok: false, message: 'Saldo insuficiente' };
-  const newBalance = Number(wallet.balance || 0) - Number(amount || 0);
-  await supabase.from('wallets').update({ balance: newBalance }).eq('user_id', userId);
-  const { data: tx } = await supabase.from('transactions').insert({
+// Los tres proveedores de facturas (luz, agua, impuestos) comparten camino: la
+// deuda vive en service_bills y el importe lo fija esa tabla, nunca el cliente.
+const SERVICE_BILL_PROVIDERS = { segesa: 'SEGESA', snge: 'SNGE', dgi: 'DGI' };
+
+// El importe de un servicio ya no vive en el codigo ni en el cuerpo de la
+// peticion: vive en service_tariffs / service_products. El cliente manda que
+// variant contrata y la referencia de su pedido; la base de datos pone el precio
+// y asienta la deuda con el proveedor.
+const tariffError = (msg) => (/saldo insuficiente/i.test(String(msg || ''))
+  ? { ok: false, http: 400, code: 'INSUFFICIENT_BALANCE', message: 'Saldo insuficiente' }
+  : { ok: false, http: 500, code: 'CHARGE_FAILED', message: 'No se pudo completar el cargo' });
+
+const serviceCharge = async (userId, service, variant, ref) => {
+  const { data, error } = await supabase.rpc('service_charge', {
+    p_user_id: userId,
+    p_service: String(service),
+    p_variant: String(variant),
+    p_ref: String(ref),
+  });
+  if (error) return tariffError(error.message);
+  return data || { ok: false, code: 'CHARGE_FAILED' };
+};
+
+const serviceBasketCharge = async (userId, ref, items, service = 'supermercado') => {
+  const { data, error } = await supabase.rpc('service_basket_charge', {
+    p_user_id: userId,
+    p_ref: String(ref),
+    p_items: items,
+    p_service: String(service),
+  });
+  if (error) return tariffError(error.message);
+  return data || { ok: false, code: 'CHARGE_FAILED' };
+};
+
+const serviceRefund = async (userId, service, ref, amount) => {
+  const { data, error } = await supabase.rpc('service_refund', {
+    p_user_id: userId,
+    p_service: String(service),
+    p_ref: String(ref),
+    p_amount: roundAmount(amount),
+  });
+  if (error) return tariffError(error.message);
+  return data || { ok: false, code: 'REFUND_FAILED' };
+};
+
+// Unidad de precio del pedido: se lee, nunca se envia desde la app.
+const readTariff = async (service, variant) => {
+  const { data, error } = await supabase
+    .from('service_tariffs')
+    .select('service, variant, amount, currency, concept')
+    .eq('service', service).eq('variant', variant).eq('active', true)
+    .maybeSingle();
+  if (error || !data) return null;
+  return data;
+};
+
+// Catalogo de precios: la tabla que cobra es la misma que se muestra, para que
+// la app no pueda pintar un importe y pagar otro.
+const readProducts = async ({ category, notCategory, q } = {}) => {
+  let query = supabase
+    .from('service_products')
+    .select('id, name, category, price, currency')
+    .eq('active', true)
+    .order('id');
+  if (category) query = query.eq('category', category);
+  if (notCategory) query = query.neq('category', notCategory);
+  if (q) query = query.ilike('name', `%${String(q)}%`);
+  const { data, error } = await query;
+  if (error) return null;
+  return data || [];
+};
+
+// Lista de tarifas y catalogo: la app deja de llevar sus numeros en el codigo.
+app.get('/api/servicios/tarifas', auth, async (_req, res) => {
+  const { data: tarifas, error } = await supabase
+    .from('service_tariffs')
+    .select('service, variant, amount, currency, concept')
+    .eq('active', true)
+    .order('service').order('variant');
+  if (error) return res.status(502).json({ message: error.message, code: 'TARIFFS_UNAVAILABLE' });
+  const { data: productos } = await supabase
+    .from('service_products')
+    .select('id, name, category, price, currency')
+    .eq('active', true)
+    .order('category').order('name');
+  res.json({ tarifas: tarifas || [], productos: productos || [] });
+});
+
+const serviceConsult = async (provider, ref, userId) => {
+  const { data, error } = await supabase
+    .from('service_bills')
+    .select('id, contract_ref, amount, currency, period, concept, due_date, status')
+    .eq('provider', provider)
+    .eq('contract_ref', ref)
+    .eq('status', 'pending')
+    .or(`user_id.is.null,user_id.eq.${userId}`)
+    .order('due_date', { ascending: true });
+
+  if (error) {
+    console.error('serviceConsult error:', error.message);
+    return { ok: false, code: 'BILLS_UNAVAILABLE', message: 'No se pudo consultar la deuda. Inténtalo de nuevo.' };
+  }
+
+  const facturas = data || [];
+  const importe = facturas.reduce((s, f) => s + Number(f.amount || 0), 0);
+  return {
+    ok: true,
+    contract: ref,
+    importe,
+    estado: facturas.length ? 'pendiente' : 'sin_deuda',
+    facturas,
+  };
+};
+
+const servicePay = async (provider, billId, userId) => {
+  const { data, error } = await supabase.rpc('service_pay_bill', {
+    p_bill_id: billId,
+    p_user_id: userId,
+  });
+
+  if (error) {
+    console.error('servicePay error:', error.message);
+    if (/Saldo insuficiente/i.test(error.message || '')) {
+      return { ok: false, code: 'INSUFFICIENT_BALANCE', message: 'Saldo insuficiente' };
+    }
+    return { ok: false, code: 'PAY_FAILED', message: 'No se pudo completar el pago. Inténtalo de nuevo.' };
+  }
+
+  const r = data || {};
+  if (!r.ok) {
+    const codes = { BILL_NOT_FOUND: 404, BILL_NOT_PENDING: 409, BILL_OTHER_USER: 403 };
+    return { ok: false, http: codes[r.code] || 400, code: r.code || 'PAY_FAILED', ...r };
+  }
+
+  const balance = await readWalletBalance(userId);
+  const label = SERVICE_BILL_PROVIDERS[provider] || provider.toUpperCase();
+  await supabase.from('transactions').insert({
     user_id: userId,
-    type: txType,
-    amount,
-    method: method || 'EGCHAT',
-    reference,
-    status: 'completed'
-  }).select().maybeSingle();
-  await logAudit(userId, 'wallet_debit', 'wallet', tx?.id || reference, { amount, reference, txType });
-  return { ok: true, balance: newBalance, tx };
+    type: 'service_payment',
+    amount: Number(r.amount),
+    method: 'EGCHAT',
+    reference: `${label}-${r.contract_ref}`,
+    status: 'completed',
+    ledger_journal_id: r.journal_id || null,
+  });
+  await logAudit(userId, 'service_bill_paid', 'services', r.bill_id, r);
+
+  return {
+    ok: true,
+    response: {
+      success: true,
+      provider,
+      bill_id: r.bill_id,
+      importe: Number(r.amount),
+      balance,
+      journal_id: r.journal_id,
+      message: `Pago de ${label} completado`,
+    },
+  };
 };
 
 app.post('/api/servicios/segesa/consultar', auth, async (req, res) => {
   const { contrato } = req.body;
   if (!contrato) return res.status(400).json({ message: 'Numero de contrato requerido', code: 'VALIDATION_ERROR' });
-  const response = { contrato, titular: 'Cliente SEGESA', importe: Math.floor(Math.random()*15000)+5000, vencimiento: '2026-04-30', estado: 'pendiente', direccion: 'Malabo, Guinea Ecuatorial' };
-  await createServiceOrder(req.user.id, 'segesa', 'consultar', 0, contrato, req.body, response);
-  res.json(response);
+  const out = await serviceConsult('segesa', String(contrato), req.user.id);
+  if (!out.ok) return res.status(502).json(out);
+  await createServiceOrder(req.user.id, 'segesa', 'consultar', 0, String(contrato), req.body, out);
+  res.json(out);
 });
 
-app.post('/api/servicios/segesa/pagar', auth, async (req, res) => {
-  const { contrato, importe, metodo } = req.body;
-  if (!contrato || toNum(importe) <= 0) return res.status(400).json({ message: 'Datos invalidos', code: 'VALIDATION_ERROR' });
-  const deb = await debitWalletWithTx(req.user.id, toNum(importe), metodo || 'EGCHAT', `SEGESA-${contrato}`, 'service_payment');
-  if (!deb.ok) return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
-  const response = { success: true, balance: deb.balance, referencia: safeRef('SEG'), message: 'Pago de electricidad completado' };
-  await createServiceOrder(req.user.id, 'segesa', 'pagar', importe, contrato, req.body, response);
-  res.json(response);
+app.post('/api/servicios/segesa/pagar', auth, walletLimiter, async (req, res) => {
+  const { factura_id } = req.body;
+  if (!factura_id) return res.status(400).json({
+    message: 'factura_id requerido: se paga una factura consultada, no un importe libre',
+    code: 'BILL_ID_REQUIRED',
+  });
+  const out = await servicePay('segesa', factura_id, req.user.id);
+  if (!out.ok) return res.status(out.http || 400).json(out);
+  await createServiceOrder(req.user.id, 'segesa', 'pagar', out.response.importe, out.response.bill_id, req.body, out.response);
+  res.json(out.response);
 });
 
 app.post('/api/servicios/snge/consultar', auth, async (req, res) => {
   const { contrato } = req.body;
   if (!contrato) return res.status(400).json({ message: 'Numero de contrato requerido', code: 'VALIDATION_ERROR' });
-  const response = { contrato, titular: 'Cliente SNGE', importe: Math.floor(Math.random()*8000)+2000, vencimiento: '2026-04-30', estado: 'pendiente', direccion: 'Malabo, Guinea Ecuatorial' };
-  await createServiceOrder(req.user.id, 'snge', 'consultar', 0, contrato, req.body, response);
-  res.json(response);
+  const out = await serviceConsult('snge', String(contrato), req.user.id);
+  if (!out.ok) return res.status(502).json(out);
+  await createServiceOrder(req.user.id, 'snge', 'consultar', 0, String(contrato), req.body, out);
+  res.json(out);
 });
 
-app.post('/api/servicios/snge/pagar', auth, async (req, res) => {
-  const { contrato, importe, metodo } = req.body;
-  if (!contrato || toNum(importe) <= 0) return res.status(400).json({ message: 'Datos invalidos', code: 'VALIDATION_ERROR' });
-  const deb = await debitWalletWithTx(req.user.id, toNum(importe), metodo || 'EGCHAT', `SNGE-${contrato}`, 'service_payment');
-  if (!deb.ok) return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
-  const response = { success: true, balance: deb.balance, referencia: safeRef('SNGE'), message: 'Pago de agua completado' };
-  await createServiceOrder(req.user.id, 'snge', 'pagar', importe, contrato, req.body, response);
-  res.json(response);
+app.post('/api/servicios/snge/pagar', auth, walletLimiter, async (req, res) => {
+  const { factura_id } = req.body;
+  if (!factura_id) return res.status(400).json({
+    message: 'factura_id requerido: se paga una factura consultada, no un importe libre',
+    code: 'BILL_ID_REQUIRED',
+  });
+  const out = await servicePay('snge', factura_id, req.user.id);
+  if (!out.ok) return res.status(out.http || 400).json(out);
+  await createServiceOrder(req.user.id, 'snge', 'pagar', out.response.importe, out.response.bill_id, req.body, out.response);
+  res.json(out.response);
 });
 
 app.post('/api/servicios/dgi/consultar', auth, async (req, res) => {
-  const { nif, tipo } = req.body;
+  const { nif } = req.body;
   if (!nif) return res.status(400).json({ message: 'NIF requerido', code: 'VALIDATION_ERROR' });
-  const response = { nif, tipo, importe: Math.floor(Math.random()*50000)+10000, periodo: '2026-T1', estado: 'pendiente', descripcion: `Impuesto ${tipo || 'general'}` };
-  await createServiceOrder(req.user.id, 'dgi', 'consultar', 0, nif, req.body, response);
-  res.json(response);
+  const out = await serviceConsult('dgi', String(nif), req.user.id);
+  if (!out.ok) return res.status(502).json(out);
+  await createServiceOrder(req.user.id, 'dgi', 'consultar', 0, String(nif), req.body, out);
+  res.json(out);
 });
 
-app.post('/api/servicios/dgi/pagar', auth, async (req, res) => {
-  const { nif, importe, referencia } = req.body;
-  if (!nif || toNum(importe) <= 0) return res.status(400).json({ message: 'Datos invalidos', code: 'VALIDATION_ERROR' });
-  const deb = await debitWalletWithTx(req.user.id, toNum(importe), 'EGCHAT', `DGI-${nif}-${referencia || 'R'}`, 'tax_payment');
-  if (!deb.ok) return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
-  const response = { success: true, balance: deb.balance, referencia: safeRef('DGI'), message: 'Pago de impuesto completado' };
-  await createServiceOrder(req.user.id, 'dgi', 'pagar', importe, nif, req.body, response);
-  res.json(response);
+app.post('/api/servicios/dgi/pagar', auth, walletLimiter, async (req, res) => {
+  const { factura_id } = req.body;
+  if (!factura_id) return res.status(400).json({
+    message: 'factura_id requerido: se paga una factura consultada, no un importe libre',
+    code: 'BILL_ID_REQUIRED',
+  });
+  const out = await servicePay('dgi', factura_id, req.user.id);
+  if (!out.ok) return res.status(out.http || 400).json(out);
+  await createServiceOrder(req.user.id, 'dgi', 'pagar', out.response.importe, out.response.bill_id, req.body, out.response);
+  res.json(out.response);
 });
 
-app.post('/api/servicios/correos/enviar', auth, async (req, res) => {
+// Las deudas las trae el proveedor (fichero, ventanilla o integración), jamás la
+// app. Cada fila repetida del mismo fichero se ignora por el indice unico.
+app.post('/api/servicios/facturas/cargar', auth, requireAdmin, async (req, res) => {
+  const filas = Array.isArray(req.body?.facturas) ? req.body.facturas : [];
+  if (!filas.length) return res.status(400).json({ message: 'facturas[] requerido', code: 'VALIDATION_ERROR' });
+
+  let creadas = 0, repetidas = 0, invalidas = 0;
+  for (const f of filas) {
+    const provider = String(f?.provider || '').toLowerCase();
+    const ref = String(f?.contract_ref ?? f?.contrato ?? f?.nif ?? '').trim();
+    const amount = roundAmount(Number(f?.amount ?? f?.importe ?? 0));
+    if (!SERVICE_BILL_PROVIDERS[provider] || !ref || !(amount > 0)) { invalidas++; continue; }
+    const { error } = await supabase.from('service_bills').insert({
+      provider,
+      contract_ref: ref,
+      user_id: f?.user_id || null,
+      amount,
+      currency: f?.currency || WALLET_CURRENCY,
+      period: f?.period || null,
+      concept: f?.concept || null,
+      due_date: f?.due_date || null,
+    });
+    if (error) {
+      if (/duplicate key|already exists/i.test(error.message || '')) { repetidas++; continue; }
+      console.error('cargar facturas error:', error.message);
+      invalidas++;
+      continue;
+    }
+    creadas++;
+  }
+
+  await logAudit(req.user.id, 'service_bills_loaded', 'services', 'carga', { filas: filas.length, creadas, repetidas, invalidas });
+  res.json({ filas: filas.length, creadas, repetidas, invalidas });
+});
+
+// Deuda del usuario en todos los proveedores, para que la app no tenga que
+// adivinar contratos. Con estado=todas o estado=pagadas también devuelve lo
+// abonado, así la pantalla de facturas puede enseñar el historial sin inventar.
+app.get('/api/servicios/facturas', auth, async (req, res) => {
+  const estado = String(req.query.estado || 'pendientes').toLowerCase();
+  let query = supabase
+    .from('service_bills')
+    .select('id, provider, contract_ref, amount, currency, period, concept, due_date, status, paid_at')
+    .or(`user_id.eq.${req.user.id},user_id.is.null`)
+    .order('due_date', { ascending: true });
+  if (estado === 'pendientes') query = query.eq('status', 'pending');
+  else if (estado === 'pagadas') query = query.eq('status', 'paid');
+
+  const { data, error } = await query;
+  if (error) return res.status(502).json({ message: error.message, code: 'BILLS_UNAVAILABLE' });
+  const facturas = data || [];
+  const pendientes = facturas.filter(f => f.status === 'pending');
+  res.json({
+    facturas,
+    total: pendientes.reduce((s, f) => s + Number(f.amount || 0), 0),
+    por_proveedor: pendientes.reduce((acc, f) => {
+      acc[f.provider] = (acc[f.provider] || 0) + Number(f.amount || 0);
+      return acc;
+    }, {}),
+  });
+});
+
+// Servicios que aun no tienen canal de cobro (matricula, reserva de hotel,
+// vuelo, inversion...). La solicitud queda registrada en service_orders con
+// importe 0 para que el comercio la revise: aqui no sale dinero de la cartera
+// y, sin fila insertada, la app no puede dar por confirmada nada.
+const SOLICITUD_SERVICIOS = [
+  'educacion', 'hoteles', 'restaurantes', 'comida', 'vuelos', 'inversiones',
+  'bancos', 'internet', 'canales', 'lavanderia', 'belleza', 'gasolineras', 'tienda',
+  'recarga',
+];
+
+app.post('/api/servicios/solicitud', auth, async (req, res) => {
+  const { provider, tipo, referencia, datos, external_id } = req.body || {};
+  const servicio = String(provider || '').toLowerCase();
+  if (!SOLICITUD_SERVICIOS.includes(servicio)) {
+    return res.status(400).json({ message: 'Servicio no reconocido', code: 'VALIDATION_ERROR' });
+  }
+
+  // Repetir la misma referencia no duplica la solicitud.
+  const ref = String(external_id || '').trim() || safeRef(servicio.toUpperCase());
+  const { data: previa } = await supabase.from('service_orders')
+    .select('order_ref, status').eq('order_ref', ref).eq('user_id', req.user.id).maybeSingle();
+  if (previa) {
+    return res.json({ solicitudId: previa.order_ref, status: previa.status, idempotent: true, message: 'La solicitud ya estaba registrada' });
+  }
+
+  const { data: orden, error } = await supabase.from('service_orders').insert({
+    order_ref: ref,
+    user_id: req.user.id,
+    provider: servicio,
+    service_type: String(tipo || 'solicitud'),
+    contract_ref: referencia ? String(referencia) : null,
+    amount: 0,
+    status: 'pending',
+    payload: datos || {},
+    response: { needs_confirmation: true },
+  }).select('order_ref, status, created_at').maybeSingle();
+  if (error || !orden) {
+    console.error('Solicitud de servicio:', error?.message);
+    return res.status(502).json({ message: 'No se pudo registrar la solicitud', code: 'REQUEST_NOT_SAVED' });
+  }
+
+  await logAudit(req.user.id, 'service_request', servicio, orden.order_ref, { tipo, referencia });
+  res.status(201).json({
+    solicitudId: orden.order_ref,
+    status: orden.status,
+    message: 'Solicitud registrada. El comercio debe confirmarla; todavia no se ha cobrado nada.',
+  });
+});
+
+// Listado de solicitudes del usuario para que la app enseñe el historial desde
+// la base de datos y no desde un array que se pierde al cerrar la pantalla.
+app.get('/api/servicios/solicitudes', auth, async (req, res) => {
+  const provider = String(req.query.provider || '').toLowerCase();
+  let query = supabase
+    .from('service_orders')
+    .select('order_ref, provider, service_type, contract_ref, amount, status, payload, response, created_at')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false })
+    .limit(50);
+  if (provider) query = query.eq('provider', provider);
+  const { data, error } = await query;
+  if (error) return res.status(502).json({ message: 'No se pudieron listar las solicitudes', code: 'REQUESTS_UNAVAILABLE' });
+  res.json(data || []);
+});
+
+app.post('/api/servicios/correos/enviar', auth, walletLimiter, async (req, res) => {
   const { destinatario, peso, tipo } = req.body;
   if (!destinatario) return res.status(400).json({ message: 'destinatario requerido', code: 'VALIDATION_ERROR' });
-  const tarifa = tipo === 'express' ? 5000 : 2500;
-  const response = { tracking: `EG${Date.now()}`, tarifa, estimado: tipo === 'express' ? '1-2 dias' : '3-5 dias', destinatario, message: 'Paquete registrado correctamente' };
-  await createServiceOrder(req.user.id, 'correos', 'enviar', tarifa, destinatario, { destinatario, peso, tipo }, response);
+  const variant = ['nacional', 'express', 'internacional', 'apartado'].includes(tipo) ? tipo : 'nacional';
+
+  const tarifa = await readTariff('correos', variant);
+  if (!tarifa) return res.status(502).json({ message: 'Tarifa de Correos no disponible', code: 'TARIFF_UNAVAILABLE' });
+
+  const tracking = `EG${Date.now()}`;
+  const cargo = await serviceCharge(req.user.id, 'correos', variant, tracking);
+  if (!cargo.ok) return res.status(cargo.http || 400).json(cargo);
+
+  const balance = await readWalletBalance(req.user.id);
+  const response = {
+    tracking,
+    tarifa: Number(cargo.amount),
+    variante: variant,
+    estimado: variant === 'express' ? '1-2 dias' : '3-5 dias',
+    destinatario,
+    journal_id: cargo.journal_id,
+    balance,
+    message: 'Paquete registrado y pagado',
+  };
+  await createServiceOrder(req.user.id, 'correos', 'enviar', Number(cargo.amount), destinatario, { destinatario, peso, tipo: variant }, response);
   res.json(response);
 });
 
 app.get('/api/servicios/orders', auth, async (req, res) => {
   const { data } = await supabase.from('service_orders').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
   res.json(data || []);
-});
-
-// ════════════════════════════════════════════════════════════════════
-// RECARGAS MÓVILES
-// ════════════════════════════════════════════════════════════════════
-const MOBILE_OPERATORS = [
-  { id: 'getesa', name: 'GETESA', code: '+240 222', color: '#1485EE' },
-  { id: 'gecomsa', name: 'GECOMSA', code: '+240 333', color: '#2E9E6B' },
-  { id: 'orange', name: 'Orange GE', code: '+240 555', color: '#FF8C00' }
-];
-
-const MOBILE_PACKAGES = {
-  getesa: [
-    { id: 'g1', name: 'Recarga 1000 XAF', type: 'saldo', price: 1000, validity: '30 días', desc: '1000 XAF de saldo' },
-    { id: 'g2', name: 'Recarga 2500 XAF', type: 'saldo', price: 2500, validity: '30 días', desc: '2500 XAF de saldo' },
-    { id: 'g3', name: 'Pack Datos 1GB', type: 'datos', price: 3000, validity: '7 días', desc: '1GB de datos móviles' },
-    { id: 'g4', name: 'Pack Datos 5GB', type: 'datos', price: 8000, validity: '30 días', desc: '5GB de datos móviles' },
-    { id: 'g5', name: 'Pack Llamadas', type: 'minutos', price: 2000, validity: '7 días', desc: '60 minutos gratis' }
-  ],
-  gecomsa: [
-    { id: 'c1', name: 'Recarga 1000 XAF', type: 'saldo', price: 1000, validity: '30 días', desc: '1000 XAF de saldo' },
-    { id: 'c2', name: 'Recarga 2500 XAF', type: 'saldo', price: 2500, validity: '30 días', desc: '2500 XAF de saldo' },
-    { id: 'c3', name: 'Pack Datos 2GB', type: 'datos', price: 4000, validity: '15 días', desc: '2GB de datos móviles' },
-    { id: 'c4', name: 'Pack Datos 10GB', type: 'datos', price: 12000, validity: '30 días', desc: '10GB de datos móviles' }
-  ],
-  orange: [
-    { id: 'o1', name: 'Recarga 1500 XAF', type: 'saldo', price: 1500, validity: '30 días', desc: '1500 XAF de saldo' },
-    { id: 'o2', name: 'Recarga 3000 XAF', type: 'saldo', price: 3000, validity: '30 días', desc: '3000 XAF de saldo' },
-    { id: 'o3', name: 'Pack Orange 3GB', type: 'datos', price: 5000, validity: '30 días', desc: '3GB de datos Orange' },
-    { id: 'o4', name: 'Pack Orange Ilimitado', type: 'datos', price: 15000, validity: '30 días', desc: 'Datos ilimitados' }
-  ]
-};
-
-// Obtener operadores móviles disponibles
-app.get('/api/services/mobile/operators', auth, async (req, res) => {
-  res.json(MOBILE_OPERATORS);
-});
-
-// Obtener paquetes de un operador específico
-app.get('/api/services/mobile/operators/:operatorId/packages', auth, async (req, res) => {
-  const { operatorId } = req.params;
-  const packages = MOBILE_PACKAGES[operatorId] || [];
-  res.json(packages);
-});
-
-// Procesar recarga móvil
-app.post('/api/services/mobile/recharge', auth, async (req, res) => {
-  const { operatorId, packageId, phone, amount } = req.body;
-  
-  if (!operatorId || !packageId || !phone || !amount) {
-    return res.status(400).json({ message: 'Datos incompletos', code: 'VALIDATION_ERROR' });
-  }
-
-  const operator = MOBILE_OPERATORS.find(op => op.id === operatorId);
-  const packages = MOBILE_PACKAGES[operatorId] || [];
-  const pkg = packages.find(p => p.id === packageId);
-
-  if (!operator || !pkg) {
-    return res.status(400).json({ message: 'Operador o paquete no válido', code: 'VALIDATION_ERROR' });
-  }
-
-  if (amount !== pkg.price) {
-    return res.status(400).json({ message: 'Monto incorrecto', code: 'VALIDATION_ERROR' });
-  }
-
-  // Debitar del monedero
-  const deb = await debitWalletWithTx(req.user.id, amount, 'EGCHAT', `${operatorId.toUpperCase()}-${phone}`, 'mobile_recharge');
-  if (!deb.ok) {
-    return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
-  }
-
-  const response = {
-    success: true,
-    balance: deb.balance,
-    referencia: safeRef('REC'),
-    operator: operator.name,
-    phone,
-    package: pkg.name,
-    amount,
-    validity: pkg.validity,
-    message: `Recarga ${pkg.name} completada para ${phone}`
-  };
-
-  // Crear orden de servicio
-  await createServiceOrder(req.user.id, 'mobile_recharge', operatorId, amount, phone, req.body, response);
-  
-  res.json(response);
-});
-
-// Obtener historial de recargas
-app.get('/api/services/mobile/history', auth, async (req, res) => {
-  const { data } = await supabase
-    .from('service_orders')
-    .select('*')
-    .eq('user_id', req.user.id)
-    .eq('provider', 'mobile_recharge')
-    .order('created_at', { ascending: false });
-  
-  res.json(data || []);
-});
-
-// ════════════════════════════════════════════════════════════════════
-// GESTIÓN DE FACTURAS PERSONALES
-// ════════════════════════════════════════════════════════════════════
-const BILL_CATEGORIES = [
-  { id: 'electricidad', name: 'Electricidad', icon: '⚡', provider: 'SEGESA', color: '#F59E0B' },
-  { id: 'agua', name: 'Agua', icon: '💧', provider: 'SNGE', color: '#06B6D4' },
-  { id: 'telefono', name: 'Teléfono', icon: '📞', provider: 'GETESA', color: '#8B5CF6' },
-  { id: 'internet', name: 'Internet', icon: '🌐', provider: 'GECOMSA', color: '#10B981' },
-  { id: 'seguro', name: 'Seguro', icon: '🛡️', provider: 'COGE', color: '#F59E0B' },
-  { id: 'impuestos', name: 'Impuestos', icon: '🏛️', provider: 'DGI', color: '#EF4444' },
-  { id: 'alquiler', name: 'Alquiler', icon: '🏠', provider: '', color: '#6B7280' },
-  { id: 'otros', name: 'Otros', icon: '📄', provider: '', color: '#9CA3AF' }
-];
-
-// Obtener categorías de facturas
-app.get('/api/services/bills/categories', auth, async (req, res) => {
-  res.json(BILL_CATEGORIES);
-});
-
-// Crear nueva factura personal
-app.post('/api/services/bills', auth, async (req, res) => {
-  const { service, provider, amount, dueDate, reference, categoryId } = req.body;
-  
-  if (!service || !amount || !dueDate) {
-    return res.status(400).json({ message: 'Datos incompletos', code: 'VALIDATION_ERROR' });
-  }
-
-  const category = BILL_CATEGORIES.find(c => c.id === categoryId);
-  const billData = {
-    user_id: req.user.id,
-    service: service,
-    provider: provider || category?.provider || '',
-    amount: parseInt(amount, 10),
-    due_date: dueDate,
-    reference: reference || '',
-    category_id: categoryId || 'otros',
-    icon: category?.icon || '📄',
-    color: category?.color || '#9CA3AF',
-    status: 'pendiente',
-    created_at: new Date().toISOString()
-  };
-
-  const { data: bill, error } = await supabase
-    .from('user_bills')
-    .insert(billData)
-    .select()
-    .single();
-
-  if (error) {
-    console.error('Create bill error:', error);
-    return res.status(500).json({ message: 'Error al crear factura' });
-  }
-
-  res.json({ success: true, bill });
-});
-
-// Obtener facturas del usuario
-app.get('/api/services/bills', auth, async (req, res) => {
-  const { status } = req.query;
-  
-  let query = supabase
-    .from('user_bills')
-    .select('*')
-    .eq('user_id', req.user.id)
-    .order('due_date', { ascending: true });
-
-  if (status && status !== 'todas') {
-    query = query.eq('status', status);
-  }
-
-  const { data: bills } = await query;
-  res.json(bills || []);
-});
-
-// Pagar factura personal
-app.post('/api/services/bills/:billId/pay', auth, async (req, res) => {
-  const { billId } = req.params;
-  const { paymentMethod = 'EGCHAT' } = req.body;
-
-  // Obtener factura
-  const { data: bill, error: billError } = await supabase
-    .from('user_bills')
-    .select('*')
-    .eq('id', billId)
-    .eq('user_id', req.user.id)
-    .single();
-
-  if (billError || !bill) {
-    return res.status(404).json({ message: 'Factura no encontrada' });
-  }
-
-  if (bill.status === 'pagada') {
-    return res.status(400).json({ message: 'La factura ya está pagada' });
-  }
-
-  // Debitar del monedero
-  const deb = await debitWalletWithTx(req.user.id, bill.amount, paymentMethod, `BILL-${billId}`, 'bill_payment');
-  if (!deb.ok) {
-    return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
-  }
-
-  // Marcar factura como pagada
-  const { error: updateError } = await supabase
-    .from('user_bills')
-    .update({ 
-      status: 'pagada',
-      paid_at: new Date().toISOString()
-    })
-    .eq('id', billId);
-
-  if (updateError) {
-    console.error('Update bill error:', updateError);
-    return res.status(500).json({ message: 'Error al actualizar factura' });
-  }
-
-  const response = {
-    success: true,
-    balance: deb.balance,
-    referencia: safeRef('PAY'),
-    service: bill.service,
-    amount: bill.amount,
-    message: `Pago de ${bill.service} completado`
-  };
-
-  // Crear orden de servicio para el historial
-  await createServiceOrder(req.user.id, 'bill_payment', bill.category_id, bill.amount, bill.reference, 
-    { billId, service: bill.service }, response);
-
-  res.json(response);
-});
-
-// Eliminar factura personal
-app.delete('/api/services/bills/:billId', auth, async (req, res) => {
-  const { billId } = req.params;
-
-  const { error } = await supabase
-    .from('user_bills')
-    .delete()
-    .eq('id', billId)
-    .eq('user_id', req.user.id);
-
-  if (error) {
-    console.error('Delete bill error:', error);
-    return res.status(500).json({ message: 'Error al eliminar factura' });
-  }
-
-  res.json({ success: true, message: 'Factura eliminada' });
 });
 
 // ════════════════════════════════════════════════════════════════════
@@ -3837,14 +5701,6 @@ const SUPERMERCADOS = [
   { id: '2', name: 'Tienda Bata Centro', city: 'Bata', address: 'Av. Hassan II', phone: '+240 333 001', open: true },
   { id: '3', name: 'Mercado Mongomo', city: 'Mongomo', address: 'Plaza Central', phone: '+240 444 001', open: false },
 ];
-const PRODUCTOS = [
-  { id: '1', name: 'Arroz 5kg', price: 3500, category: 'AlimentaciÁƒÂ³n', stock: 50 },
-  { id: '2', name: 'Aceite 1L', price: 1200, category: 'AlimentaciÁƒÂ³n', stock: 30 },
-  { id: '3', name: 'Agua 6x1.5L', price: 2000, category: 'Bebidas', stock: 100 },
-  { id: '4', name: 'Leche 1L', price: 800, category: 'LÁƒÂ¡cteos', stock: 20 },
-  { id: '5', name: 'Pan de molde', price: 600, category: 'PanaderÁƒÂ­a', stock: 15 },
-];
-
 app.get('/api/supermarkets', auth, async (req, res) => {
   const { city } = req.query;
   const result = city ? SUPERMERCADOS.filter(s => s.city.toLowerCase() === city.toLowerCase()) : SUPERMERCADOS;
@@ -3852,21 +5708,40 @@ app.get('/api/supermarkets', auth, async (req, res) => {
 });
 
 app.get('/api/supermarkets/:smId/products', auth, async (req, res) => {
-  const { cat } = req.query;
-  const result = cat ? PRODUCTOS.filter(p => p.category === cat) : PRODUCTOS;
-  res.json(result);
+  const productos = await readProducts(req.query.cat
+    ? { category: req.query.cat }
+    : { notCategory: 'Medicamentos' });
+  if (productos === null) return res.status(502).json({ message: 'Catalogo no disponible', code: 'CATALOG_UNAVAILABLE' });
+  res.json(productos);
 });
 
-app.post('/api/supermarkets/orders', auth, async (req, res) => {
+app.post('/api/supermarkets/orders', auth, walletLimiter, async (req, res) => {
   const { items, supermarketId, address, external_id } = req.body;
   if (external_id) {
     const { data: existing } = await supabase.from('service_orders').select('*').eq('order_ref', external_id).eq('user_id', req.user.id).maybeSingle();
     if (existing) return res.json({ orderId: existing.order_ref, status: existing.status, total: existing.amount, balance: null, eta: '30-45 min', idempotent: true });
   }
-  const total = items?.reduce((s, i) => s + (i.price * i.qty), 0) || 0;
-  const deb = await debitWalletWithTx(req.user.id, total, 'EGCHAT', `SUPER-${supermarketId}`, 'shopping_payment');
-  if (!deb.ok) return res.status(400).json({ message: deb.message, code: 'INSUFFICIENT_BALANCE' });
+  // El cuerpo puede traer precios: se ignoran. El total lo pone service_products.
+  const pedido = (Array.isArray(items) ? items : []).map(i => ({
+    product_id: String(i?.product_id ?? i?.id ?? '').trim(),
+    qty: Number(i?.qty ?? i?.cantidad ?? 1),
+  })).filter(i => i.product_id && i.qty > 0);
+  if (!pedido.length) {
+    return res.status(400).json({ message: 'Pedido vacio: cada linea necesita product_id y cantidad', code: 'VALIDATION_ERROR' });
+  }
+
   const orderId = external_id || safeRef('ORD');
+  const cargo = await serviceBasketCharge(req.user.id, orderId, pedido);
+  if (!cargo.ok) {
+    return res.status(cargo.http || 400).json({
+      message: cargo.code === 'PRODUCT_NOT_FOUND' ? 'Algun producto ya no esta en el catalogo'
+        : cargo.message || 'No se pudo completar el pedido',
+      code: cargo.code || 'ORDER_FAILED',
+    });
+  }
+
+  const total = Number(cargo.amount);
+  const balance = await readWalletBalance(req.user.id);
   await supabase.from('service_orders').upsert({
     order_ref: orderId,
     user_id: req.user.id,
@@ -3875,11 +5750,11 @@ app.post('/api/supermarkets/orders', auth, async (req, res) => {
     contract_ref: String(supermarketId || ''),
     amount: total,
     status: 'completed',
-    payload: { items: items || [], address: address || '' },
-    response: { eta: '30-45 min' }
+    payload: { items: cargo.lines || pedido, address: address || '' },
+    response: { eta: '30-45 min', journal_id: cargo.journal_id }
   }, { onConflict: 'order_ref' });
-  await logAudit(req.user.id, 'supermarket_order_create', 'supermarkets', orderId, { total, supermarketId });
-  res.json({ orderId, status: 'confirmed', total, balance: deb.balance, eta: '30-45 min' });
+  await logAudit(req.user.id, 'supermarket_order_create', 'supermarkets', orderId, { total, supermarketId, journal_id: cargo.journal_id });
+  res.json({ orderId, status: 'confirmed', total, balance, eta: '30-45 min', journal_id: cargo.journal_id });
 });
 
 app.get('/api/supermarkets/orders', auth, async (req, res) => {
@@ -3932,21 +5807,32 @@ app.post('/api/salud/citas', auth, async (req, res) => {
 });
 
 app.get('/api/salud/medicamentos', auth, async (req, res) => {
-  const { q } = req.query;
-  const meds = [
-    { id: '1', name: 'Paracetamol 500mg', price: 500, stock: true },
-    { id: '2', name: 'Ibuprofeno 400mg', price: 800, stock: true },
-    { id: '3', name: 'Amoxicilina 500mg', price: 1500, stock: false },
-    { id: '4', name: 'Omeprazol 20mg', price: 1200, stock: true },
-  ];
-  const result = q ? meds.filter(m => m.name.toLowerCase().includes(q.toLowerCase())) : meds;
-  res.json(result);
+  const meds = await readProducts({ category: 'Medicamentos', q: req.query.q });
+  if (meds === null) return res.status(502).json({ message: 'Catalogo no disponible', code: 'CATALOG_UNAVAILABLE' });
+  res.json(meds);
 });
 
-app.post('/api/salud/medicamentos/pedido', auth, async (req, res) => {
-  const { items, farmaciaId, direccion, external_id } = req.body;
-  const total = items?.reduce((s, i) => s + (i.price * i.qty), 0) || 0;
+app.post('/api/salud/medicamentos/pedido', auth, walletLimiter, async (req, res) => {
+  const { items, farmaciaId, direccion, external_id } = req.body || {};
+  const pedido = (Array.isArray(items) ? items : []).map(i => ({
+    product_id: String(i?.product_id ?? i?.id ?? '').trim(),
+    qty: Number(i?.qty ?? i?.cantidad ?? 1),
+  })).filter(i => i.product_id && i.qty > 0);
+  if (!pedido.length) {
+    return res.status(400).json({ message: 'Pedido vacio: cada linea necesita product_id y cantidad', code: 'VALIDATION_ERROR' });
+  }
+
   const orderId = external_id || safeRef('MED');
+  const cargo = await serviceBasketCharge(req.user.id, orderId, pedido, 'farmacia');
+  if (!cargo.ok) {
+    return res.status(cargo.http || 400).json({
+      message: cargo.code === 'PRODUCT_NOT_FOUND' ? 'Algun producto ya no esta en el catalogo'
+        : cargo.message || 'No se pudo completar el pedido',
+      code: cargo.code || 'ORDER_FAILED',
+    });
+  }
+
+  const total = Number(cargo.amount);
   await supabase.from('service_orders').upsert({
     order_ref: orderId,
     user_id: req.user.id,
@@ -3955,344 +5841,82 @@ app.post('/api/salud/medicamentos/pedido', auth, async (req, res) => {
     contract_ref: String(farmaciaId || ''),
     amount: total,
     status: 'completed',
-    payload: { items: items || [], direccion: direccion || '' },
-    response: { eta: '20-30 min' }
+    payload: { items: cargo.lines || pedido, direccion: direccion || '' },
+    response: { eta: '20-30 min', journal_id: cargo.journal_id }
   }, { onConflict: 'order_ref' });
-  res.json({ orderId, status: 'confirmed', total, eta: '20-30 min', message: 'Pedido de medicamentos confirmado' });
+  await logAudit(req.user.id, 'medicament_order_create', 'salud', orderId, { total, farmaciaId, journal_id: cargo.journal_id });
+  res.json({ orderId, status: 'confirmed', total, balance: await readWalletBalance(req.user.id), eta: '20-30 min', journal_id: cargo.journal_id, message: 'Pedido de medicamentos confirmado y pagado' });
 });
 
-// ══════════════════════════════════════════════════════════════════
-// TAXI — v2: tarifas reales, conductores múltiples, ETA dinámico,
-//           historial, estimación por distancia
-// ══════════════════════════════════════════════════════════════════
-
-// Tarifas reales por tipo (XAF: base + por km)
-const TAXI_FARES = {
-  moto:    { base: 300,  perKm: 150, minFare: 500  },
-  taxi:    { base: 500,  perKm: 250, minFare: 1000 },
-  suv:     { base: 800,  perKm: 400, minFare: 2000 },
-  vip:     { base: 1500, perKm: 700, minFare: 3500 },
-  cargo:   { base: 1000, perKm: 500, minFare: 2500 },
-  van:     { base: 1200, perKm: 550, minFare: 3000 },
-  minivan: { base: 900,  perKm: 450, minFare: 2200 },
-};
-
-function calcTaxiFare(type, distanceKm) {
-  const f = TAXI_FARES[type] || TAXI_FARES.taxi;
-  const km = Math.max(1, distanceKm || 3); // mínimo 1 km
-  const total = f.base + f.perKm * km;
-  return Math.max(f.minFare, Math.round(total / 100) * 100);
-}
-
-// Conductores por tipo de vehículo (pool real)
-const DRIVERS_POOL = {
-  moto: [
-    { name: 'Mba Nzang', rating: 4.7, plate: 'GE-4521M', vehicle: 'Honda CB150', phone: '+240 222 301 101', initials: 'MN' },
-    { name: 'Nkogo Obiang', rating: 4.8, plate: 'GE-6812M', vehicle: 'Yamaha YBR', phone: '+240 222 302 202', initials: 'NO' },
-    { name: 'Esono Mba', rating: 4.6, plate: 'GE-9001M', vehicle: 'Honda Wave', phone: '+240 222 303 303', initials: 'EM' },
-  ],
-  taxi: [
-    { name: 'Carlos Mba', rating: 4.9, plate: 'GE-1234', vehicle: 'Toyota Corolla', phone: '+240 222 400 100', initials: 'CM' },
-    { name: 'José Nguema', rating: 4.8, plate: 'GE-5678', vehicle: 'Toyota Camry', phone: '+240 222 400 200', initials: 'JN' },
-    { name: 'Pedro Ondo', rating: 4.7, plate: 'GE-9012', vehicle: 'Hyundai Elantra', phone: '+240 222 400 300', initials: 'PO' },
-    { name: 'Marcos Edu', rating: 4.9, plate: 'GE-3456', vehicle: 'Toyota Vios', phone: '+240 222 400 400', initials: 'ME' },
-  ],
-  suv: [
-    { name: 'Antonio Ndong', rating: 4.9, plate: 'GE-7890', vehicle: 'Toyota RAV4', phone: '+240 222 500 100', initials: 'AN' },
-    { name: 'Francisco Ela', rating: 4.8, plate: 'GE-2345', vehicle: 'Mitsubishi Outlander', phone: '+240 222 500 200', initials: 'FE' },
-    { name: 'Bernardo Mba', rating: 4.9, plate: 'GE-6789', vehicle: 'Toyota Fortuner', phone: '+240 222 500 300', initials: 'BM' },
-  ],
-  vip: [
-    { name: 'Rodrigo Nsue', rating: 5.0, plate: 'GE-0001', vehicle: 'Mercedes C-Class', phone: '+240 222 600 100', initials: 'RN' },
-    { name: 'Eduardo Mangue', rating: 4.9, plate: 'GE-0002', vehicle: 'BMW Serie 5', phone: '+240 222 600 200', initials: 'EM' },
-    { name: 'Víctor Micha', rating: 5.0, plate: 'GE-0003', vehicle: 'Lexus ES 350', phone: '+240 222 600 300', initials: 'VM' },
-  ],
-  cargo: [
-    { name: 'Manuel Eyama', rating: 4.6, plate: 'GE-C101', vehicle: 'Toyota Hilux', phone: '+240 222 700 100', initials: 'ME' },
-    { name: 'Agustín Ndong', rating: 4.7, plate: 'GE-C102', vehicle: 'Ford Ranger', phone: '+240 222 700 200', initials: 'AN' },
-  ],
-  van: [
-    { name: 'Constantino Mba', rating: 4.8, plate: 'GE-V201', vehicle: 'Toyota Hiace 8p', phone: '+240 222 800 100', initials: 'CM' },
-    { name: 'Fortunato Nze', rating: 4.7, plate: 'GE-V202', vehicle: 'Nissan Urvan', phone: '+240 222 800 200', initials: 'FN' },
-  ],
-  minivan: [
-    { name: 'Silvano Eyi', rating: 4.8, plate: 'GE-MV01', vehicle: 'Toyota Noah 6p', phone: '+240 222 900 100', initials: 'SE' },
-    { name: 'Celestino Abeso', rating: 4.7, plate: 'GE-MV02', vehicle: 'Nissan Serena', phone: '+240 222 900 200', initials: 'CA' },
-  ],
-};
-
-function pickDriver(type) {
-  const pool = DRIVERS_POOL[type] || DRIVERS_POOL.taxi;
-  return pool[Math.floor(Math.random() * pool.length)];
-}
-
-// ETA dinámico por tipo (minutos)
-const ETA_BY_TYPE = { moto: 2, taxi: 4, suv: 5, vip: 7, cargo: 8, van: 9, minivan: 6 };
-
-// Haversine distance en km
-function haversineKm(a, b) {
-  if (!a || !b) return 3;
-  const R = 6371;
-  const dLat = (b.lat - a.lat) * Math.PI / 180;
-  const dLng = (b.lng - a.lng) * Math.PI / 180;
-  const hav = Math.sin(dLat/2)**2
-    + Math.cos(a.lat*Math.PI/180) * Math.cos(b.lat*Math.PI/180) * Math.sin(dLng/2)**2;
-  return R * 2 * Math.atan2(Math.sqrt(hav), Math.sqrt(1-hav));
-}
-
-// Estimación de tarifa (sin pedir viaje)
-app.post('/api/taxi/estimate', auth, async (req, res) => {
+// ════════════════════════════════════════════════════════════════════
+// TAXI
+// ════════════════════════════════════════════════════════════════════
+app.post('/api/taxi/request', auth, walletLimiter, async (req, res) => {
   try {
-    const { type, originLat, originLng, destLat, destLng, distanceKm } = req.body;
-    const km = distanceKm || haversineKm(
-      originLat ? { lat: originLat, lng: originLng } : null,
-      destLat   ? { lat: destLat,   lng: destLng   } : null,
-    );
-    const tarifa = calcTaxiFare(type || 'taxi', km);
-    const eta    = ETA_BY_TYPE[type] || 4;
-    res.json({ tarifa, distanceKm: Math.round(km * 10) / 10, eta, currency: 'XAF' });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
+    const { origin, dest, type } = req.body;
+    if (!origin || !dest) return res.status(400).json({ message: 'origin y dest requeridos', code: 'VALIDATION_ERROR' });
+    const variant = ['moto', 'basic', 'premium'].includes(type) ? type : 'basic';
 
-app.post('/api/taxi/request', auth, async (req, res) => {
-  try {
-    const { origin, dest, type, originLat, originLng, destLat, destLng,
-            paymentMethod = 'wallet' } = req.body;
-    if (!origin || !dest) return res.status(400).json({ message: 'origin y dest requeridos' });
-
-    // Distancia y tarifa reales
-    const km     = haversineKm(
-      originLat ? { lat: originLat, lng: originLng } : null,
-      destLat   ? { lat: destLat,   lng: destLng   } : null,
-    );
-    const tarifa = calcTaxiFare(type || 'taxi', km);
-    const eta    = ETA_BY_TYPE[type] || 4;
-    const driver = pickDriver(type || 'taxi');
-
-    // Validar wallet solo si paga con wallet
-    if (paymentMethod === 'wallet') {
-      let wallet = null;
-      try {
-        const { data } = await supabase.from('wallets').select('balance').eq('user_id', req.user.id).single();
-        wallet = data;
-      } catch (e) { console.warn('Wallet query failed:', e.message); }
-      if (!wallet || tarifa > Number(wallet.balance || 0)) {
-        return res.status(400).json({ message: `Saldo insuficiente. Se necesitan ${tarifa.toLocaleString()} XAF.` });
-      }
-    }
+    const tarifa = await readTariff('taxi', variant);
+    if (!tarifa) return res.status(502).json({ message: 'Tarifa de taxi no disponible', code: 'TARIFF_UNAVAILABLE' });
 
     const rideId = safeRef('RIDE');
-    const insertData = {
+    const driver = { name: 'Carlos Mba', phone: '+240 222 555', rating: 4.8, plate: 'GE-1234', vehicle: variant === 'moto' ? 'Moto Honda' : 'Toyota Corolla' };
+
+    // El viaje se escribe antes de cobrar: si no queda fila, no hay cargo.
+    const { data: ride, error: rideError } = await supabase.from('taxi_rides').insert({
       ride_ref: rideId,
       user_id: req.user.id,
       origin,
       destination: dest,
-      ride_type: type || 'taxi',
-      fare: tarifa,
-      distance_km: Math.round(km * 10) / 10,
-      eta_minutes: eta,
+      ride_type: variant,
+      fare: Number(tarifa.amount),
       status: 'searching',
-      payment_method: paymentMethod,
-      driver_name: driver.name,
-      driver_rating: driver.rating,
-      driver_plate: driver.plate,
-      driver_vehicle: driver.vehicle,
-      driver_phone: driver.phone,
-    };
-
-    let ride = null;
-    try {
-      const { data } = await supabase.from('taxi_rides').insert(insertData).select().maybeSingle();
-      ride = data;
-    } catch (insertErr) {
-      console.warn('taxi_rides insert failed, using fallback:', insertErr.message);
-      ride = { id: rideId, ...insertData, created_at: new Date().toISOString() };
-      getUserStore(taxiFallbackStore, req.user.id).push(ride);
+      driver,
+    }).select().maybeSingle();
+    if (rideError || !ride) {
+      console.error('taxi_rides insert:', rideError?.message || 'sin fila insertada');
+      return res.status(502).json({ message: 'No se pudo registrar el viaje', code: 'RIDE_NOT_SAVED' });
     }
 
-    // Simular progreso: searching → matched → riding → completed en el backend
-    const rideRef = ride?.ride_ref || rideId;
-    setTimeout(async () => {
-      try {
-        await supabase.from('taxi_rides').update({ status: 'matched' }).eq('ride_ref', rideRef);
-        const us = getUserStore(taxiFallbackStore, req.user.id);
-        const fi = us.findIndex(r => r.ride_ref === rideRef);
-        if (fi !== -1) us[fi].status = 'matched';
-      } catch {}
-    }, 5000);
+    const cargo = await serviceCharge(req.user.id, 'taxi', variant, rideId);
+    if (!cargo.ok) {
+      await supabase.from('taxi_rides').update({ status: 'cancelled', updated_at: new Date().toISOString() })
+        .eq('id', ride.id).eq('charged_at', null);
+      return res.status(cargo.http || 400).json(cargo.code === 'INSUFFICIENT_BALANCE'
+        ? { message: 'Saldo insuficiente', code: 'INSUFFICIENT_BALANCE' }
+        : { message: 'No se pudo cobrar el viaje', code: cargo.code || 'CHARGE_FAILED' });
+    }
 
-    setTimeout(async () => {
-      try {
-        await supabase.from('taxi_rides').update({ status: 'riding' }).eq('ride_ref', rideRef);
-        const us = getUserStore(taxiFallbackStore, req.user.id);
-        const fi = us.findIndex(r => r.ride_ref === rideRef);
-        if (fi !== -1) us[fi].status = 'riding';
-      } catch {}
-    }, eta * 60 * 1000 + 5000);
-
-    try { await logAudit(req.user.id, 'taxi_request', 'taxi', ride?.id || rideId, { tarifa, type }); } catch {}
+    await supabase.from('taxi_rides')
+      .update({ status: 'assigned', charged_at: new Date().toISOString(), journal_id: cargo.journal_id })
+      .eq('id', ride.id);
+    await logAudit(req.user.id, 'taxi_request', 'taxi', ride.id, { fare: Number(cargo.amount), variant });
 
     res.json({
       rideId,
       driver,
-      eta,
-      tarifa,
-      distanceKm: Math.round(km * 10) / 10,
-      type: type || 'taxi',
-      status: 'searching',
-      paymentMethod,
+      eta: Math.floor(Math.random() * 8) + 3,
+      tarifa: Number(cargo.amount),
+      type: variant,
+      status: 'assigned',
+      balance: await readWalletBalance(req.user.id),
+      journal_id: cargo.journal_id,
     });
-  } catch (e) {
-    console.error('Taxi request error:', e);
-    res.status(500).json({ message: 'Error al solicitar taxi' });
+  } catch (error) {
+    console.error('Taxi request error:', error);
+    res.status(500).json({ message: 'Error al solicitar taxi', code: 'INTERNAL_ERROR' });
   }
 });
 
 app.get('/api/taxi/:rideId/status', auth, async (req, res) => {
   try {
-    let ride = null;
-    try {
-      const { data } = await supabase.from('taxi_rides')
-        .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
-      ride = data;
-    } catch (e) { console.warn('Taxi status query failed:', e.message); }
-
-    if (!ride) {
-      const userRides = getUserStore(taxiFallbackStore, req.user.id);
-      ride = userRides.find(r => r.ride_ref === req.params.rideId);
-    }
-
-    if (!ride) return res.status(404).json({ message: 'Viaje no encontrado' });
-
-    res.json({
-      rideId:          ride.ride_ref,
-      status:          ride.status || 'processing',
-      eta:             ride.status === 'completed' ? 0 : (ride.eta_minutes || 4),
-      distanceKm:      ride.distance_km || 3,
-      fare:            ride.fare,
-      driver: {
-        name:    ride.driver_name,
-        rating:  ride.driver_rating,
-        plate:   ride.driver_plate,
-        vehicle: ride.driver_vehicle,
-        phone:   ride.driver_phone,
-        initials:(ride.driver_name || 'CN').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase(),
-      },
-      driver_location: { lat: 3.752 + Math.random()*0.005, lng: 8.774 + Math.random()*0.005 },
-      paymentMethod:   ride.payment_method || 'wallet',
-    });
-  } catch (e) {
-    res.status(500).json({ message: 'Error al obtener estado del viaje' });
-  }
-});
-
-app.post('/api/taxi/:rideId/cancel', auth, async (req, res) => {
-  try {
-    const rideId = req.params.rideId;
-    try {
-      await supabase.from('taxi_rides').update({ status: 'cancelled', updated_at: new Date().toISOString() })
-        .eq('user_id', req.user.id).eq('ride_ref', rideId);
-    } catch (e) { console.warn('Taxi cancel update failed:', e.message); }
-    const userRides = getUserStore(taxiFallbackStore, req.user.id);
-    const fi = userRides.findIndex(r => r.ride_ref === rideId);
-    if (fi !== -1) userRides[fi].status = 'cancelled';
-    try { await logAudit(req.user.id, 'taxi_cancel', 'taxi', rideId, {}); } catch {}
-    res.json({ message: 'Viaje cancelado', rideId });
-  } catch (e) {
-    res.status(500).json({ message: 'Error al cancelar viaje' });
-  }
-});
-
-app.post('/api/taxi/:rideId/rate', auth, async (req, res) => {
-  try {
-    const { rating, comment } = req.body;
-    if (!rating || rating < 1 || rating > 5) return res.status(400).json({ message: 'Rating 1-5' });
-    const rideId = req.params.rideId;
-
-    let ride = null;
-    try {
-      const { data } = await supabase.from('taxi_rides')
-        .select('*').eq('user_id', req.user.id).eq('ride_ref', rideId).maybeSingle();
-      ride = data;
-    } catch {}
-    if (!ride) {
-      const us = getUserStore(taxiFallbackStore, req.user.id);
-      ride = us.find(r => r.ride_ref === rideId);
-    }
-    if (!ride) return res.status(404).json({ message: 'Viaje no encontrado' });
-
-    const upd = { rating, rating_comment: comment||null, status: 'completed', updated_at: new Date().toISOString() };
-    try {
-      await supabase.from('taxi_rides').update(upd).eq('user_id', req.user.id).eq('ride_ref', rideId);
-    } catch {}
-    const us = getUserStore(taxiFallbackStore, req.user.id);
-    const fi = us.findIndex(r => r.ride_ref === rideId);
-    if (fi !== -1) Object.assign(us[fi], upd);
-
-    // Descontar del wallet si fue pago con wallet
-    if (ride.payment_method !== 'cash') {
-      try { await debitWalletWithTx(req.user.id, ride.fare||0, 'TAXI', `TAXI-${rideId}`, 'taxi'); } catch {}
-    }
-
-    try { await logAudit(req.user.id, 'taxi_rate', 'taxi', rideId, { rating }); } catch {}
-    res.json({ message: 'Valoración enviada', rating, rideId });
-  } catch (e) {
-    res.status(500).json({ message: 'Error al valorar viaje' });
-  }
-});
-
-app.get('/api/taxi/rides', auth, async (req, res) => {
-  try {
-    const page  = parseInt(String(req.query.page  || '1'));
-    const limit = parseInt(String(req.query.limit || '20'));
-    const offset = (page - 1) * limit;
-
-    let rides = [];
-    try {
-      const { data } = await supabase.from('taxi_rides')
-        .select('*').eq('user_id', req.user.id)
-        .order('created_at', { ascending: false })
-        .range(offset, offset + limit - 1);
-      rides = data || [];
-    } catch (e) { console.warn('Taxi rides query failed:', e.message); }
-
-    const fallbackRides = getUserStore(taxiFallbackStore, req.user.id);
-    const combined = [...rides, ...fallbackRides];
-    const unique = combined.filter((r, i, a) => i === a.findIndex(x => x.ride_ref === r.ride_ref));
-    unique.sort((a, b) => new Date(b.created_at||0).getTime() - new Date(a.created_at||0).getTime());
-
-    res.json(unique.slice(0, limit));
-  } catch (e) {
-    res.status(500).json({ message: 'Error al obtener historial' });
-  }
-});
-    
-
-app.get('/api/taxi/:rideId/status', auth, async (req, res) => {
-  try {
-    let ride = null;
-    
-    // Intentar obtener de Supabase
-    try {
-      const { data } = await supabase.from('taxi_rides')
-        .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
-      ride = data;
-    } catch (dbError) {
-      console.warn('Taxi status query failed, checking fallback:', dbError.message);
-    }
-    
-    // Si no hay datos, buscar en fallback store
-    if (!ride) {
-      const userRides = getUserStore(taxiFallbackStore, req.user.id);
-      ride = userRides.find(r => r.ride_ref === req.params.rideId);
-    }
-    
+    const { data: ride } = await supabase.from('taxi_rides')
+      .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
     if (!ride) {
       return res.status(404).json({ message: 'Viaje no encontrado', code: 'RIDE_NOT_FOUND' });
     }
-    
+
     const status = sandboxStatus.includes(ride.status) ? ride.status : 'processing';
     res.json({ 
       rideId: ride.ride_ref, 
@@ -4310,54 +5934,30 @@ app.get('/api/taxi/:rideId/status', auth, async (req, res) => {
 
 app.post('/api/taxi/:rideId/cancel', auth, async (req, res) => {
   try {
-    let ride = null;
-    
-    // Buscar en Supabase
-    try {
-      const { data } = await supabase.from('taxi_rides')
-        .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
-      ride = data;
-    } catch (dbError) {
-      console.warn('Taxi cancel query failed, checking fallback:', dbError.message);
+    const { data: ride } = await supabase.from('taxi_rides')
+      .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
+    if (!ride) return res.status(404).json({ message: 'Viaje no encontrado', code: 'RIDE_NOT_FOUND' });
+
+    // Un viaje cobrado se devuelve con su propio asiento, una sola vez: la clave
+    // de reembolso lleva el id del viaje, así que cancelar dos veces no devuelve
+    // dinero dos veces.
+    let reembolsado = 0;
+    if (ride.charged_at && !ride.refunded_at) {
+      const dev = await serviceRefund(req.user.id, 'taxi', ride.ride_ref, Number(ride.fare));
+      if (!dev.ok) return res.status(dev.http || 500).json({ message: 'No se pudo devolver el viaje', code: dev.code || 'REFUND_FAILED' });
+      reembolsado = Number(dev.amount);
     }
-    
-    // Si no hay datos, buscar en fallback store
-    if (!ride) {
-      const userRides = getUserStore(taxiFallbackStore, req.user.id);
-      ride = userRides.find(r => r.ride_ref === req.params.rideId);
-    }
-    
-    if (!ride) {
-      return res.status(404).json({ message: 'Viaje no encontrado', code: 'RIDE_NOT_FOUND' });
-    }
-    
-    // Actualizar en Supabase si tiene ID
-    if (ride.id && typeof ride.id === 'string' && !ride.id.startsWith('RIDE')) {
-      try {
-        await supabase.from('taxi_rides').update({ 
-          status: 'failed', 
-          updated_at: new Date().toISOString() 
-        }).eq('id', ride.id);
-      } catch (updateError) {
-        console.warn('Taxi cancel update failed:', updateError.message);
-      }
-    }
-    
-    // Actualizar en fallback store
-    const userRides = getUserStore(taxiFallbackStore, req.user.id);
-    const fallbackIndex = userRides.findIndex(r => r.ride_ref === req.params.rideId);
-    if (fallbackIndex !== -1) {
-      userRides[fallbackIndex].status = 'failed';
-      userRides[fallbackIndex].updated_at = new Date().toISOString();
-    }
-    
-    try {
-      await logAudit(req.user.id, 'taxi_cancel', 'taxi', ride.id, { ride_ref: ride.ride_ref });
-    } catch (auditError) {
-      console.warn('Audit logging failed:', auditError.message);
-    }
-    
-    res.json({ message: 'Viaje cancelado', rideId: req.params.rideId });
+
+    // Si no se devolvio nada, refunded_at no se toca: ponerlo a null dejaria el
+    // viaje otra vez reembolsable al tercer clic.
+    await supabase.from('taxi_rides')
+      .update(reembolsado
+        ? { status: 'cancelled', refunded_at: new Date().toISOString(), updated_at: new Date().toISOString() }
+        : { status: 'cancelled', updated_at: new Date().toISOString() })
+      .eq('id', ride.id);
+    await logAudit(req.user.id, 'taxi_cancel', 'taxi', ride.id, { ride_ref: ride.ride_ref, reembolsado });
+
+    res.json({ message: 'Viaje cancelado', rideId: req.params.rideId, reembolsado, balance: await readWalletBalance(req.user.id) });
   } catch (error) {
     console.error('Taxi cancel error:', error);
     res.status(500).json({ message: 'Error al cancelar viaje', code: 'INTERNAL_ERROR' });
@@ -4370,69 +5970,29 @@ app.post('/api/taxi/:rideId/rate', auth, async (req, res) => {
     if (!rating || rating < 1 || rating > 5) {
       return res.status(400).json({ message: 'Rating debe ser entre 1 y 5', code: 'INVALID_RATING' });
     }
-    
-    let ride = null;
-    
-    // Buscar en Supabase
-    try {
-      const { data } = await supabase.from('taxi_rides')
-        .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
-      ride = data;
-    } catch (dbError) {
-      console.warn('Taxi rate query failed, checking fallback:', dbError.message);
-    }
-    
-    // Si no hay datos, buscar en fallback store
-    if (!ride) {
-      const userRides = getUserStore(taxiFallbackStore, req.user.id);
-      ride = userRides.find(r => r.ride_ref === req.params.rideId);
-    }
-    
+
+    const { data: ride } = await supabase.from('taxi_rides')
+      .select('*').eq('user_id', req.user.id).eq('ride_ref', req.params.rideId).maybeSingle();
     if (!ride) {
       return res.status(404).json({ message: 'Viaje no encontrado', code: 'RIDE_NOT_FOUND' });
     }
-    
-    const updateData = {
+
+    // Valorar cierra el viaje: el cobro ya se hizo al solicitarlo, aqui solo
+    // queda la opinion del cliente y el estado.
+    await supabase.from('taxi_rides').update({
       rating: Number(rating),
       rating_comment: comment || null,
       status: 'completed',
       updated_at: new Date().toISOString()
-    };
-    
-    // Actualizar en Supabase si tiene ID
-    if (ride.id && typeof ride.id === 'string' && !ride.id.startsWith('RIDE')) {
-      try {
-        await supabase.from('taxi_rides').update(updateData).eq('id', ride.id);
-      } catch (updateError) {
-        console.warn('Taxi rate update failed:', updateError.message);
-      }
-    }
-    
-    // Actualizar en fallback store
-    const userRides = getUserStore(taxiFallbackStore, req.user.id);
-    const fallbackIndex = userRides.findIndex(r => r.ride_ref === req.params.rideId);
-    if (fallbackIndex !== -1) {
-      Object.assign(userRides[fallbackIndex], updateData);
-    }
-    
-    let deb = { balance: 0 };
-    try {
-      deb = await debitWalletWithTx(req.user.id, 0, 'EGCHAT', `TAXI-RATE-${req.params.rideId}`, 'taxi_rate');
-    } catch (walletError) {
-      console.warn('Wallet debit failed:', walletError.message);
-    }
-    
-    try {
-      await logAudit(req.user.id, 'taxi_rate', 'taxi', ride.id, { ride_ref: ride.ride_ref, rating });
-    } catch (auditError) {
-      console.warn('Audit logging failed:', auditError.message);
-    }
-    
-    res.json({ 
-      message: 'Valoracion enviada', 
-      rating: Number(rating), 
-      rideId: req.params.rideId, 
-      balance: deb.balance 
+    }).eq('id', ride.id);
+
+    await logAudit(req.user.id, 'taxi_rate', 'taxi', ride.id, { ride_ref: ride.ride_ref, rating });
+
+    res.json({
+      message: 'Valoracion enviada',
+      rating: Number(rating),
+      rideId: req.params.rideId,
+      balance: await readWalletBalance(req.user.id)
     });
   } catch (error) {
     console.error('Taxi rate error:', error);
@@ -4442,34 +6002,56 @@ app.post('/api/taxi/:rideId/rate', auth, async (req, res) => {
 
 app.get('/api/taxi/rides', auth, async (req, res) => {
   try {
-    let rides = [];
-    
-    // Intentar obtener de Supabase
-    try {
-      const { data } = await supabase.from('taxi_rides')
-        .select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
-      rides = data || [];
-    } catch (dbError) {
-      console.warn('Taxi rides query failed, using fallback:', dbError.message);
-    }
-    
-    // Combinar con fallback store
-    const fallbackRides = getUserStore(taxiFallbackStore, req.user.id);
-    const combined = [...rides, ...fallbackRides];
-    
-    // Eliminar duplicados por ride_ref y ordenar
-    const uniqueRides = combined.filter((ride, index, self) => 
-      index === self.findIndex(r => r.ride_ref === ride.ride_ref)
-    );
-    
-    uniqueRides.sort((a, b) => 
-      new Date(b.created_at || 0) - new Date(a.created_at || 0)
-    );
-    
-    res.json(uniqueRides);
+    const { data, error } = await supabase.from('taxi_rides')
+      .select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
+    if (error) return res.status(502).json({ message: 'No se pudieron listar los viajes', code: 'RIDES_UNAVAILABLE' });
+    res.json(data || []);
   } catch (error) {
     console.error('Taxi rides error:', error);
     res.status(500).json({ message: 'Error al obtener viajes', code: 'INTERNAL_ERROR' });
+  }
+});
+
+// Alta de conductor. No existe flota que asignar todavía, así que la solicitud
+// se registra como orden de servicio (importe 0: no mueve dinero) y el operador
+// la revisa desde service_orders. Sin fila no hay solicitud: antes la app
+// confirmaba el alta con solo haber llamado a la ruta.
+app.post('/api/taxi/drivers/register', auth, async (req, res) => {
+  try {
+    const { name, phone, license, vehicle } = req.body || {};
+    if (!name || !phone) {
+      return res.status(400).json({ message: 'Nombre y telefono requeridos', code: 'VALIDATION_ERROR' });
+    }
+    if (!vehicle || !vehicle.plate) {
+      return res.status(400).json({ message: 'Matricula requerida', code: 'VALIDATION_ERROR' });
+    }
+
+    const ref = safeRef('DRV');
+    const { data: orden, error } = await supabase.from('service_orders').insert({
+      order_ref: ref,
+      user_id: req.user.id,
+      provider: 'taxi',
+      service_type: 'conductor',
+      contract_ref: String(vehicle.plate),
+      amount: 0,
+      status: 'pending',
+      payload: { name, phone, license: license || null, vehicle },
+      response: { status: 'pending_review' },
+    }).select('order_ref, status, created_at').maybeSingle();
+    if (error || !orden) {
+      console.error('Taxi driver register:', error?.message);
+      return res.status(502).json({ message: 'No se pudo registrar la solicitud', code: 'APPLICATION_NOT_SAVED' });
+    }
+
+    await logAudit(req.user.id, 'taxi_driver_register', 'taxi', orden.order_ref, { plate: vehicle.plate });
+    res.status(201).json({
+      driverId: orden.order_ref,
+      status: orden.status,
+      message: 'Solicitud registrada. El equipo de MiTaxi la revisara y te contactara.',
+    });
+  } catch (error) {
+    console.error('Taxi driver register error:', error);
+    res.status(500).json({ message: 'Error al registrar conductor', code: 'INTERNAL_ERROR' });
   }
 });
 
@@ -4572,7 +6154,7 @@ app.post('/api/insurance/quote', auth, async (req, res) => {
 });
 
 // Contratar seguro
-app.post('/api/insurance/contract', auth, async (req, res) => {
+app.post('/api/insurance/contract', auth, walletLimiter, async (req, res) => {
   try {
     const { insurance_type, coverage_amount, duration_months, payment_method } = req.body;
 
@@ -4602,8 +6184,18 @@ app.post('/api/insurance/contract', auth, async (req, res) => {
       return res.status(400).json({ message: 'Saldo insuficiente para contratar seguro' });
     }
 
+    // Cobrar antes de emitir: dos peticiones simultáneas no pueden quedarse con
+    // dos pólizas pagando una sola vez.
+    const debit = await debitWallet(req.user.id, total_premium, {
+      operation: 'pago_servicio',
+      account: 'SYS-SUSPENSE',
+      concept: `Prima de seguro ${insurance_type} ${duration_months} meses`,
+      key: req.body?.client_ref ? `INS-${String(req.body.client_ref)}` : null,
+    });
+    if (!debit.ok) return transferErrorResponse(res, debit.code);
+
     // Crear pÁƒÂ³liza
-    const { data: policy } = await supabase
+    const { data: policy, error: policyError } = await supabase
       .from('insurance_policies')
       .insert({
         user_id: req.user.id,
@@ -4618,15 +6210,26 @@ app.post('/api/insurance/contract', auth, async (req, res) => {
       })
       .select()
       .single();
-
-    // Procesar pago
-    const newBalance = wallet.balance - total_premium;
-    await supabase
-      .from('wallets')
-      .update({ balance: newBalance })
-      .eq('user_id', req.user.id);
+    if (policyError) {
+      // Anulamos la prima con el asiento contrario (mismo origen y destino) para
+      // que el libro refleje el cobro y la devolución, no un saldo suelto.
+      await creditWallet(req.user.id, total_premium, {
+        operation: 'ajuste',
+        account: 'SYS-SUSPENSE',
+        concept: 'Devolución de prima no emitida',
+        key: `INS-VOID-${req.params?.id || Date.now()}`,
+      });
+      return res.status(500).json({ message: 'No se pudo emitir la póliza' });
+    }
 
     // Registrar transacciÁƒÂ³n
+    // La póliza queda atada al asiento que la cobró: sin eso, el libro y la
+    // historia del cliente no tienen forma de encontrarse.
+    await supabase
+      .from('insurance_policies')
+      .update({ ledger_journal_id: debit.journal_id })
+      .eq('id', policy.id);
+
     await supabase
       .from('transactions')
       .insert({
@@ -4636,17 +6239,13 @@ app.post('/api/insurance/contract', auth, async (req, res) => {
         method: payment_method,
         reference: `INSURANCE-${policy.id}`,
         status: 'completed',
-        metadata: {
-          policy_id: policy.id,
-          insurance_type,
-          duration_months
-        }
+        ledger_journal_id: debit.journal_id,
       });
 
     res.json({
       message: 'Seguro contratado exitosamente',
       policy,
-      balance: newBalance
+      balance: debit.balance
     });
   } catch (e) {
     console.error('Contract insurance error:', e);
@@ -4920,55 +6519,109 @@ app.get('/api/news/favorites', auth, async (req, res) => {
 // ════════════════════════════════════════════════════════════════════
 
 const ASEGURADORAS = [
-  { id: '1', name: 'COGE Seguros', products: ['Vida', 'Salud', 'Auto', 'Hogar'] },
-  { id: '2', name: 'SIAT Guinea', products: ['Auto', 'Empresarial', 'Transporte'] },
-  { id: '3', name: 'Allianz GE', products: ['Vida', 'Salud', 'Viaje'] },
+  { id: 'coge', name: 'COGE Seguros' },
+  { id: 'siat', name: 'SIAT Guinea' },
+  { id: 'allianz', name: 'Allianz GE' },
 ];
 
-app.get('/api/seguros/companias', auth, async (req, res) => res.json(ASEGURADORAS));
+app.get('/api/seguros/companias', auth, async (_req, res) => res.json(ASEGURADORAS));
 
+// La prima no la decide el orden de un array: la lee el servidor de
+// service_tariffs (service = compañía, variant = producto) y es exactamente esa
+// cifra la que insurance_take_out() asienta al contratar.
 app.get('/api/seguros/companias/:companyId/productos', auth, async (req, res) => {
-  const company = ASEGURADORAS.find(a => a.id === req.params.companyId) || ASEGURADORAS[0];
-  res.json(company.products.map((p, i) => ({ id: String(i+1), name: p, price: (i+1)*5000, coverage: '12 meses' })));
-});
-app.get('/seguros/companias/:companyId/productos', auth, async (req, res) => {
-  const company = ASEGURADORAS.find(a => a.id === req.params.companyId) || ASEGURADORAS[0];
-  res.json(company.products.map((p, i) => ({ id: String(i + 1), name: p, price: (i + 1) * 5000, coverage: '12 meses' })));
+  const company = ASEGURADORAS.find(a => a.id === req.params.companyId);
+  if (!company) return res.status(404).json({ message: 'Aseguradora no encontrada', code: 'COMPANY_NOT_FOUND' });
+  const { data, error } = await supabase
+    .from('service_tariffs')
+    .select('variant, amount, currency, concept')
+    .eq('service', company.id).eq('active', true)
+    .order('variant');
+  if (error || !data) return res.status(502).json({ message: 'Primas no disponibles', code: 'TARIFFS_UNAVAILABLE' });
+  res.json(data.map(p => ({
+    id: p.variant,
+    name: p.concept ? p.concept.split(' - ')[1] || p.variant : p.variant,
+    price: Number(p.amount),
+    currency: p.currency,
+    coverage: '12 meses',
+  })));
 });
 
-app.post('/api/seguros/solicitar', auth, async (req, res) => {
+app.post('/api/seguros/solicitar', auth, walletLimiter, async (req, res) => {
   const { companyId, producto, datos, external_id } = req.body || {};
   if (!companyId || !producto) return res.status(400).json({ message: 'companyId y producto requeridos', code: 'VALIDATION_ERROR' });
-  const solicitudId = external_id || safeRef('SEG');
-  await supabase.from('service_orders').upsert({
-    order_ref: solicitudId,
-    user_id: req.user.id,
-    provider: 'seguros',
-    service_type: 'solicitud',
-    contract_ref: String(companyId),
-    amount: 0,
-    status: 'pending',
-    payload: { producto, datos: datos || null },
-    response: { message: 'Solicitud de seguro enviada. Te contactaremos en 24h.' }
-  }, { onConflict: 'order_ref' });
-  await logAudit(req.user.id, 'insurance_request', 'seguros', solicitudId, { companyId, producto });
-  res.json({ solicitudId, status: 'pending', message: 'Solicitud de seguro enviada. Te contactaremos en 24h.' });
-});
+  if (!ASEGURADORAS.some(a => a.id === companyId)) return res.status(400).json({ message: 'Aseguradora no encontrada', code: 'COMPANY_NOT_FOUND' });
 
-app.post('/api/seguros/solicitudes/:solicitudId/documentos', auth, async (req, res) => {
-  const { solicitudId } = req.params;
-  const { tipo } = req.body || {};
-  res.status(201).json({
-    solicitudId,
-    tipo: tipo || 'documento',
-    status: 'uploaded',
-    message: 'Documento recibido'
+  const ref = String(external_id || '').trim() || safeRef('POL');
+  const { data, error } = await supabase.rpc('insurance_take_out', {
+    p_user_id: req.user.id,
+    p_company: String(companyId),
+    p_product: String(producto),
+    p_ref: ref,
+  });
+  if (error) {
+    console.error('insurance_take_out error:', error.message);
+    const fallo = tariffError(error.message);
+    return res.status(fallo.http).json(fallo);
+  }
+  const r = data || {};
+  if (!r.ok) {
+    return res.status(r.code === 'TARIFF_NOT_FOUND' ? 400 : 500).json({
+      message: r.code === 'TARIFF_NOT_FOUND' ? 'Prima no disponible para ese producto' : 'No se pudo emitir la póliza',
+      code: r.code || 'POLICY_FAILED',
+    });
+  }
+
+  const balance = await readWalletBalance(req.user.id);
+  await createServiceOrder(req.user.id, 'seguros', 'solicitar', Number(r.premium), r.policy_ref,
+    { companyId, producto, datos: datos || null }, { ...r, balance });
+  await logAudit(req.user.id, 'insurance_request', 'seguros', r.policy_id, { companyId, producto, premium: r.premium, journal_id: r.journal_id });
+  res.json({
+    solicitudId: r.policy_ref,
+    policyId: r.policy_id,
+    premium: Number(r.premium),
+    currency: r.currency,
+    expires_at: r.expires_at,
+    balance,
+    journal_id: r.journal_id,
+    status: r.status,
+    message: `Póliza emitida por ${Number(r.premium).toLocaleString()} ${r.currency || 'XAF'}`,
   });
 });
-app.post('/seguros/solicitudes/:solicitudId/documentos', auth, async (req, res) => {
-  const { solicitudId } = req.params;
-  const { tipo } = req.body || {};
-  res.status(201).json({ solicitudId, tipo: tipo || 'documento', status: 'uploaded', message: 'Documento recibido' });
+
+app.get('/api/seguros/polizas', auth, async (req, res) => {
+  const { data: polizas, error } = await supabase
+    .from('insurance_policies')
+    .select('id, policy_ref, company, product, premium, currency, status, insured, journal_id, starts_at, expires_at, created_at')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false });
+  if (error) return res.status(502).json({ message: 'No se pudieron listar las pólizas', code: 'POLICIES_UNAVAILABLE' });
+  res.json(polizas || []);
+});
+
+// Abrir un siniestro es un registro, no un abono: aquí no sale dinero de la
+// cartera. La liquidación la hace el operador con su propio asiento.
+app.post('/api/seguros/polizas/:policyId/siniestros', auth, async (req, res) => {
+  const { amount, notes } = req.body || {};
+  const reclamado = roundAmount(Number(amount || 0));
+  if (!(reclamado > 0)) return res.status(400).json({ message: 'Importe reclamado requerido', code: 'VALIDATION_ERROR' });
+
+  const { data: pol } = await supabase.from('insurance_policies')
+    .select('id, policy_ref, status').eq('id', req.params.policyId).eq('user_id', req.user.id).maybeSingle();
+  if (!pol) return res.status(404).json({ message: 'Póliza no encontrada', code: 'POLICY_NOT_FOUND' });
+
+  const claimRef = safeRef('SIN');
+  const { data: claim, error } = await supabase.from('insurance_claims').insert({
+    claim_ref: claimRef,
+    policy_id: pol.id,
+    user_id: req.user.id,
+    amount_claimed: reclamado,
+    notes: notes ? String(notes) : null,
+  }).select('id, claim_ref, policy_id, amount_claimed, status, created_at').maybeSingle();
+  if (error || !claim) return res.status(502).json({ message: 'No se pudo registrar el siniestro', code: 'CLAIM_FAILED' });
+
+  await logAudit(req.user.id, 'insurance_claim', 'seguros', claim.id, { policy_ref: pol.policy_ref, amount_claimed: reclamado });
+  res.status(201).json({ ...claim, message: 'Siniestro registrado. La aseguradora lo revisará.' });
 });
 
 // ════════════════════════════════════════════════════════════════════
@@ -5082,21 +6735,344 @@ app.post('/api/user/avatar', auth, async (req, res) => {
   }
 });
 
-app.post('/lia/analyze', auth, async (_req, res) => {
-  res.json({ analysis: 'Análisis completado.' });
+// Análisis rápido: intención detectada + respuesta que daría Lia.
+const liaAnalyzeHandler = async (req, res) => {
+  const message = typeof req.body?.message === 'string' ? req.body.message
+    : typeof req.body?.text === 'string' ? req.body.text : '';
+  if (!message.trim()) {
+    return res.status(400).json({ message: 'Falta el texto a analizar', code: 'VALIDATION_ERROR' });
+  }
+  const requestedLang = String(req.body?.lang || '').toLowerCase();
+  const lang = LIA_LANGS.includes(requestedLang) ? requestedLang : 'es';
+  const intent = liaDetectIntent(message);
+  try {
+    const reply = await liaAnswer(intent, message, lang, req.user.id, []);
+    res.json({
+      analysis: reply,
+      reply,
+      intent,
+      lang,
+      words: message.trim().split(/\s+/).length,
+      characters: message.length,
+    });
+  } catch (e) {
+    console.error('LIA analyze error:', e);
+    res.status(500).json({ message: 'No se pudo analizar el texto', code: 'ANALYZE_ERROR' });
+  }
+};
+
+app.post('/lia/analyze', auth, liaAnalyzeHandler);
+app.post('/api/lia/analyze', auth, liaAnalyzeHandler);
+
+const liaReadAudio = (req) => new Promise((resolve, reject) => {
+  const busboy = require('busboy');
+  const bb = busboy({ headers: req.headers, limits: { fileSize: 15 * 1024 * 1024, files: 1 } });
+  let audio = null;
+  const fields = {};
+  bb.on('file', (_name, stream, info) => {
+    const chunks = [];
+    stream.on('data', (chunk) => chunks.push(chunk));
+    stream.on('limit', () => reject(new Error('AUDIO_TOO_LARGE')));
+    stream.on('end', () => {
+      audio = {
+        buffer: Buffer.concat(chunks),
+        filename: info?.filename || 'audio.m4a',
+        mimeType: info?.mimeType || 'audio/m4a',
+      };
+    });
+  });
+  bb.on('field', (name, value) => { fields[name] = value; });
+  bb.on('error', reject);
+  bb.on('finish', () => resolve({ audio, fields }));
+  req.pipe(bb);
 });
 
-app.post('/api/lia/analyze', auth, async (_req, res) => {
-  res.json({ analysis: 'Análisis completado.' });
+const liaTranscribeHandler = async (req, res) => {
+  const provider = liaProvider();
+  if (!provider) {
+    return res.status(501).json({
+      message: 'El dictado necesita una clave de transcripción en el servidor (GROQ_API_KEY u OPENAI_API_KEY).',
+      code: 'DICTATION_NOT_CONFIGURED',
+    });
+  }
+  try {
+    if (!String(req.headers['content-type'] || '').includes('multipart/form-data')) {
+      return res.status(400).json({ message: 'Envía el audio como multipart/form-data', code: 'VALIDATION_ERROR' });
+    }
+    const { audio, fields } = await liaReadAudio(req);
+    if (!audio || !audio.buffer.length) {
+      return res.status(400).json({ message: 'Audio vacío', code: 'VALIDATION_ERROR' });
+    }
+
+    const form = new FormData();
+    form.append('file', new Blob([audio.buffer], { type: audio.mimeType }), audio.filename);
+    form.append('model', provider.sttModel);
+    const requestedLang = String(fields.lang || '').toLowerCase();
+    if (LIA_LANGS.includes(requestedLang)) form.append('language', requestedLang);
+
+    const response = await fetch(`${provider.base}/audio/transcriptions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${provider.key}` },
+      body: form,
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      console.warn('LIA transcribe error:', provider.name, response.status, detail.slice(0, 200));
+      return res.status(502).json({ message: 'No se pudo transcribir el audio', code: 'STT_FAILED' });
+    }
+    const data = await response.json();
+    const text = typeof data?.text === 'string' ? data.text.trim() : '';
+    if (!text) {
+      return res.status(422).json({ message: 'No se ha reconocido voz en el audio', code: 'STT_EMPTY' });
+    }
+    res.json({ text });
+  } catch (e) {
+    if (e?.message === 'AUDIO_TOO_LARGE') {
+      return res.status(413).json({ message: 'El audio supera 15 MB', code: 'AUDIO_TOO_LARGE' });
+    }
+    console.error('LIA transcribe exception:', e);
+    res.status(500).json({ message: 'Error al transcribir el audio', code: 'STT_ERROR' });
+  }
+};
+
+app.post('/lia/transcribe', auth, liaTranscribeHandler);
+app.post('/api/lia/transcribe', auth, liaTranscribeHandler);
+
+// ── LIA: lectura de imágenes y documentos ─────────────────────────
+const LIA_ATTACH_COPY = {
+  es: {
+    notConfigured: 'La lectura de archivos necesita una clave de IA en el servidor.',
+    empty: 'El archivo llegó vacío. Inténtalo de nuevo.',
+    tooLarge: 'El archivo supera 20 MB. Envíame uno más pequeño.',
+    unsupported: 'No pude leer este archivo. Puedo con fotos, PDF, Word, Excel, TXT, CSV y RTF.',
+    readError: 'No pude analizar el archivo ahora mismo. Inténtalo de nuevo en un momento.',
+    video: 'Los vídeos todavía no se pueden analizar. Envíame una foto o un documento.',
+    imagePrompt: 'Analiza esta imagen. Si contiene texto, transcríbelo; si es un recibo, factura o documento, resume los datos importantes (importes, fechas, nombres, números).',
+    documentPrompt: 'Lee este documento y explícame lo importante de forma breve. Si el usuario hizo una pregunta, respóndela con el contenido.',
+    rules: 'Acabas de recibir un archivo del usuario. Basa tu respuesta SOLO en su contenido real; no inventes datos que no aparezcan. Si el archivo no se puede leer, dilo con claridad. Si el usuario pide una acción de la app, explica en qué pantalla se hace.',
+  },
+  fr: {
+    notConfigured: 'La lecture de fichiers nécessite une clé d\'IA sur le serveur.',
+    empty: 'Le fichier est arrivé vide. Réessaie.',
+    tooLarge: 'Le fichier dépasse 20 Mo. Envoie-moi un fichier plus petit.',
+    unsupported: 'Je n\'ai pas pu lire ce fichier. Je peux lire les photos, PDF, Word, Excel, TXT, CSV et RTF.',
+    readError: 'Je n\'ai pas pu analyser le fichier pour le moment. Réessaie dans un instant.',
+    video: 'Les vidéos ne peuvent pas encore être analysées. Envoie-moi une photo ou un document.',
+    imagePrompt: 'Analyse cette image. Si elle contient du texte, transcris-le ; s\'il s\'agit d\'un reçu, d\'une facture ou d\'un document, résume les informations importantes (montants, dates, noms, numéros).',
+    documentPrompt: 'Lis ce document et explique-moi l\'essentiel brièvement. Si l\'utilisateur a posé une question, réponds-y à partir du contenu.',
+    rules: 'Tu viens de recevoir un fichier de l\'utilisateur. Fonde ta réponse UNIQUEMENT sur son contenu réel ; n\'invente pas de données absentes. Si le fichier est illisible, dis-le clairement. Si l\'utilisateur demande une action de l\'app, explique sur quel écran elle se fait.',
+  },
+  en: {
+    notConfigured: 'File reading needs an AI key on the server.',
+    empty: 'The file arrived empty. Please try again.',
+    tooLarge: 'The file is over 20 MB. Send me a smaller one.',
+    unsupported: 'I couldn\'t read this file. I can read photos, PDF, Word, Excel, TXT, CSV and RTF.',
+    readError: 'I couldn\'t analyze the file right now. Please try again in a moment.',
+    video: 'Videos can\'t be analyzed yet. Send me a photo or a document.',
+    imagePrompt: 'Analyze this image. If it contains text, transcribe it; if it\'s a receipt, invoice or document, summarize the important details (amounts, dates, names, numbers).',
+    documentPrompt: 'Read this document and briefly explain what matters. If the user asked a question, answer it from the content.',
+    rules: 'You just received a file from the user. Base your answer ONLY on its real content; do not invent details that aren\'t there. If the file can\'t be read, say so clearly. If the user asks for an app action, explain which screen does it.',
+  },
+  pt: {
+    notConfigured: 'A leitura de ficheiros precisa de uma chave de IA no servidor.',
+    empty: 'O ficheiro chegou vazio. Tenta novamente.',
+    tooLarge: 'O ficheiro tem mais de 20 MB. Envia-me um mais pequeno.',
+    unsupported: 'Não consegui ler este ficheiro. Consigo ler fotos, PDF, Word, Excel, TXT, CSV e RTF.',
+    readError: 'Não consegui analisar o ficheiro agora. Tenta novamente daqui a pouco.',
+    video: 'Os vídeos ainda não podem ser analisados. Envia-me uma foto ou um documento.',
+    imagePrompt: 'Analisa esta imagem. Se contiver texto, transcreve-o; se for um recibo, fatura ou documento, resume os dados importantes (valores, datas, nomes, números).',
+    documentPrompt: 'Lê este documento e explica-me o essencial de forma breve. Se o utilizador fez uma pergunta, responde com base no conteúdo.',
+    rules: 'Acabaste de receber um ficheiro do utilizador. Baseia a tua resposta APENAS no conteúdo real; não inventes dados que não apareçam. Se o ficheiro não puder ser lido, diz isso com clareza. Se o utilizador pedir uma ação da app, explica em que ecrã se faz.',
+  },
+};
+
+const liaReadUpload = (req) => new Promise((resolve, reject) => {
+  const busboy = require('busboy');
+  const bb = busboy({ headers: req.headers, limits: { fileSize: 20 * 1024 * 1024, files: 1 } });
+  let file = null;
+  const fields = {};
+  bb.on('file', (_name, stream, info) => {
+    const chunks = [];
+    let size = 0;
+    stream.on('data', (chunk) => { size += chunk.length; chunks.push(chunk); });
+    stream.on('limit', () => {
+      const err = new Error('FILE_TOO_LARGE');
+      err.fields = fields;
+      reject(err);
+    });
+    stream.on('end', () => {
+      file = {
+        buffer: Buffer.concat(chunks),
+        filename: info?.filename || 'archivo',
+        mimeType: info?.mimeType || 'application/octet-stream',
+        size,
+      };
+    });
+  });
+  bb.on('field', (name, value) => { fields[name] = value; });
+  bb.on('error', reject);
+  bb.on('finish', () => resolve({ file, fields }));
+  req.pipe(bb);
 });
 
-app.post('/lia/transcribe', auth, async (_req, res) => {
-  res.json({ text: 'Transcripción completada.' });
-});
+const liaExtractDocumentText = async (buffer, filename, mimeType) => {
+  const lower = String(filename || '').toLowerCase();
+  const mime = String(mimeType || '').toLowerCase();
+  const ext = (lower.split('.').pop() || '').trim();
+  if (mime === 'application/pdf' || ext === 'pdf') {
+    const pdfParse = require('pdf-parse');
+    const parsed = await pdfParse(buffer);
+    return parsed?.text || '';
+  }
+  if (mime.includes('wordprocessingml') || ext === 'docx') {
+    const mammoth = require('mammoth');
+    const parsed = await mammoth.extractRawText({ buffer });
+    return parsed?.value || '';
+  }
+  if (mime.includes('spreadsheetml') || ['xlsx', 'xls', 'ods'].includes(ext)) {
+    const XLSX = require('xlsx');
+    const book = XLSX.read(buffer, { type: 'buffer' });
+    return (book.SheetNames || []).slice(0, 8).map((sheet) => {
+      const csv = XLSX.utils.sheet_to_csv(book.Sheets[sheet]);
+      return `# ${sheet}\n${csv}`;
+    }).join('\n\n');
+  }
+  if (ext === 'rtf' || mime === 'application/rtf' || mime === 'text/rtf') {
+    return buffer.toString('utf8')
+      .replace(/\\'([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+      .replace(/\\[a-z]+-?\d* ?/gi, ' ')
+      .replace(/[{}]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  if (mime.startsWith('text/') || ['txt', 'csv', 'md', 'json', 'xml', 'html', 'htm', 'log', 'srt', 'vtt'].includes(ext)) {
+    return buffer.toString('utf8');
+  }
+  return '';
+};
 
-app.post('/api/lia/transcribe', auth, async (_req, res) => {
-  res.json({ text: 'Transcripción completada.' });
-});
+const liaVisionModels = (provider) => {
+  if (provider.name === 'openai') return [process.env.LIA_VISION_MODEL || 'gpt-4o-mini'];
+  return [...new Set([
+    process.env.LIA_VISION_MODEL,
+    'qwen/qwen3.8-27b',
+    'meta-llama/llama-4-scout-17b-16e-instruct',
+    'meta-llama/llama-4-maverick-17b-128e-instruct',
+  ].filter(Boolean))];
+};
+
+const liaAttachHandler = async (req, res) => {
+  try {
+    if (!String(req.headers['content-type'] || '').includes('multipart/form-data')) {
+      return res.status(400).json({ message: 'Envía el archivo como multipart/form-data', code: 'VALIDATION_ERROR' });
+    }
+    const { file, fields } = await liaReadUpload(req);
+    const requestedLang = String(fields.lang || '').toLowerCase();
+    const lang = LIA_LANGS.includes(requestedLang) ? requestedLang : 'es';
+    const copy = LIA_ATTACH_COPY[lang];
+    const provider = liaProvider();
+    if (!provider) return res.status(501).json({ message: copy.notConfigured, code: 'ATTACH_NOT_CONFIGURED' });
+    if (!file || !file.buffer.length) return res.status(400).json({ message: copy.empty, code: 'VALIDATION_ERROR' });
+
+    const caption = String(fields.prompt || '').trim().slice(0, 1000);
+    const mime = String(file.mimeType || '').toLowerCase();
+    const ext = (String(file.filename || '').toLowerCase().split('.').pop() || '').trim();
+    const isImage = mime.startsWith('image/') || ['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'heif', 'bmp'].includes(ext);
+    const isVideo = mime.startsWith('video/') || ['mp4', 'mov', 'm4v', 'avi', 'webm', 'mkv', '3gp'].includes(ext);
+    if (isVideo) return res.status(415).json({ message: copy.video, code: 'ATTACH_VIDEO_UNSUPPORTED' });
+
+    let userContent;
+    let models;
+    let attachmentKind = 'document';
+
+    if (isImage) {
+      attachmentKind = 'image';
+      const imageMime = mime.startsWith('image/') ? mime : (ext === 'png' ? 'image/png' : 'image/jpeg');
+      userContent = [
+        { type: 'text', text: caption || copy.imagePrompt },
+        { type: 'image_url', image_url: { url: `data:${imageMime};base64,${file.buffer.toString('base64')}` } },
+      ];
+      models = liaVisionModels(provider);
+    } else {
+      let text = await liaExtractDocumentText(file.buffer, file.filename, file.mimeType);
+      text = String(text || '').replace(/\u0000/g, ' ').replace(/[ \t]+\n/g, '\n').trim();
+      if (!text) return res.status(422).json({ message: copy.unsupported, code: 'ATTACH_UNSUPPORTED' });
+      userContent = `${caption || copy.documentPrompt}\n\n--- ${file.filename} ---\n${text.slice(0, 20000)}`;
+      models = [provider.chatModel];
+    }
+
+    const [{ data: profile }, wallet] = await Promise.all([
+      supabase.from('users').select('full_name, city').eq('id', req.user.id).maybeSingle(),
+      liaGetWallet(req.user.id),
+    ]);
+    const system = `${liaBuildSystem(lang, profile, wallet)}\n${copy.rules}`;
+
+    let reply = null;
+    let lastStatus = 0;
+    for (const model of models) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 45000);
+      try {
+        const response = await fetch(`${provider.base}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.key}` },
+          body: JSON.stringify({
+            model,
+            temperature: 0.2,
+            max_tokens: 700,
+            messages: [{ role: 'system', content: system }, { role: 'user', content: userContent }],
+          }),
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          lastStatus = response.status;
+          console.warn('LIA attach LLM error:', provider.name, model, response.status, (await response.text().catch(() => '')).slice(0, 200));
+          continue;
+        }
+        const data = await response.json();
+        const text = data?.choices?.[0]?.message?.content;
+        if (typeof text === 'string' && text.trim()) { reply = text.trim(); break; }
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    if (!reply) {
+      return res.status(502).json({ message: copy.readError, code: 'ATTACH_LLM_FAILED' });
+    }
+
+    if (!isLocalUserId(req.user.id)) {
+      try {
+        const { error } = await supabase.from('lia_conversations').insert({
+          user_id: req.user.id,
+          message: `[${attachmentKind === 'image' ? 'Imagen' : 'Documento'}] ${file.filename}${caption ? `: ${caption}` : ''}`,
+          reply,
+        });
+        if (error) console.warn('LIA attach history save failed:', error.message);
+      } catch (e) {
+        console.warn('LIA attach history save failed:', e?.message || e);
+      }
+    }
+
+    res.json({
+      reply,
+      action: 'attachment',
+      lang,
+      attachment: { name: file.filename, kind: attachmentKind, mime: file.mimeType, size: file.size },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (e) {
+    if (e?.message === 'FILE_TOO_LARGE') {
+      const requestedLang = String(e.fields?.lang || '').toLowerCase();
+      const copy = LIA_ATTACH_COPY[LIA_LANGS.includes(requestedLang) ? requestedLang : 'es'];
+      return res.status(413).json({ message: copy.tooLarge, code: 'FILE_TOO_LARGE' });
+    }
+    console.error('LIA attach exception:', e);
+    res.status(500).json({ message: 'Error al analizar el archivo', code: 'ATTACH_ERROR' });
+  }
+};
+
+app.post('/lia/attach', auth, liaAttachHandler);
+app.post('/api/lia/attach', auth, liaAttachHandler);
 
 // ════════════════════════════════════════════════════════════════════
 // GRUPOS DE CHAT
@@ -5109,54 +7085,7 @@ app.post('/api/chats/:chatId/participants', auth, async (req, res) => {
     res.json({ message: 'Participante añadido' });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
-
-// Obtener lista de participantes de un grupo con información completa
-app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
-  try {
-    const { chatId } = req.params;
-
-    // Obtener todos los participantes con su información de usuario
-    const { data: participants, error } = await supabase
-      .from('chat_participants')
-      .select('user_id')
-      .eq('chat_id', chatId);
-
-    if (error) throw error;
-    if (!participants || participants.length === 0) return res.json([]);
-
-    // Obtener info de usuarios
-    const userIds = participants.map(p => p.user_id);
-    const { data: users, error: usersError } = await supabase
-      .from('users')
-      .select('id, phone, full_name, avatar_url, online_status, last_seen')
-      .in('id', userIds);
-
-    if (usersError) throw usersError;
-
-    const usersMap = {};
-    (users || []).forEach(u => { usersMap[u.id] = u; });
-
-    const formattedParticipants = participants.map(p => {
-      const u = usersMap[p.user_id] || {};
-      return {
-        id: p.user_id,
-        user_id: p.user_id,
-        phone: u.phone,
-        full_name: u.full_name,
-        avatar_url: u.avatar_url,
-        online_status: u.online_status,
-        last_seen: u.last_seen,
-        role: p.user_id === req.user.id ? 'admin' : 'member',
-        joined_at: p.joined_at
-      };
-    });
-
-    res.json(formattedParticipants);
-  } catch (e) {
-    console.error('Get participants error:', e);
-    res.status(500).json({ message: e.message });
-  }
-});
+// Nota: GET /api/chats/:chatId/participants está definido arriba (única implementación)
 
 // Guardar fondo de chat personalizado (individual por usuario, no afecta a otros)
 app.post('/api/chats/:chatId/wallpaper', auth, async (req, res) => {
@@ -5228,26 +7157,27 @@ app.get('/api/notifications', auth, async (req, res) => {
     if (!chatIds.length) return res.json([]);
 
     const { data: msgs } = await supabase.from('messages')
-      .select('id, text, chat_id, sender_id, created_at, users!sender_id(full_name, avatar_url)')
+      .select('id, text, chat_id, sender_id, created_at')
       .in('chat_id', chatIds)
       .neq('sender_id', req.user.id)
       .eq('status', 'sent')
       .order('created_at', { ascending: false })
       .limit(20);
 
-    res.json(msgs || []);
-  } catch (e) { res.json([]); }
-});
+    // Obtener senders en consulta separada
+    const senderIds = [...new Set((msgs || []).map(m => m.sender_id).filter(Boolean))];
+    const { data: senders } = senderIds.length > 0
+      ? await supabase.from('users').select('id, full_name, avatar_url').in('id', senderIds)
+      : { data: [] };
+    const sendersById = {};
+    (senders || []).forEach(u => { sendersById[String(u.id)] = u; });
+    const msgsWithSender = (msgs || []).map(m => ({
+      ...m,
+      users: sendersById[String(m.sender_id)] || null,
+    }));
 
-// Marcar mensajes como leÁƒÂ­dos
-app.post('/api/chats/:chatId/read', auth, async (req, res) => {
-  try {
-    await supabase.from('messages')
-      .update({ status: 'read' })
-      .eq('chat_id', req.params.chatId)
-      .neq('sender_id', req.user.id);
-    res.json({ message: 'Mensajes marcados como leÁƒÂ­dos' });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+    res.json(msgsWithSender);
+  } catch (e) { res.json([]); }
 });
 
 // ════════════════════════════════════════════════════════════════════
@@ -5267,77 +7197,58 @@ app.get('/api/users/:userId', auth, async (req, res) => {
 // ════════════════════════════════════════════════════════════════════
 
 // Auto-crear tablas de espacios
-const ensureSpacesTable = async () => {
-  try {
-    await supabase.rpc('exec_sql', { sql: `
-      CREATE TABLE IF NOT EXISTS spaces (
-        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-        name VARCHAR(100) NOT NULL,
-        description TEXT,
-        type VARCHAR(20) DEFAULT 'publico' CHECK (type IN ('publico','comunidad')),
-        cover TEXT,
-        emoji VARCHAR(10) DEFAULT '📢',
-        owner_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        followers_count INTEGER DEFAULT 0,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS space_follows (
-        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-        space_id UUID REFERENCES spaces(id) ON DELETE CASCADE,
-        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE(space_id, user_id)
-      );
-      CREATE TABLE IF NOT EXISTS space_posts (
-        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-        space_id UUID REFERENCES spaces(id) ON DELETE CASCADE,
-        author_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        text TEXT NOT NULL,
-        image_url TEXT,
-        likes_count INTEGER DEFAULT 0,
-        comments_count INTEGER DEFAULT 0,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS space_post_likes (
-        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-        post_id UUID REFERENCES space_posts(id) ON DELETE CASCADE,
-        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE(post_id, user_id)
-      );
-      CREATE TABLE IF NOT EXISTS space_post_comments (
-        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-        post_id UUID REFERENCES space_posts(id) ON DELETE CASCADE,
-        author_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        text TEXT NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_spaces_type ON spaces(type);
-      CREATE INDEX IF NOT EXISTS idx_space_follows_user ON space_follows(user_id);
-      CREATE INDEX IF NOT EXISTS idx_space_posts_space ON space_posts(space_id);
-      CREATE INDEX IF NOT EXISTS idx_space_posts_created ON space_posts(created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_space_comments_post ON space_post_comments(post_id);
-    `}).catch(() => {});
-  } catch {}
+// Las creaba `exec_sql`, que ya no existe en el esquema (ver nota en
+// ensureChatMuteColumn). El DDL vivo esta en
+// migrations/2026-11-05_espacio_dulce_lote_e1.sql; aqui solo se comprueba que el
+// esquema esta puesto, porque antes el catch vacio tragaba el error y la pantalla
+// salia vacia sin que nadie supiera por que.
+const ensureSpacesSchema = async () => {
+  const faltan = [];
+  for (const t of ['spaces', 'space_follows', 'space_posts', 'space_post_likes', 'space_post_comments', 'stories',
+                   'moments', 'moment_likes', 'moment_comments', 'live_streams']) {
+    try {
+      const { error } = await supabase.from(t).select('id').limit(1);
+      if (error) faltan.push(`${t}: ${error.message}`);
+    } catch (e) {
+      faltan.push(`${t}: ${e.message}`);
+    }
+  }
+  if (faltan.length > 0) {
+    console.warn('ensureSpacesSchema: falta el esquema de Espacio Dulce, pegar migrations/2026-11-05_espacio_dulce_lote_e1.sql ->', faltan.join(' | '));
+  }
 };
-ensureSpacesTable();
+ensureSpacesSchema();
 
-// Seed espacios por defecto si no existen
+// Los cinco canales por defecto, creados solo si la tabla esta vacia.
+// Los seguidores que llevaba antes (48200, 31500, 22100...) eran inventados: no hay
+// nadie detras de esas cuentas todavia, y empezar con una audiencia falsa es peor
+// que empezar con cero. Ahora nacen en 0 y suben con space_followers_delta.
 const seedDefaultSpaces = async () => {
   try {
-    const { data } = await supabase.from('spaces').select('id').limit(1);
+    const { data, error } = await supabase.from('spaces').select('id').limit(1);
+    if (error) return;
     if (data && data.length > 0) return; // ya existen
     const defaults = [
-      { name: 'Gobierno GE', description: 'Noticias y comunicados oficiales del Gobierno de Guinea Ecuatorial', type: 'publico', cover: 'linear-gradient(135deg,#1e3a5f,#0369a1)', emoji: '🏛️', followers_count: 48200 },
-      { name: 'Musica GQ', description: 'Lo mejor de la musica de Guinea Ecuatorial y Africa Central', type: 'comunidad', cover: 'linear-gradient(135deg,#7c3aed,#db2777)', emoji: '🎵', followers_count: 12800 },
-      { name: 'Mercado Malabo', description: 'Compra, vende e intercambia en Guinea Ecuatorial', type: 'comunidad', cover: 'linear-gradient(135deg,#059669,#0d9488)', emoji: '🛒', followers_count: 31500 },
-      { name: 'Deportes GQ', description: 'Futbol, baloncesto y todos los deportes de Guinea Ecuatorial', type: 'publico', cover: 'linear-gradient(135deg,#dc2626,#f59e0b)', emoji: '⚽', followers_count: 22100 },
-      { name: 'Tecnologia GE', description: 'Innovacion, startups y tecnologia en Guinea Ecuatorial', type: 'comunidad', cover: 'linear-gradient(135deg,#1e40af,#7c3aed)', emoji: '💻', followers_count: 8900 },
+      { name: 'Gobierno GE', description: 'Canal reservado para comunicados oficiales. Todavia sin redactor.', type: 'publico', cover: 'linear-gradient(135deg,#1e3a5f,#0369a1)', emoji: '🏛️', followers_count: 0 },
+      { name: 'Musica GQ', description: 'Lo mejor de la musica de Guinea Ecuatorial y Africa Central', type: 'comunidad', cover: 'linear-gradient(135deg,#7c3aed,#db2777)', emoji: '🎵', followers_count: 0 },
+      { name: 'Mercado Malabo', description: 'Compra, vende e intercambia en Guinea Ecuatorial', type: 'comunidad', cover: 'linear-gradient(135deg,#059669,#0d9488)', emoji: '🛒', followers_count: 0 },
+      { name: 'Deportes GQ', description: 'Futbol, baloncesto y todos los deportes de Guinea Ecuatorial', type: 'publico', cover: 'linear-gradient(135deg,#dc2626,#f59e0b)', emoji: '⚽', followers_count: 0 },
+      { name: 'Tecnologia GE', description: 'Innovacion, startups y tecnologia en Guinea Ecuatorial', type: 'comunidad', cover: 'linear-gradient(135deg,#1e40af,#7c3aed)', emoji: '💻', followers_count: 0 },
     ];
     await supabase.from('spaces').insert(defaults);
-  } catch {}
+  } catch (e) {
+    console.warn('seedDefaultSpaces:', e.message);
+  }
 };
 setTimeout(seedDefaultSpaces, 3000);
+
+// Un fallo de esquema no es un listado vacio. Mientras devolvia `[]`, la pantalla
+// no tenia forma de saber que estaba rota y la web tapaba el hueco con canales y
+// posts inventados. 502 con codigo para que el cliente pueda avisar de verdad.
+const espacioFallo = (res, e) => res.status(502).json({
+  error: 'ESPACIO_ESQUEMA_FALLO',
+  message: (e && e.message) ? e.message : 'No se pudo leer el esquema de Espacio Dulce.',
+});
 
 // GET /api/spaces — listar todos los espacios con estado de seguimiento del usuario
 app.get('/api/spaces', auth, async (req, res) => {
@@ -5347,7 +7258,7 @@ app.get('/api/spaces', auth, async (req, res) => {
       .from('spaces')
       .select('*')
       .order('followers_count', { ascending: false });
-    if (error) return res.json([]);
+    if (error) return espacioFallo(res, error);
 
     // Qué espacios sigue el usuario
     const { data: follows } = await supabase
@@ -5357,7 +7268,7 @@ app.get('/api/spaces', auth, async (req, res) => {
     const followedIds = new Set((follows || []).map(f => f.space_id));
 
     res.json((spaces || []).map(s => ({ ...s, following: followedIds.has(s.id) })));
-  } catch (e) { res.json([]); }
+  } catch (e) { espacioFallo(res, e); }
 });
 
 // POST /api/spaces — crear espacio
@@ -5371,7 +7282,7 @@ app.post('/api/spaces', auth, async (req, res) => {
       .select().single();
     if (error) throw error;
     // Auto-seguir al creador
-    await supabase.from('space_follows').insert({ space_id: data.id, user_id: req.user.id }).catch(() => {});
+    await supabase.from('space_follows').insert({ space_id: data.id, user_id: req.user.id });
     res.status(201).json({ ...data, following: true });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
@@ -5385,12 +7296,14 @@ app.post('/api/spaces/:id/follow', auth, async (req, res) => {
       .from('space_follows').select('id').eq('space_id', id).eq('user_id', userId).single();
     if (existing) {
       await supabase.from('space_follows').delete().eq('space_id', id).eq('user_id', userId);
-      await supabase.from('spaces').update({ followers_count: supabase.rpc ? undefined : 0 }).eq('id', id);
-      await supabase.rpc('exec_sql', { sql: `UPDATE spaces SET followers_count = GREATEST(0, followers_count - 1) WHERE id = '${id}'` }).catch(() => {});
+      // El contador lo mueve la base de datos con un delta: antes esta línea
+      // escribía `followers_count: undefined` (no-op) y además un UPDATE en
+      // cadena que se pisaba con los demás seguidores.
+      await supabase.rpc('space_followers_delta', { p_space_id: id, p_delta: -1 });
       res.json({ following: false });
     } else {
       await supabase.from('space_follows').insert({ space_id: id, user_id: userId });
-      await supabase.rpc('exec_sql', { sql: `UPDATE spaces SET followers_count = followers_count + 1 WHERE id = '${id}'` }).catch(() => {});
+      await supabase.rpc('space_followers_delta', { p_space_id: id, p_delta: 1 });
       res.json({ following: true });
     }
   } catch (e) { res.status(500).json({ message: e.message }); }
@@ -5405,13 +7318,14 @@ app.get('/api/spaces/:id/posts', auth, async (req, res) => {
     const limit = 20;
     const offset = (page - 1) * limit;
 
-    const { data: posts } = await supabase
+    const { data: posts, error: postsError } = await supabase
       .from('space_posts')
       .select('*')
       .eq('space_id', id)
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
+    if (postsError) return espacioFallo(res, postsError);
     if (!posts || posts.length === 0) return res.json([]);
 
     // Datos de autores
@@ -5444,7 +7358,7 @@ app.get('/api/spaces/:id/posts', auth, async (req, res) => {
         liked: likedSet.has(p.id),
       };
     }));
-  } catch (e) { res.json([]); }
+  } catch (e) { espacioFallo(res, e); }
 });
 
 // POST /api/spaces/:id/posts — publicar en un espacio
@@ -5470,11 +7384,11 @@ app.post('/api/spaces/posts/:postId/like', auth, async (req, res) => {
     const { data: existing } = await supabase.from('space_post_likes').select('id').eq('post_id', postId).eq('user_id', userId).single();
     if (existing) {
       await supabase.from('space_post_likes').delete().eq('post_id', postId).eq('user_id', userId);
-      await supabase.rpc('exec_sql', { sql: `UPDATE space_posts SET likes_count = GREATEST(0, likes_count - 1) WHERE id = '${postId}'` }).catch(() => {});
+      await supabase.rpc('space_likes_delta', { p_post_id: postId, p_delta: -1 });
       res.json({ liked: false });
     } else {
       await supabase.from('space_post_likes').insert({ post_id: postId, user_id: userId });
-      await supabase.rpc('exec_sql', { sql: `UPDATE space_posts SET likes_count = likes_count + 1 WHERE id = '${postId}'` }).catch(() => {});
+      await supabase.rpc('space_likes_delta', { p_post_id: postId, p_delta: 1 });
       res.json({ liked: true });
     }
   } catch (e) { res.status(500).json({ message: e.message }); }
@@ -5501,7 +7415,7 @@ app.get('/api/spaces/posts/:postId/comments', auth, async (req, res) => {
       const timeStr = diff < 60000 ? 'ahora' : diff < 3600000 ? `${Math.floor(diff/60000)}m` : `${Math.floor(diff/3600000)}h`;
       return { id: c.id, author: author.full_name || 'Usuario', avatar: (author.full_name||'U').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase(), avatarUrl: author.avatar_url||'', text: c.text, time: timeStr };
     }));
-  } catch (e) { res.json([]); }
+  } catch (e) { espacioFallo(res, e); }
 });
 
 // POST /api/spaces/posts/:postId/comments — comentar
@@ -5515,49 +7429,486 @@ app.post('/api/spaces/posts/:postId/comments', auth, async (req, res) => {
       .insert({ post_id: postId, author_id: req.user.id, text: text.trim() })
       .select().single();
     if (error) throw error;
-    await supabase.rpc('exec_sql', { sql: `UPDATE space_posts SET comments_count = comments_count + 1 WHERE id = '${postId}'` }).catch(() => {});
+    await supabase.rpc('space_comments_delta', { p_post_id: postId, p_delta: 1 });
     const { data: author } = await supabase.from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
     res.status(201).json({ id: data.id, author: author?.full_name || 'Usuario', avatar: (author?.full_name||'U').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase(), avatarUrl: author?.avatar_url||'', text: data.text, time: 'ahora' });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// DELETE /api/spaces/posts/:postId — eliminar post (solo autor o admin del espacio)
+// DELETE /api/spaces/posts/:postId — eliminar post (autor o dueno del espacio)
 app.delete('/api/spaces/posts/:postId', auth, async (req, res) => {
   try {
     const { postId } = req.params;
-    const { error } = await supabase.from('space_posts').delete().eq('id', postId).eq('author_id', req.user.id);
+    const userId = req.user.id;
+    const { data: post } = await supabase
+      .from('space_posts').select('id, author_id, space_id').eq('id', postId).single();
+    if (!post) return res.status(404).json({ error: 'NO_ENCONTRADO', message: 'Ese post no existe.' });
+
+    let puede = post.author_id === userId;
+    if (!puede) {
+      const { data: espacio } = await supabase
+        .from('spaces').select('owner_id').eq('id', post.space_id).single();
+      puede = espacio && espacio.owner_id === userId;
+    }
+    if (!puede) return res.status(403).json({ error: 'NO_ES_TUYO', message: 'Solo el autor o el dueño del canal pueden borrarlo.' });
+
+    const { data: borrados, error } = await supabase
+      .from('space_posts').delete().eq('id', postId).select('id');
     if (error) throw error;
-    res.json({ ok: true });
+    if (!borrados || borrados.length === 0) {
+      return res.status(403).json({ error: 'NO_ES_TUYO', message: 'No se ha podido borrar el post.' });
+    }
+    res.json({ ok: true, id: borrados[0].id });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 // ════════════════════════════════════════════════════════════════════
-// STORIES / ESTADOS
+// MOMENTOS / MURO DE ESPACIO DULCE
+// ════════════════════════════════════════════════════════════════════
+// `app/moments.tsx` y la seccion de muro de `app/stories.tsx` llaman a estas
+// seis rutas. Hasta ahora no existian: la pantalla se quedaba en vacio y el
+// cliente lo tapaba con su caché local. Las tablas las crea
+// migrations/2026-11-05_espacio_dulce_lote_e1.sql.
+// Los likes y los comentarios se cuentan al leer, no se guardan contados: un
+// numero escrito aparte es un numero que puede mentir.
+
+// Contactos del usuario, con el mismo criterio que usa GET /api/stories:
+// tabla contacts por cualquiera de sus dos puntas mas los compañeros de chat.
+const contactosDeUsuario = async (userId) => {
+  const ids = new Set();
+  const { data: contacts } = await supabase
+    .from('contacts')
+    .select('contact_user_id, contact_id')
+    .or(`user_id.eq.${userId},contact_id.eq.${userId}`)
+    .eq('is_blocked', false);
+  (contacts || []).forEach(c => {
+    if (c.contact_user_id && c.contact_user_id !== userId) ids.add(c.contact_user_id);
+    if (c.contact_id && c.contact_id !== userId) ids.add(c.contact_id);
+  });
+
+  const { data: chatParts } = await supabase
+    .from('chat_participants').select('chat_id').eq('user_id', userId);
+  if (chatParts && chatParts.length > 0) {
+    const { data: otherParts } = await supabase
+      .from('chat_participants')
+      .select('user_id')
+      .in('chat_id', chatParts.map(c => c.chat_id))
+      .neq('user_id', userId);
+    (otherParts || []).forEach(p => ids.add(p.user_id));
+  }
+  return Array.from(ids);
+};
+
+const momentoSinComentarios = (m, usersMap, likedSet) => {
+  const autor = usersMap[m.user_id] || {};
+  const comoLista = (v) => {
+    let out = v;
+    if (typeof out === 'string') { try { out = JSON.parse(out); } catch { out = []; } }
+    return Array.isArray(out) ? out : [];
+  };
+  return {
+    id: m.id,
+    user_id: m.user_id,
+    user_name: autor.full_name || 'Usuario',
+    user_avatar: autor.avatar_url || '',
+    text: m.text || '',
+    images: comoLista(m.images),
+    videos: comoLista(m.videos),
+    likes: 0,
+    liked_by_me: likedSet.has(m.id),
+    comments: [],
+    created_at: m.created_at,
+  };
+};
+
+app.get('/api/moments', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const autores = [userId, ...(await contactosDeUsuario(userId))];
+
+    const { data: moments, error } = await supabase
+      .from('moments')
+      .select('*')
+      .in('user_id', autores)
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error) return espacioFallo(res, error);
+    if (!moments || moments.length === 0) return res.json([]);
+
+    const ids = moments.map(m => m.id);
+    const userMap = {};
+    const authorIds = [...new Set(moments.map(m => m.user_id))];
+    const [likesRes, commentsRes, authorsRes] = await Promise.all([
+      supabase.from('moment_likes').select('moment_id, user_id').in('moment_id', ids),
+      supabase.from('moment_comments').select('*').in('moment_id', ids).order('created_at', { ascending: true }),
+      supabase.from('users').select('id, full_name, avatar_url').in('id', authorIds),
+    ]);
+    if (authorsRes.error) return espacioFallo(res, authorsRes.error);
+    (authorsRes.data || []).forEach(u => { userMap[u.id] = u; });
+
+    const likesCount = {};
+    (likesRes.data || []).forEach(l => { likesCount[l.moment_id] = (likesCount[l.moment_id] || 0) + 1; });
+    const likedMine = new Set((likesRes.data || []).filter(l => l.user_id === userId).map(l => l.moment_id));
+
+    const commentNames = {};
+    const cIds = [...new Set((commentsRes.data || []).map(c => c.user_id))];
+    if (cIds.length > 0) {
+      const { data: cUsers } = await supabase.from('users').select('id, full_name').in('id', cIds);
+      (cUsers || []).forEach(u => { commentNames[u.id] = u.full_name || 'Usuario'; });
+    }
+
+    const out = moments.map(m => {
+      const p = momentoSinComentarios(m, userMap, likedMine);
+      p.likes = likesCount[m.id] || 0;
+      p.comments = (commentsRes.data || [])
+        .filter(c => c.moment_id === m.id)
+        .map(c => ({
+          id: c.id, user_id: c.user_id, user_name: commentNames[c.user_id] || 'Usuario',
+          text: c.text, created_at: c.created_at,
+        }));
+      return p;
+    });
+    res.json(out);
+  } catch (e) { espacioFallo(res, e); }
+});
+
+app.post('/api/moments', auth, async (req, res) => {
+  try {
+    const { text, images, videos } = req.body;
+    const limpio = (text || '').trim();
+    const fotos = Array.isArray(images) ? images.filter(u => typeof u === 'string' && u.length > 0) : [];
+    const clips = Array.isArray(videos) ? videos.filter(u => typeof u === 'string' && u.length > 0) : [];
+    if (!limpio && fotos.length === 0 && clips.length === 0)
+      return res.status(400).json({ message: 'texto o foto requeridos' });
+
+    const { data, error } = await supabase
+      .from('moments')
+      .insert({ user_id: req.user.id, text: limpio, images: fotos, videos: clips })
+      .select().single();
+    if (error) return espacioFallo(res, error);
+
+    const { data: me } = await supabase
+      .from('users').select('id, full_name, avatar_url').eq('id', req.user.id).single();
+    res.status(201).json(momentoSinComentarios(data, { [req.user.id]: me || {} }, new Set()));
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// PATCH /api/moments/:id — editar el propio. El boton de editar existe en la app
+// y llamaba a esta ruta: sin ella el modal guardaba, la pantalla mostraba el
+// texto nuevo y al volver a abrir el momento seguia igual.
+app.patch('/api/moments/:id', auth, async (req, res) => {
+  try {
+    const { data: actual } = await supabase
+      .from('moments').select('id, user_id').eq('id', req.params.id).single();
+    if (!actual) return res.status(404).json({ error: 'NO_ENCONTRADO', message: 'Ese momento no existe.' });
+    if (actual.user_id !== req.user.id) {
+      return res.status(403).json({ error: 'NO_ES_TUYO', message: 'Solo el autor edita su momento.' });
+    }
+
+    const cambios = {};
+    if (typeof req.body?.text === 'string') cambios.text = req.body.text.trim();
+    if (Array.isArray(req.body?.images)) cambios.images = req.body.images.filter(u => typeof u === 'string' && u.length > 0);
+    if (Array.isArray(req.body?.videos)) cambios.videos = req.body.videos.filter(u => typeof u === 'string' && u.length > 0);
+    if (Object.keys(cambios).length === 0)
+      return res.status(400).json({ message: 'nada que guardar' });
+
+    const { data, error } = await supabase
+      .from('moments').update(cambios).eq('id', req.params.id).select().single();
+    if (error) throw error;
+
+    const { data: autor } = await supabase
+      .from('users').select('id, full_name, avatar_url').eq('id', data.user_id).single();
+    const { data: misLikes } = await supabase
+      .from('moment_likes').select('id').eq('moment_id', data.id).eq('user_id', req.user.id).maybeSingle();
+    res.json(momentoSinComentarios(data, { [data.user_id]: autor || {} }, new Set(misLikes ? [data.id] : [])));
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.delete('/api/moments/:id', auth, async (req, res) => {
+  try {
+    // `.eq('user_id', ...)` ya filtra, pero si no borra nada habria que decirlo:
+    // responder `ok` con cero filas eliminadas es mentirle a la pantalla.
+    const { data: borrados, error } = await supabase
+      .from('moments').delete().eq('id', req.params.id).eq('user_id', req.user.id).select('id');
+    if (error) throw error;
+    if (!borrados || borrados.length === 0) {
+      return res.status(403).json({ error: 'NO_ES_TUYO', message: 'Ese momento no es tuyo o ya no existe.' });
+    }
+    res.json({ ok: true, id: borrados[0].id });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.post('/api/moments/:id/like', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const { data: existing } = await supabase
+      .from('moment_likes').select('id').eq('moment_id', id).eq('user_id', userId).single();
+    if (existing) {
+      await supabase.from('moment_likes').delete().eq('id', existing.id);
+    } else {
+      const { error } = await supabase.from('moment_likes').insert({ moment_id: id, user_id: userId });
+      if (error) throw error;
+    }
+    const { count } = await supabase
+      .from('moment_likes').select('id', { count: 'exact', head: true }).eq('moment_id', id);
+    res.json({ liked: !existing, likes: count || 0 });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.get('/api/moments/:id/comments', auth, async (req, res) => {
+  try {
+    const { data: comments, error } = await supabase
+      .from('moment_comments').select('*').eq('moment_id', req.params.id).order('created_at', { ascending: true });
+    if (error) return espacioFallo(res, error);
+    if (!comments || comments.length === 0) return res.json([]);
+    const ids = [...new Set(comments.map(c => c.user_id))];
+    const { data: users } = await supabase.from('users').select('id, full_name').in('id', ids);
+    const names = {};
+    (users || []).forEach(u => { names[u.id] = u.full_name || 'Usuario'; });
+    res.json(comments.map(c => ({
+      id: c.id, user_id: c.user_id, user_name: names[c.user_id] || 'Usuario',
+      text: c.text, created_at: c.created_at,
+    })));
+  } catch (e) { espacioFallo(res, e); }
+});
+
+app.post('/api/moments/:id/comments', auth, async (req, res) => {
+  try {
+    const limpio = (req.body?.text || '').trim();
+    if (!limpio) return res.status(400).json({ message: 'texto requerido' });
+    const { data, error } = await supabase
+      .from('moment_comments')
+      .insert({ moment_id: req.params.id, user_id: req.user.id, text: limpio })
+      .select().single();
+    if (error) return espacioFallo(res, error);
+    const { data: me } = await supabase.from('users').select('full_name').eq('id', req.user.id).single();
+    res.status(201).json({
+      id: data.id, user_id: req.user.id, user_name: me?.full_name || 'Usuario',
+      text: data.text, created_at: data.created_at,
+    });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// CONTENIDO NUEVO Y AVISOS DE ESPACIO DULCE
 // ════════════════════════════════════════════════════════════════════
 
-// Auto-crear tabla stories si no existe al primer uso
-const ensureStoriesTable = async () => {
-  try {
-    const { error } = await supabase.from('stories').select('id').limit(1);
-    if (error && error.message && error.message.includes('does not exist')) {
-      await supabase.rpc('exec_sql', {
-        sql: `CREATE TABLE IF NOT EXISTS stories (
-          id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-          user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
-          media JSONB NOT NULL,
-          type TEXT DEFAULT 'text',
-          views INTEGER DEFAULT 0,
-          reactions JSONB DEFAULT '[]',
-          expires_at TIMESTAMPTZ NOT NULL,
-          created_at TIMESTAMPTZ DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS idx_stories_user_id ON stories(user_id);
-        CREATE INDEX IF NOT EXISTS idx_stories_expires_at ON stories(expires_at);`
-      }).catch(() => {});
-    }
-  } catch {}
+// Lo nuevo de las ultimas 24 horas, para el punto verde de la barra de
+// mensajeria. La app llama a estas dos rutas cada 30 segundos: si responden 404
+// el indicador nunca sale y el usuario no se entera de que alguien publico.
+const desdeHace24h = () => new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+
+const nombresAutores = async (userIds) => {
+  const map = {};
+  if (userIds.length === 0) return map;
+  const { data } = await supabase.from('users').select('id, full_name').in('id', userIds);
+  (data || []).forEach(u => { map[u.id] = u.full_name || 'Usuario'; });
+  return map;
 };
-ensureStoriesTable();
+
+app.get('/api/moments/contacts-new', auth, async (req, res) => {
+  try {
+    const contactos = await contactosDeUsuario(req.user.id);
+    if (contactos.length === 0) return res.json([]);
+    const { data, error } = await supabase
+      .from('moments')
+      .select('id, user_id, created_at')
+      .in('user_id', contactos)
+      .gte('created_at', desdeHace24h())
+      .order('created_at', { ascending: false });
+    if (error) return espacioFallo(res, error);
+    const nombres = await nombresAutores([...new Set((data || []).map(m => m.user_id))]);
+    res.json((data || []).map(m => ({ ...m, user_name: nombres[m.user_id] || 'Usuario' })));
+  } catch (e) { espacioFallo(res, e); }
+});
+
+app.get('/api/stories/contacts-new', auth, async (req, res) => {
+  try {
+    const now = new Date().toISOString();
+    const { data: mine } = await supabase
+      .from('stories')
+      .select('user_id')
+      .eq('user_id', req.user.id)
+      .gte('created_at', desdeHace24h())
+      .gt('expires_at', now);
+    const ignorados = new Set((mine || []).map(s => s.user_id));
+    const contactos = (await contactosDeUsuario(req.user.id)).filter(id => !ignorados.has(id));
+    if (contactos.length === 0) return res.json([]);
+    const { data, error } = await supabase
+      .from('stories')
+      .select('id, user_id, created_at')
+      .in('user_id', contactos)
+      .gte('created_at', desdeHace24h())
+      .gt('expires_at', now)
+      .order('created_at', { ascending: false });
+    if (error) return espacioFallo(res, error);
+    const nombres = await nombresAutores([...new Set((data || []).map(s => s.user_id))]);
+    res.json((data || []).map(s => ({ ...s, user_name: nombres[s.user_id] || 'Usuario' })));
+  } catch (e) { espacioFallo(res, e); }
+});
+
+// El aviso sale del servidor porque la lista de contactos y sus tokens de push
+// solo viven aqui. El autor se excluye a si mismo y el dueno de la publicacion
+// es el unico que puede dispararlo: si no, cualquiera avisaria a la agenda de
+// otro usuario de un contenido que no es suyo.
+const notificarContactos = async (userId, tabla, idParam, ruta, texto, columnaDueno = 'user_id') => {
+  const { data: fila } = await supabase.from(tabla).select(`id, ${columnaDueno}`).eq('id', idParam).single();
+  if (!fila) return { estado: 404, cuerpo: { error: 'NO_ENCONTRADO', message: `Ese ${ruta} no existe.` } };
+  if (fila[columnaDueno] !== userId) return { estado: 403, cuerpo: { error: 'NO_ES_TUYO', message: `Ese ${ruta} no es tuyo.` } };
+
+  const destinatarios = await contactosDeUsuario(userId);
+  await Promise.allSettled(
+    destinatarios.map(contactoId => sendPushToUser(contactoId, texto))
+  );
+  // No se cuenta como "enviados": sendPushToUser se traga sus propios errores y
+  // un fulfilled aqui no significa que el telefono haya sonado. Lo que si es
+  // cierto es a cuantos contactos se dirigio el aviso.
+  return {
+    estado: 200,
+    cuerpo: { ok: true, destinatarios: destinatarios.length },
+  };
+};
+
+app.post('/api/moments/:id/notify', auth, async (req, res) => {
+  try {
+    const nombre = (req.body?.authorName || 'Un contacto').toString().slice(0, 60);
+    const preview = (req.body?.preview || 'Nuevo momento').toString().slice(0, 120);
+    const r = await notificarContactos(req.user.id, 'moments', req.params.id, 'momento', {
+      title: `${nombre} publico un momento`,
+      body: preview,
+      notificationType: 'moment_new',
+      url: '/moments',
+      tag: `momento-${req.params.id}`,
+      momentId: req.params.id,
+      senderName: nombre,
+    });
+    res.status(r.estado).json(r.cuerpo);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.post('/api/stories/:storyId/notify', auth, async (req, res) => {
+  try {
+    const nombre = (req.body?.authorName || 'Un contacto').toString().slice(0, 60);
+    const r = await notificarContactos(req.user.id, 'stories', req.params.storyId, 'estado', {
+      title: `${nombre} publico un estado`,
+      body: 'Toca para verlo',
+      notificationType: 'story_new',
+      url: '/stories',
+      tag: `estado-${req.params.storyId}`,
+      storyId: req.params.storyId,
+      senderName: nombre,
+    });
+    res.status(r.estado).json(r.cuerpo);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// DIRECTOS (LIVE) — el registro, no el video
+// ════════════════════════════════════════════════════════════════════
+// El video viaja por los canales de realtime del telefono. Lo que faltaba era el
+// registro: sin live_streams la pestaña de vivos no tenia donde leer quien estaba
+// en directo, y el cliente inventaba un id y se lo apuntaba a si mismo.
+// No hay columna de espectadores: nadie sabe ese numero hasta que exista presencia
+// real, y un conteo escrito aparte es un numero que puede mentir.
+
+app.post('/api/live/start', auth, async (req, res) => {
+  try {
+    const titulo = (req.body?.title || 'Directo').toString().slice(0, 80);
+    // Un usuario no puede tener dos directos abiertos: si no se cierra el anterior
+    // la lista de activos queda duplicada y nunca se apaga.
+    await supabase.from('live_streams')
+      .update({ is_active: false, ended_at: new Date().toISOString() })
+      .eq('host_id', req.user.id).eq('is_active', true);
+    const { data, error } = await supabase
+      .from('live_streams').insert({ host_id: req.user.id, title: titulo }).select().single();
+    if (error) return espacioFallo(res, error);
+    const { data: anfitrion } = await supabase
+      .from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
+    res.status(201).json({
+      liveId: data.id,
+      host_id: req.user.id,
+      host_name: anfitrion?.full_name || 'Usuario',
+      host_avatar: anfitrion?.avatar_url || '',
+      started_at: data.started_at,
+    });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.get('/api/live/active', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('live_streams')
+      .select('id, host_id, title, started_at')
+      .eq('is_active', true)
+      .gte('started_at', desdeHace24h())
+      .order('started_at', { ascending: false });
+    if (error) return espacioFallo(res, error);
+    const hosts = [...new Set((data || []).map(l => l.host_id))];
+    let perfiles = [];
+    if (hosts.length > 0) {
+      const r = await supabase.from('users').select('id, full_name, avatar_url').in('id', hosts);
+      perfiles = r.data || [];
+    }
+    const mapa = {};
+    perfiles.forEach(u => { mapa[u.id] = u; });
+    res.json((data || []).map(l => ({
+      live_id: l.id,
+      id: l.id,
+      host_id: l.host_id,
+      host_name: mapa[l.host_id]?.full_name || 'Usuario',
+      host_avatar: mapa[l.host_id]?.avatar_url || '',
+      title: l.title,
+      started_at: l.started_at,
+    })));
+  } catch (e) { espacioFallo(res, e); }
+});
+
+// POST /api/live/:liveId/end — lo llama el propio anfitrion al colgar. Antes el
+// telefono hacia el update contra la tabla: sin un registro compartido el directo
+// se quedaba activo para los demas aunque el dueno ya hubiera salido.
+app.post('/api/live/:liveId/end', auth, async (req, res) => {
+  try {
+    const { data: directo } = await supabase
+      .from('live_streams').select('id, host_id').eq('id', req.params.liveId).single();
+    if (!directo) return res.status(404).json({ error: 'NO_ENCONTRADO', message: 'Ese directo no existe.' });
+    if (directo.host_id !== req.user.id) {
+      return res.status(403).json({ error: 'NO_ES_TUYO', message: 'Ese directo no es tuyo.' });
+    }
+    const { data, error } = await supabase
+      .from('live_streams')
+      .update({ is_active: false, ended_at: new Date().toISOString() })
+      .eq('id', req.params.liveId).eq('host_id', req.user.id).eq('is_active', true)
+      .select('id');
+    if (error) throw error;
+    if (!data || data.length === 0) {
+      return res.status(404).json({ error: 'NO_ENCONTRADO', message: 'Ese directo ya termino.' });
+    }
+    res.json({ ok: true, id: data[0].id });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.post('/api/live/:liveId/notify', auth, async (req, res) => {
+  try {
+    const nombre = (req.body?.hostName || 'Un contacto').toString().slice(0, 60);
+    const r = await notificarContactos(req.user.id, 'live_streams', req.params.liveId, 'directo', {
+      title: `${nombre} esta en directo`,
+      body: 'Toca para unirte',
+      notificationType: 'live_new',
+      url: '/stories',
+      tag: `directo-${req.params.liveId}`,
+      liveId: req.params.liveId,
+      senderName: nombre,
+    }, 'host_id');
+    res.status(r.estado).json(r.cuerpo);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// La tabla `stories` la crea tambien
+// migrations/2026-11-05_espacio_dulce_lote_e1.sql y su presencia la comprueba
+// ensureSpacesSchema arriba. Antes intentaba crearse ella sola con `exec_sql`, que
+// ya no existe: el catch vacio se tragaba el fallo y los estados no salian.
+
 
 app.get('/api/stories', auth, async (req, res) => {
   try {
@@ -5565,12 +7916,14 @@ app.get('/api/stories', auth, async (req, res) => {
     const now = new Date().toISOString();
 
     // 1. Mis propios estados
-    const { data: mine } = await supabase
+    const { data: mine, error: mineError } = await supabase
       .from('stories')
       .select('*')
       .eq('user_id', userId)
       .gt('expires_at', now)
       .order('created_at', { ascending: false });
+
+    if (mineError) return espacioFallo(res, mineError);
 
     // 2. IDs de contactos (tabla contacts)
     const { data: contacts } = await supabase
@@ -5639,6 +7992,7 @@ app.get('/api/stories', auth, async (req, res) => {
         media: Array.isArray(media) ? media : [],
         views: s.views || 0,
         reactions: s.reactions || [],
+        replies: s.replies || [],
         seen: false,
         publishedAt: new Date(s.created_at).getTime(),
         expiresAt: new Date(s.expires_at).getTime(),
@@ -5650,7 +8004,7 @@ app.get('/api/stories', auth, async (req, res) => {
       ...(mine || []).map(s => format(s, true)),
       ...contactStories.map(s => format(s, false)),
     ]);
-  } catch (e) { res.json([]); }
+  } catch (e) { espacioFallo(res, e); }
 });
 
 app.post('/api/stories', auth, async (req, res) => {
@@ -5686,7 +8040,7 @@ app.post('/api/stories', auth, async (req, res) => {
     } else {
       const { data, error } = await supabase
         .from('stories')
-        .insert({ user_id: req.user.id, media: newSlides, type, views: 0, expires_at: expiresAt })
+        .insert({ user_id: req.user.id, media: newSlides, type, views: 0, reactions: [], replies: [], expires_at: expiresAt })
         .select()
         .single();
       if (error) throw error;
@@ -5738,6 +8092,40 @@ app.post('/api/stories/:storyId/view', auth, async (req, res) => {
   } catch (e) { res.json({ ok: false }); }
 });
 
+app.post('/api/stories/:storyId/reply', auth, async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ message: 'text requerido' });
+
+    const { data: story, error: storyErr } = await supabase
+      .from('stories')
+      .select('id, user_id, replies')
+      .eq('id', req.params.storyId)
+      .single();
+
+    if (storyErr || !story) return res.status(404).json({ message: 'Story no encontrada' });
+
+    const replies = Array.isArray(story.replies) ? story.replies : [];
+    const replyPayload = {
+      id: `reply-${Date.now()}`,
+      storyId: req.params.storyId,
+      userId: req.user.id,
+      text: text.trim(),
+      createdAt: new Date().toISOString(),
+    };
+
+    const updatedReplies = [...replies, replyPayload];
+    const { error: updateErr } = await supabase
+      .from('stories')
+      .update({ replies: updatedReplies })
+      .eq('id', req.params.storyId);
+
+    if (updateErr) throw updateErr;
+
+    res.json({ ok: true, reply: replyPayload, replies: updatedReplies });
+  } catch (e) { res.status(500).json({ message: e.message || 'No se pudo guardar la respuesta' }); }
+});
+
 app.post('/api/stories/:storyId/react', auth, async (req, res) => {
   try {
     const { emoji } = req.body;
@@ -5785,746 +8173,1056 @@ const updateUserVersions = async () => {
 
 // ─── WebRTC Signaling — persistido en Supabase ───────────────────────────────
 
-// TURN token endpoint — genera credenciales temporales para TURN server
-const handleTurnToken = async (req, res) => {
+// TURN token endpoint — credenciales temporales de relay
+//
+// Orden de preferencia: Cloudflare Realtime (los primeros 1.000 GB/mes son gratis y
+// el relay solo se pisa cuando falla la conexion directa) → Twilio NTS → STUN publico.
+const TWILIO_ACCOUNT_SID  = process.env.TWILIO_ACCOUNT_SID  || '';
+const TWILIO_API_KEY_SID  = process.env.TWILIO_API_KEY_SID  || '';
+const TWILIO_API_KEY_SECRET = process.env.TWILIO_API_KEY_SECRET || '';
+const TWILIO_AUTH_TOKEN   = process.env.TWILIO_AUTH_TOKEN   || '';
+const CF_TURN_KEY_ID    = process.env.CF_TURN_KEY_ID || '';
+// La doc de Cloudflare llama a este valor TURN_KEY_API_TOKEN y nosotros CF_TURN_KEY_SECRET en el
+// panel; se aceptan los dos nombres para que un pegado con cualquiera de las dos letras funcione.
+const CF_TURN_KEY_TOKEN = process.env.CF_TURN_KEY_SECRET || process.env.CF_TURN_KEY_API_TOKEN || '';
+const CF_TURN_TTL       = parseInt(process.env.CF_TURN_TTL || '86400', 10);
+
+async function getCloudflareIceServers() {
+  if (!CF_TURN_KEY_ID || !CF_TURN_KEY_TOKEN) throw new Error('sin CF_TURN_KEY_ID + CF_TURN_KEY_SECRET');
+  TURN_VIA = 'cloudflare';
+  const r = await fetch(
+    `https://rtc.live.cloudflare.com/v1/turn/keys/${CF_TURN_KEY_ID}/credentials/generate-ice-servers`,
+    {
+      method:  'POST',
+      headers: { authorization: `Bearer ${CF_TURN_KEY_TOKEN}`, 'content-type': 'application/json' },
+      body:    JSON.stringify({ ttl: CF_TURN_TTL }),
+      signal:  AbortSignal.timeout(8000),
+    }
+  );
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    // rtc.live responde {"error":"texto"}, no el envoltorio errors[] del API de Cloudflare.
+    const e = data?.errors?.[0]?.message
+      ?? (typeof data?.error === 'string' ? data.error : data?.error?.message)
+      ?? data?.message;
+    throw Object.assign(new Error(`Cloudflare ${r.status}: ${String(e ?? 'respuesta sin detalle').slice(0, 120)}`), { status: r.status });
+  }
+  // Devuelve el bloque ya en la forma {urls, username, credential} que lee useWebRTC.
+  const servers = (Array.isArray(data.iceServers) ? data.iceServers : []).map(s => ({
+    urls: s.urls,
+    ...(s.username   ? { username:   s.username }   : {}),
+    ...(s.credential ? { credential: s.credential } : {}),
+  }));
+  if (!servers.some(s => String(s.urls).includes('turn:'))) throw new Error('Cloudflare respondio sin entradas TURN');
+  return servers;
+}
+
+async function getTwilioIceServers() {
+  // La via limpia es una API key propia de NTS. Si no existe, el SDK tambien acepta
+  // el token maestro de SMS como credenciales REST, asi que el TURN funciona sin
+  // secretos nuevos: se avisa en el log, no es un reemplazo silencioso.
+  const conApiKey = !!(TWILIO_ACCOUNT_SID && TWILIO_API_KEY_SID && TWILIO_API_KEY_SECRET);
+  if (!conApiKey && !(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN)) {
+    throw new Error('sin credenciales de Twilio en el servicio');
+  }
+  if (!conApiKey) {
+    console.warn('[turn] sin API key de NTS: los tokens salen del token maestro de SMS (TWILIO_AUTH_TOKEN)');
+  }
+  TURN_VIA = conApiKey ? 'apikey' : 'maestro';
+  const client = require('twilio')(
+    conApiKey ? TWILIO_API_KEY_SID : TWILIO_ACCOUNT_SID,
+    conApiKey ? TWILIO_API_KEY_SECRET : TWILIO_AUTH_TOKEN,
+    { accountSid: TWILIO_ACCOUNT_SID }
+  );
+  const token = await client.tokens.create({ ttl: 86400 });
+  return token.iceServers.map(s => ({
+    urls: s.url || s.urls,
+    username: s.username,
+    credential: s.credential,
+  }));
+}
+
+// Prueba un proveedor y despues el siguiente; el error acumulado dice por que cada uno
+// cayo, que es lo que necesita quien lea `turn.ultimo` en voip-status.
+async function getIceServers() {
+  const caidas = [];
+  let http = null, codigo = null;
+  for (const [nombre, fn] of [['cloudflare', getCloudflareIceServers], ['twilio', getTwilioIceServers]]) {
+    try { return await fn(); }
+    catch (e) {
+      caidas.push(`${nombre}: ${redactarSecretos(e.message).slice(0, 120)}`);
+      // Se guarda el primer estado HTTP que respondio un proveedor: es el que dice si la
+      // clave TURN existe, si Twilio rechazó la credencial o si fue un fallo de red.
+      if (http === null && e.status !== undefined) { http = e.status; codigo = e.code ?? null; }
+    }
+  }
+  throw Object.assign(new Error(caidas.join(' | ')), { status: http ?? undefined, code: codigo ?? undefined });
+}
+
+// Solo STUN publicos: un TURN abierto y sin probar (openrelay) aporta candidatos
+// muertos que retrasan la negociacion ICE en lugar de ayudar. El TURN real lo
+// devuelven getCloudflareIceServers() o getTwilioIceServers().
+const FALLBACK_ICE = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+  { urls: 'stun:stun.cloudflare.com:3478' }
+];
+
+// Estado del ultimo intento de TURN, para diagnosticar sin leer los logs del servicio.
+// Nunca guarda valores de secretos: los mensajes se redactan antes de guardarse.
+let TURN_VIA = null;
+let TURN_ULTIMO = null;
+const redactarSecretos = (s) => [TWILIO_AUTH_TOKEN, TWILIO_API_KEY_SECRET, TWILIO_ACCOUNT_SID, CF_TURN_KEY_TOKEN]
+  .filter(Boolean)
+  .reduce((acc, v) => acc.split(v).join('[secreto]'), String(s || ''));
+
+// Ruta principal usada por el frontend
+app.get('/api/turn-token', auth, async (req, res) => {
   try {
-    const accountSid   = process.env.TWILIO_ACCOUNT_SID;
-    const apiKeySid    = process.env.TWILIO_API_KEY_SID;
-    const apiKeySecret = process.env.TWILIO_API_KEY_SECRET;
-    const client = require('twilio')(apiKeySid, apiKeySecret, { accountSid });
-    const token  = await client.tokens.create({ ttl: 86400 });
-    res.json({
-      iceServers: token.iceServers.map(s => ({
-        urls: s.url || s.urls, username: s.username, credential: s.credential,
-      }))
-    });
+    const iceServers = await getIceServers();
+    TURN_ULTIMO = {
+      ok: true,
+      en: new Date().toISOString(),
+      via: TURN_VIA,
+      servidores: iceServers.length,
+      conTurn: iceServers.some(s => String(s.urls).includes('turn:')),
+      // Solo las URLs: username y credential son la credencial del relay y no salen del proceso.
+      urls: iceServers.flatMap(s => Array.isArray(s.urls) ? s.urls : [s.urls]),
+    };
+    res.json({ iceServers });
   } catch (e) {
-    // Fallback STUN + TURN públicos (Metered.ca free tier)
-    res.json({
-      iceServers: [
-        { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-        { urls: 'stun:stun.cloudflare.com:3478' },
-        { urls: 'turn:relay.metered.ca:80',               username: 'openrelayproject', credential: 'openrelayproject' },
-        { urls: 'turn:relay.metered.ca:443',              username: 'openrelayproject', credential: 'openrelayproject' },
-        { urls: 'turns:relay.metered.ca:443',             username: 'openrelayproject', credential: 'openrelayproject' },
-        { urls: 'turn:relay.metered.ca:80?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-      ]
+    // Sin ningun proveedor el ICE se queda solo con STUN publico: la llamada timbra pero
+    // el audio puede no conectar entre redes distintas. `e.message` ya trae por que cayo
+    // cada proveedor, redactado y con nomes de variable.
+    TURN_ULTIMO = {
+      ok: false,
+      en: new Date().toISOString(),
+      via: TURN_VIA,
+      codigo: e.code ?? null,
+      http: e.status ?? null,
+      mensaje: redactarSecretos(e.message).slice(0, 240),
+    };
+    console.error('TURN sin relay, se devuelven solo STUN publicos ·', TURN_ULTIMO.mensaje);
+    res.json({ iceServers: FALLBACK_ICE });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUSH VoIP (PushKit → CallKit)
+//
+// Es la única forma de que un iPhone con la app cerrada muestre la ventana de
+// llamada entrante: un banner normal de APNs no levanta la UI de CallKit, así
+// que sin este push la llamada "llega como notificación" y no se puede contestar.
+//
+// Requiere en Render las variables de entorno:
+//   APNS_KEY_P8   · contenido del AuthKey_XXXXXXXX.p8 (PEM de una línea o base64)
+//   APNS_KEY_ID   · 10 caracteres (el nombre del archivo sin extensión)
+//   APNS_TEAM_ID  · 10 caracteres
+//   APNS_BUNDLE_ID· opcional, por defecto com.jallzstores.egchat
+//   APNS_ENV      · opcional: production | sandbox
+// Sin APNS_KEY_P8 la función devuelve configured:false y el llamador mantiene
+// el comportamiento anterior (banner por Expo Push).
+// ─────────────────────────────────────────────────────────────────────────────
+const http2  = require('node:http2');
+
+const APNS_VOIP_HOSTS = {
+  production: 'api.push.apple.com',
+  sandbox:    'api.sandbox.push.apple.com',
+};
+
+let _apnsVoipJwt    = null;
+let _apnsVoipJwtIat = 0;
+
+/** Convierte un callId arbitrario ("call_1698…") en el UUID que exige iOS 16. */
+const uuidFromCallId = (callId) => {
+  const h = crypto.createHash('md5').update(String(callId || '')).digest('hex');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
+};
+
+const getApnsVoipJwt = () => {
+  const keyId  = process.env.APNS_KEY_ID;
+  const teamId = process.env.APNS_TEAM_ID;
+  const raw    = process.env.APNS_KEY_P8;
+  if (!keyId || !teamId || !raw) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  if (_apnsVoipJwt && now - _apnsVoipJwtIat < 3000) return _apnsVoipJwt;
+
+  // Render no admite valores multilínea: se acepta PEM con "\n" literal o base64
+  let keyP8 = raw.includes('BEGIN PRIVATE KEY') ? raw.replace(/\\n/g, '\n')
+                                                : Buffer.from(raw, 'base64').toString('utf8');
+  if (!keyP8.includes('BEGIN PRIVATE KEY')) return null;
+
+  try {
+    _apnsVoipJwt = jwt.sign({ iss: teamId, iat: now }, keyP8, {
+      algorithm: 'ES256',
+      header: { alg: 'ES256', kid: keyId },
     });
+    _apnsVoipJwtIat = now;
+    return _apnsVoipJwt;
+  } catch (e) {
+    console.error('[voip] JWT APNs no generado:', e.message);
+    return null;
   }
 };
 
-// Alias sin prefijo /call/ para compatibilidad con cliente web
-app.get('/api/turn-token',      auth, handleTurnToken);
-app.get('/api/call/turn-token', auth, handleTurnToken);
+/** Un POST a APNs para un token device. Nunca rechaza: devuelve {ok, reason}. */
+const sendApnsVoip = (deviceToken, apnsJwt, payload) => new Promise((resolve) => {
+  const host   = APNS_VOIP_HOSTS[process.env.APNS_ENV] || APNS_VOIP_HOSTS.production;
+  const bundle = process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat';
+  const client = http2.connect(`https://${host}`);
 
-// Iniciar llamada — caller envía offer + push al destinatario
-app.post('/api/call/offer', auth, async (req, res) => {
-  let { callId, offer, targetUserId, type } = req.body;
-  if (!callId || !offer) return res.status(400).json({ error: 'callId y offer requeridos' });
+  let settled = false;
+  const settle = (ok, reason) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    try { client.destroy(); } catch {}
+    resolve({ ok, reason });
+  };
+  const timer = setTimeout(() => settle(false, 'TIMEOUT'), 6000);
 
-  // Si targetUserId es un chatId (UUID sin user en voip_push_tokens), resolver el userId real
-  if (targetUserId) {
-    const { data: participant, error: partErr } = await supabase
-      .from('chat_participants')
-      .select('user_id')
-      .eq('chat_id', targetUserId)
-      .neq('user_id', req.user.id)
-      .maybeSingle();
-    console.log(`[Call] Resolución chatId: targetUserId=${targetUserId}, callerId=${req.user.id}, found=${!!participant?.user_id}, error=${partErr?.message || 'none'}`);
-    if (participant?.user_id) {
-      console.log(`[Call] targetUserId ${targetUserId} era chatId → resuelto a userId ${participant.user_id}`);
-      targetUserId = participant.user_id;
+  client.on('error', (e) => settle(false, e.message));
+
+  const req = client.request({
+    ':method':          'POST',
+    ':path':            `/3/device/${deviceToken}`,
+    ':authority':       host,
+    'authorization':    `bearer ${apnsJwt}`,
+    'apns-push-type':   'voip',
+    'apns-topic':       `${bundle}.voip`,
+    'apns-priority':    '10',
+    'apns-expiration':  String(Math.floor(Date.now() / 1000) + 90),
+    'content-type':     'application/json',
+  });
+
+  let status = 0;
+  let body   = '';
+  req.on('response', (headers) => { status = Number(headers[':status']) || 0; });
+  req.on('data',     (d) => { body += d; });
+  req.on('error',    (e) => settle(false, e.message));
+  req.on('end',      () => {
+    if (status === 200) return settle(true, null);
+    let reason = `HTTP ${status}`;
+    try { reason = JSON.parse(body).reason || reason; } catch {}
+    settle(false, reason);
+  });
+  req.end(JSON.stringify(payload));
+});
+
+const sendVoipPushToUser = async (userId, call) => {
+  try {
+    const apnsJwt = getApnsVoipJwt();
+    if (!apnsJwt) return { configured: false, delivered: false, reason: 'no_credentials' };
+
+    const { data: voipSubs } = await supabase
+      .from('expo_push_tokens')
+      .select('token')
+      .eq('user_id', userId)
+      .eq('token_type', 'voip')
+      .neq('is_active', false);
+
+    if (!voipSubs || voipSubs.length === 0) {
+      console.log(`[voip] sin token para user=${String(userId).slice(0, 8)}: la llamada sale por otro canal`);
+      return { configured: true, delivered: false, reason: 'no_voip_token' };
+    }
+
+    const payload = {
+      aps: { 'content-available': 1 },
+      'call-id':      String(call.callId),
+      'call-uuid':    uuidFromCallId(call.callId),
+      'call-timeout': 60,
+      callId:         String(call.callId),
+      callerName:     call.callerName || 'EGCHAT',
+      callerAvatar:   call.callerAvatar || '',
+      callType:       call.callType || 'audio',
+      callerId:       call.callerId || '',
+      ...(call.offer ? { offer: call.offer } : {}),
+    };
+    // APNs limita los pushes VoIP a 5KB. Si el offer SDP no cabe, el callee ya
+    // lo recupera por polling (_fetchOfferWithRetry), así que se omite.
+    if (Buffer.byteLength(JSON.stringify(payload)) > 4800) delete payload.offer;
+
+    const results   = await Promise.all(voipSubs.map(s => sendApnsVoip(s.token, apnsJwt, payload)));
+    const delivered = results.some(r => r.ok);
+    if (delivered) console.log(`[voip] entregado por APNs a user=${String(userId).slice(0, 8)} (${voipSubs.length} token(s))`);
+    else console.warn(`[voip] ${voipSubs.length} token(s), 0 entregados:`, results.map(r => r.reason).join(' | '));
+    return { configured: true, delivered, reason: delivered ? null : (results[0] && results[0].reason) || 'failed' };
+  } catch (e) {
+    console.error('[voip] error:', e.message);
+    return { configured: true, delivered: false, reason: e.message };
+  }
+};
+
+/**
+ * Push VoIP de señalización (aviso de respuesta o de fin), sin offer: es pequeño
+ * y cabe siempre. La app lo traduce en CallKit: corta el timbre si la llamada
+ * aún no estaba conectada. Sin este push, un iPhone suspendido no se entera de
+ * que otra máquina contestó y sigue sonando hasta que caduca la sesión.
+ */
+const sendVoipSignalToUsers = async (userIds, callId, type, reason) => {
+  try {
+    // Un VoIP push obliga al binario a reportar una interacción de CallKit. Los
+    // iPhone con 126/127 no leen `notificationType` y abrirían una llamada
+    // fantasma, así que la señal no se emite solo porque existan las claves
+    // APNs: hace falta además VOIP_SIGNAL_ENABLED=1, cuando el grupo esté en 129.
+    if (process.env.VOIP_SIGNAL_ENABLED !== '1') {
+      return { configured: false, delivered: false, reason: 'signal_disabled' };
+    }
+    const apnsJwt = getApnsVoipJwt();
+    if (!apnsJwt) return { configured: false, delivered: false };
+
+    const tokens = [];
+    for (const id of userIds) {
+      const { data } = await supabase
+        .from('expo_push_tokens')
+        .select('token')
+        .eq('user_id', id)
+        .eq('token_type', 'voip')
+        .neq('is_active', false);
+      (data || []).forEach(s => s.token && tokens.push(s.token));
+    }
+    const uniq = [...new Set(tokens)];
+    if (uniq.length === 0) return { configured: true, delivered: false, reason: 'no_voip_token' };
+
+    // El binario de TestFlight decide con estos dos campos si debe colgar la
+    // llamada que ya está sonando: `notificationType` (los dos valores que
+    // emite notifyCallPeer) o `status` (answered/ended/rejected/cancelled/
+    // missed). Son alternativas en el cliente, así que se mandan los dos.
+    const status = type === 'call_answered' ? 'answered'
+      : (['rejected', 'cancelled', 'missed'].includes(String(reason || '')) ? String(reason) : 'ended');
+    const payload = {
+      aps: { 'content-available': 1 },
+      callId:           String(callId),
+      'call-uuid':      uuidFromCallId(callId),
+      notificationType: type,
+      status,
+      reason: reason || status,
+    };
+    const results   = await Promise.all(uniq.map(t => sendApnsVoip(t, apnsJwt, payload)));
+    const delivered = results.some(r => r.ok);
+    if (!delivered) console.warn(`[voip-signal] ${type} ${callId}: 0/${uniq.length} entregados`);
+    return { configured: true, delivered };
+  } catch (e) {
+    console.error('[voip-signal] error:', e.message);
+    return { configured: true, delivered: false, reason: e.message };
+  }
+};
+
+/**
+ * Entrega una llamada entrante por el mejor canal disponible, en este orden:
+ *   1. APNs VoIP directo (abre la ventana de CallKit con el teléfono bloqueado)
+ *   2. Edge Function deliver-call-push (si Render tiene SERVICE_TOKEN configurado)
+ *   3. Banner por Expo Push (comportamiento clásico)
+ * Solo se usa un canal: si el anterior entregó, se corta para no timbrar dos veces.
+ */
+const deliverIncomingCall = async (targetUserId, call) => {
+  const voip = await sendVoipPushToUser(targetUserId, call);
+  if (voip.delivered) return { channel: 'voip', delivered: true };
+
+  const edgeFnUrl = process.env.SUPABASE_URL
+    ? `${process.env.SUPABASE_URL}/functions/v1/deliver-call-push`
+    : null;
+
+  if (edgeFnUrl && process.env.SERVICE_TOKEN) {
+    try {
+      const edgeRes = await fetch(edgeFnUrl, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'x-service-token': process.env.SERVICE_TOKEN },
+        body: JSON.stringify({
+          callId:     call.callId,
+          callerId:   call.callerId,
+          callerName: call.callerName,
+          callerAvatar: call.callerAvatar,
+          calleeId:   targetUserId,
+          callType:   call.callType || 'audio',
+          offer:      call.offer || null,
+        }),
+      });
+      if (edgeRes.ok) {
+        const r = await edgeRes.json().catch(() => ({}));
+        const s = r.results_summary || {};
+        if (s.voip_sent > 0) return { channel: 'edge-voip', delivered: true };
+        if (s.fcm_sent > 0 || s.expo_sent > 0) return { channel: 'edge-banner', delivered: true };
+      }
+    } catch (e) {
+      console.warn('[deliver] Edge Function falló, se usa banner:', e.message);
     }
   }
-  try {
-    await supabase.from('call_sessions').upsert({
-      call_id: callId,
-      offer: JSON.stringify(offer),
-      answer: null,
-      caller_candidates: '[]',
-      callee_candidates: '[]',
-      type: type || 'audio',
-      caller_id: req.user.id,
-      target_user_id: targetUserId,
-      ended: false,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'call_id' });
 
-    // Enviar push de llamada entrante al destinatario
+  const isVideo = call.callType === 'video';
+  await sendPushToUser(targetUserId, {
+    title: isVideo ? `📹 Videollamada de ${call.callerName}` : `📞 Llamada de ${call.callerName}`,
+    body:  isVideo ? 'Toca para responder la videollamada' : 'Toca para responder la llamada',
+    tag: `call-${call.callId}`, requireInteraction: true,
+    ...call,
+    notificationType: 'incoming_call',
+  });
+  return { channel: 'banner', delivered: true };
+};
+
+// Iniciar llamada — caller envía offer + push al destinatario
+// ─────────────────────────────────────────────────────────────────────────────
+// LLAMADAS WebRTC — Señalización y gestión de estado
+//
+// FUENTE DE VERDAD: Supabase PostgreSQL via RPCs atómicas con FOR UPDATE.
+//
+// RACE CONDITIONS RESUELTAS:
+//   Accept + Accept → solo uno hace la transición, el otro recibe 'idempotent'
+//   Cancel + Accept → accept_call falla con invalid_transition
+//   End + End       → end_call es idempotente
+//   Dos dispositivos del callee → el primero acepta, el resto recibe 409
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.post('/api/call/offer', auth, async (req, res) => {
+  const { callId, offer, targetUserId, type, groupId } = req.body;
+  if (!callId || !offer) return res.status(400).json({ error: 'callId y offer requeridos' });
+  if (!targetUserId) return res.status(400).json({ error: 'targetUserId requerido' });
+  try {
+    const nonce = `${callId}_${req.user.id}`;
+    const { data: callData, error: callErr } = await supabase.rpc('initiate_call', {
+      p_call_id:   callId,
+      p_caller_id: req.user.id,
+      p_callee_id: targetUserId,
+      p_call_type: type || 'audio',
+      p_offer:     offer,
+      p_chat_id:   req.body.chatId || null,
+      p_nonce:     nonce,
+    });
+
+    if (callErr) {
+      if (callErr.message && callErr.message.includes('caller_already_in_call')) {
+        return res.status(409).json({ error: 'El llamante ya tiene una llamada activa' });
+      }
+      // Fallback si la RPC no existe aún (migración no ejecutada)
+      await supabase.from('call_sessions').upsert({
+        call_id: callId, offer: JSON.stringify(offer), answer: null,
+        caller_candidates: '[]', callee_candidates: '[]',
+        type: type || 'audio', caller_id: req.user.id,
+        target_user_id: targetUserId, ended: false,
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+        ...(groupId ? { group_id: groupId } : {}),
+      }, { onConflict: 'call_id' });
+    } else {
+      // Guardar offer como texto para polling legacy
+      await supabase.from('call_sessions').update({
+        offer: JSON.stringify(offer), updated_at: new Date().toISOString(),
+        ...(groupId ? { group_id: groupId } : {}),
+      }).eq('call_id', callId);
+    }
+
+    let delivery = null;
     if (targetUserId) {
       try {
         const { data: caller } = await supabase
           .from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
-        const callerName = caller?.full_name || 'Alguien';
-        const isVideo = (type || 'audio') === 'video';
-        const callPushPayload = {
-          title: isVideo ? `📹 Videollamada de ${callerName}` : `📞 Llamada de ${callerName}`,
-          body: isVideo ? 'Toca para responder la videollamada' : 'Toca para responder la llamada',
-          icon: caller?.avatar_url || '/favicon.svg',
-          badge: '/favicon.svg',
-          tag: `call-${callId}`,
-          requireInteraction: true,
-          url: '/',
-          callId,
-          callerId: req.user.id,
-          callerName,
-          callType: type || 'audio',
-          notificationType: 'incoming_call',
-        };
-
-        // 1️⃣ VoIP push (iOS PushKit) — despierta la app aunque esté cerrada
-        //    Se envía PRIMERO porque tiene latencia 0 y es el canal correcto para llamadas
-        console.log('[DEBUG] VoIP Payload:', JSON.stringify({
-          targetUserId,
-          callId,
-          callerName,
+        const callInfo = {
+          callId, callerId: req.user.id,
+          callerName:   caller?.full_name || 'Alguien',
           callerAvatar: caller?.avatar_url || '',
-          callType: type || 'audio',
-          hasOffer: !!offer
-        }));
-        try {
-          const voipResult = await sendVoipPushToUser({
-            targetUserId,
-            callId,
-            callerName,
-            callerAvatar: caller?.avatar_url || '',
-            callType: type || 'audio',
-            offer,
-          });
-          console.log(`[VoIP] Push resultado para user ${targetUserId}:`, JSON.stringify(voipResult));
-        } catch (voipErr) {
-          console.warn('[VoIP] VoIP push failed:', voipErr.message);
-        }
-
-        // 2️⃣ Expo push — fallback para Android y iOS sin VoIP token
-        console.log('[DEBUG] Expo Push Payload:', JSON.stringify(callPushPayload));
-        await sendPushToUser(targetUserId, callPushPayload);
-
-      } catch (pushErr) {
-        console.warn('Push call notification failed:', pushErr.message);
-      }
+          callType: type || 'audio', offer,
+        };
+        delivery = await deliverIncomingCall(targetUserId, callInfo);
+        console.log(`[call/offer] ${callId} entregada por ${delivery.channel}`);
+      } catch (pushErr) { console.warn('[call/offer] Push failed:', pushErr.message); }
     }
 
-    res.json({ ok: true });
+    res.json({ ok: true, delivery, idempotent: callData && callData.idempotent ? true : false });
   } catch (e) {
-    res.status(500).json({ error: 'Error guardando sesión' });
+    console.error('[call/offer]', e.message);
+    res.status(500).json({ error: 'Error iniciando llamada' });
   }
 });
 
-// Callee responde con answer
+// Callee responde con answer — usa RPC atómica accept_call (FOR UPDATE)
 app.post('/api/call/answer', auth, async (req, res) => {
   const { callId, answer } = req.body;
-  const { data } = await supabase.from('call_sessions').select('call_id, caller_id, type').eq('call_id', callId).eq('ended', false).single();
-  if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
-  await supabase.from('call_sessions').update({
-    answer: JSON.stringify(answer),
-    status: 'accepted',
-    updated_at: new Date().toISOString()
-  }).eq('call_id', callId);
+  if (!callId) return res.status(400).json({ error: 'callId requerido' });
+  try {
+    const { data, error } = await supabase.rpc('accept_call', {
+      p_call_id:   callId,
+      p_callee_id: req.user.id,
+      p_answer:    answer || null,
+    });
 
-  if (data.caller_id) {
-    // 1️⃣ SSE — llega inmediatamente si el caller tiene la app en foreground
-    emitToUser(String(data.caller_id), { type: 'call_answered', callId, calleeId: req.user.id, ts: Date.now() });
-    console.log(`[Call] SSE call_answered emitido al caller ${data.caller_id}`);
-
-    // 2️⃣ VoIP push al caller — despierta la app si está en background
-    // Sin esto, el SSE no llega porque iOS congela las conexiones de red
-    try {
-      const { data: callee } = await supabase.from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
-      await sendVoipPushToUser({
-        targetUserId: String(data.caller_id),
-        callId,
-        callerName: callee?.full_name || 'EGChat',
-        callerAvatar: callee?.avatar_url || '',
-        callType: data.type || 'audio',
-        offer: null,
-        notificationType: 'call_answered', // distinguir de llamada entrante
-      });
-      console.log(`[Call] VoIP push call_answered enviado al caller ${data.caller_id}`);
-    } catch (e) {
-      console.warn('[Call] VoIP push al caller falló:', e.message);
+    if (error) {
+      const msg = error.message || '';
+      if (msg.includes('not_authorized'))        return res.status(403).json({ error: 'No autorizado' });
+      if (msg.includes('call_not_found'))        return res.status(404).json({ error: 'Llamada no encontrada' });
+      if (msg.includes('call_expired'))          return res.status(410).json({ error: 'La llamada ha caducado' });
+      if (msg.includes('invalid_transition'))    return res.status(409).json({ error: 'Transición inválida: ' + msg });
+      if (msg.includes('concurrent_modification')) return res.status(409).json({ error: 'La llamada ya fue respondida en otro dispositivo' });
+      // Fallback si la RPC no existe
+      const { data: existing } = await supabase.from('call_sessions').select('call_id, target_user_id').eq('call_id', callId).eq('ended', false).single();
+      if (!existing) return res.status(404).json({ error: 'Llamada no encontrada' });
+      if (String(existing.target_user_id) !== String(req.user.id)) return res.status(403).json({ error: 'No autorizado' });
+      const fallbackUpdate = await supabase.from('call_sessions').update({
+        answer: answer ? JSON.stringify(answer) : null,
+        status: 'accepted',
+        ended: false,
+        expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        updated_at: new Date().toISOString(),
+      }).eq('call_id', callId).eq('target_user_id', String(req.user.id));
+      if (fallbackUpdate.error) throw fallbackUpdate.error;
+      await notifyCallPeer(callId, req.user.id, { type: 'call_answered', callId, reason: 'answered', ts: Date.now() });
+      return res.json({ ok: true });
     }
+
+    if (answer) {
+      await supabase.from('call_sessions').update({
+        answer: JSON.stringify(answer), updated_at: new Date().toISOString(),
+      }).eq('call_id', callId);
+    }
+
+    // FIX: Enviar broadcast instantáneo CON EL ANSWER para parar el tono y conectar inmediatamente
+    // Esto es mucho más rápido (< 50ms) que postgres_changes (200-500ms) + elimina el fetch extra
+    try {
+      const channel = supabase.channel(`call-state:${callId}`, {
+        config: { broadcast: { self: false } }
+      });
+      await channel.subscribe();
+      await channel.send({
+        type: 'broadcast',
+        event: 'call_status',
+        payload: { 
+          status: 'accepted', 
+          callId,
+          answer: answer ? JSON.parse(JSON.stringify(answer)) : null  // Incluir el answer en el broadcast
+        }
+      });
+      console.log(`[call/answer] Broadcast sent: accepted with answer for ${callId}`);
+      // Limpiar el canal después de enviar
+      setTimeout(() => supabase.removeChannel(channel), 1000);
+    } catch (broadcastErr) {
+      console.warn('[call/answer] Broadcast failed:', broadcastErr.message);
+    }
+
+    await notifyCallPeer(callId, req.user.id, { type: 'call_answered', callId, reason: 'answered', ts: Date.now() });
+
+    res.json({ ok: true, idempotent: data && data.idempotent ? true : false });
+  } catch (e) {
+    console.error('[call/answer]', e.message);
+    res.status(500).json({ error: 'Error aceptando llamada' });
   }
-  res.json({ ok: true });
 });
 
-// Enviar ICE candidate
+// ICE candidates
 app.post('/api/call/ice', auth, async (req, res) => {
   const { callId, candidate, role } = req.body;
-  const { data } = await supabase.from('call_sessions').select('caller_candidates, callee_candidates').eq('call_id', callId).single();
-  // Si la sesión no existe aún (race condition), ignorar silenciosamente
-  if (!data) return res.json({ ok: true, ignored: true });
-  if (role === 'caller') {
-    const arr = JSON.parse(data.caller_candidates || '[]');
+  if (!callId || !candidate) return res.status(400).json({ error: 'callId y candidate requeridos' });
+  try {
+    const { data } = await supabase.from('call_sessions')
+      .select('caller_candidates, callee_candidates, status, ended')
+      .eq('call_id', callId).single();
+    if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
+    const status = data.status || '';
+    if (data.ended || ['ended','rejected','missed','failed'].includes(status)) {
+      return res.json({ ok: true, skipped: true });
+    }
+    const field = role === 'caller' ? 'caller_candidates' : 'callee_candidates';
+    const arr = JSON.parse(data[field] || '[]');
     arr.push(candidate);
-    await supabase.from('call_sessions').update({ caller_candidates: JSON.stringify(arr), updated_at: new Date().toISOString() }).eq('call_id', callId);
-  } else {
-    const arr = JSON.parse(data.callee_candidates || '[]');
-    arr.push(candidate);
-    await supabase.from('call_sessions').update({ callee_candidates: JSON.stringify(arr), updated_at: new Date().toISOString() }).eq('call_id', callId);
+    await supabase.from('call_sessions').update({ [field]: JSON.stringify(arr), updated_at: new Date().toISOString() }).eq('call_id', callId);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[call/ice]', e.message);
+    res.status(500).json({ error: 'Error ICE' });
   }
-  res.json({ ok: true });
 });
 
-// Polling — obtener estado de la llamada
+// Polling — estado completo con campos nuevos
 app.get('/api/call/:callId', auth, async (req, res) => {
-  const { data } = await supabase.from('call_sessions').select('*').eq('call_id', req.params.callId).single();
-  if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
-  res.json({
-    offer: JSON.parse(data.offer || 'null'),
-    answer: data.answer ? JSON.parse(data.answer) : null,
-    callerCandidates: JSON.parse(data.caller_candidates || '[]'),
-    calleeCandidates: JSON.parse(data.callee_candidates || '[]'),
-    type: data.type,
-    callerId: data.caller_id,
-    targetUserId: data.target_user_id,
-    ended: data.ended,
-    offerVersion: data.offer_version ?? 1,
-  });
+  try {
+    const { data } = await supabase.from('call_sessions').select('*').eq('call_id', req.params.callId).maybeSingle();
+    // Fila ya barrida: se devuelve estado terminal en vez de 404, que el cliente confundía con corte de red.
+    if (!data) {
+      return res.json({
+        offer: null, answer: null, callerCandidates: [], calleeCandidates: [],
+        type: null, callerId: null, targetUserId: null,
+        ended: true, status: 'ended', connectedAt: null, endedAt: null,
+        version: 0, gone: true,
+      });
+    }
+    const ringExpired = !data.ended && !data.answer
+      && ['new', 'calling', 'ringing'].includes(String(data.status || 'ringing'))
+      && !!data.expires_at && new Date(data.expires_at).getTime() < Date.now();
+    res.json({
+      offer:            JSON.parse(data.offer || 'null'),
+      answer:           data.answer ? JSON.parse(data.answer) : null,
+      callerCandidates: JSON.parse(data.caller_candidates || '[]'),
+      calleeCandidates: JSON.parse(data.callee_candidates || '[]'),
+      type:             data.type,
+      callerId:         data.caller_id,
+      targetUserId:     data.target_user_id,
+      ended:            ringExpired ? true : data.ended,
+      status:           ringExpired ? 'missed' : (data.status || (data.ended ? 'ended' : 'ringing')),
+      connectedAt:      data.connected_at || null,
+      endedAt:          data.ended_at || null,
+      version:          data.version || 1,
+    });
+  } catch (e) {
+    console.error('[call/get]', e.message);
+    res.status(500).json({ error: 'Error obteniendo estado' });
+  }
 });
 
-// Rechazar llamada (callee)
+// Terminar llamada — usa RPC end_call (idempotente)
+app.delete('/api/call/:callId', auth, async (req, res) => {
+  try {
+    const reason = req.query.reason || 'normal';
+    const { data, error } = await supabase.rpc('end_call', {
+      p_call_id: req.params.callId,
+      p_user_id: req.user.id,
+      p_reason:  reason,
+    });
+
+    if (error) {
+      const msg = error.message || '';
+      if (msg.includes('not_authorized')) return res.status(403).json({ error: 'No autorizado' });
+      if (msg.includes('call_not_found')) return res.json({ ok: true, idempotent: true });
+      // Fallback
+      await supabase.from('call_sessions').update({ ended: true, updated_at: new Date().toISOString() }).eq('call_id', req.params.callId);
+    }
+
+    await notifyCallPeer(req.params.callId, req.user.id, { type: 'call_ended', callId: req.params.callId, reason, ts: Date.now() });
+
+    res.json({ ok: true, idempotent: data && data.idempotent ? true : false, duration_seconds: data && data.duration_seconds ? data.duration_seconds : 0 });
+  } catch (e) {
+    console.error('[call/delete]', e.message);
+    res.status(500).json({ error: 'Error terminando llamada' });
+  }
+});
+
+// Rechazar llamada — usa RPC reject_call
 app.post('/api/call/reject', auth, async (req, res) => {
   const { callId } = req.body;
-  const { data } = await supabase.from('call_sessions').select('caller_id').eq('call_id', callId).single();
-  await supabase.from('call_sessions').update({ ended: true, updated_at: new Date().toISOString() }).eq('call_id', callId);
-  if (data?.caller_id) {
-    emitToUser(String(data.caller_id), { type: 'call_ended', callId, reason: 'rejected', ts: Date.now() });
+  if (!callId) return res.status(400).json({ error: 'callId requerido' });
+  try {
+    const { data, error } = await supabase.rpc('reject_call', { p_call_id: callId, p_callee_id: req.user.id });
+    if (error) {
+      const msg = error.message || '';
+      if (msg.includes('not_authorized'))    return res.status(403).json({ error: 'No autorizado' });
+      if (msg.includes('call_not_found'))    return res.status(404).json({ error: 'No encontrada' });
+      if (msg.includes('invalid_transition')) return res.status(409).json({ error: msg });
+      // Compatibilidad con instalaciones donde aún no existe reject_call.
+      const { data: existing } = await supabase.from('call_sessions')
+        .select('call_id, target_user_id, status, ended').eq('call_id', callId).maybeSingle();
+      if (!existing) return res.status(404).json({ error: 'No encontrada' });
+      if (String(existing.target_user_id) !== String(req.user.id)) return res.status(403).json({ error: 'No autorizado' });
+      if (existing.ended || ['accepted', 'rejected', 'ended', 'missed', 'failed'].includes(existing.status)) {
+        return res.json({ ok: true, idempotent: true });
+      }
+      const fallbackUpdate = await supabase.from('call_sessions').update({
+        status: 'rejected', ended: true, ended_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      }).eq('call_id', callId).eq('target_user_id', String(req.user.id));
+      if (fallbackUpdate.error) throw fallbackUpdate.error;
+      await notifyCallPeer(callId, req.user.id, { type: 'call_ended', callId, reason: 'rejected', ts: Date.now() });
+      return res.json({ ok: true, idempotent: false });
+    }
+    await notifyCallPeer(callId, req.user.id, { type: 'call_ended', callId, reason: 'rejected', ts: Date.now() });
+    res.json({ ok: true, idempotent: data && data.idempotent ? true : false });
+  } catch (e) {
+    console.error('[call/reject]', e.message);
+    res.status(500).json({ error: 'Error rechazando llamada' });
   }
-  res.json({ ok: true });
 });
 
-// Cancelar llamada (caller)
+// Cancelar llamada (caller) — usa RPC cancel_call
 app.post('/api/call/cancel', auth, async (req, res) => {
   const { callId } = req.body;
-  const { data } = await supabase.from('call_sessions').select('target_user_id').eq('call_id', callId).single();
-  await supabase.from('call_sessions').update({ ended: true, updated_at: new Date().toISOString() }).eq('call_id', callId);
-  if (data?.target_user_id) {
-    emitToUser(String(data.target_user_id), { type: 'call_ended', callId, reason: 'cancelled', ts: Date.now() });
+  if (!callId) return res.status(400).json({ error: 'callId requerido' });
+  try {
+    const { data, error } = await supabase.rpc('cancel_call', { p_call_id: callId, p_caller_id: req.user.id });
+    if (error) {
+      const msg = error.message || '';
+      if (msg.includes('not_authorized'))    return res.status(403).json({ error: 'No autorizado' });
+      if (msg.includes('call_not_found'))    return res.json({ ok: true, idempotent: true });
+      if (msg.includes('invalid_transition')) return res.status(409).json({ error: msg });
+      // Compatibilidad con instalaciones donde aún no existe cancel_call.
+      const { data: existing } = await supabase.from('call_sessions')
+        .select('call_id, caller_id, status, ended').eq('call_id', callId).maybeSingle();
+      if (!existing) return res.json({ ok: true, idempotent: true });
+      if (String(existing.caller_id) !== String(req.user.id)) return res.status(403).json({ error: 'No autorizado' });
+      if (existing.ended || ['rejected', 'ended', 'missed', 'failed'].includes(existing.status)) {
+        return res.json({ ok: true, idempotent: true });
+      }
+      const fallbackUpdate = await supabase.from('call_sessions').update({
+        status: 'ended', ended: true, ended_at: new Date().toISOString(), end_reason: 'cancelled_by_caller', updated_at: new Date().toISOString(),
+      }).eq('call_id', callId).eq('caller_id', String(req.user.id));
+      if (fallbackUpdate.error) throw fallbackUpdate.error;
+      await notifyCallPeer(callId, req.user.id, { type: 'call_ended', callId, reason: 'cancelled', ts: Date.now() });
+      return res.json({ ok: true, idempotent: false });
+    }
+    await notifyCallPeer(callId, req.user.id, { type: 'call_ended', callId, reason: 'cancelled', ts: Date.now() });
+    res.json({ ok: true, idempotent: data && data.idempotent ? true : false });
+  } catch (e) {
+    console.error('[call/cancel]', e.message);
+    res.status(500).json({ error: 'Error cancelando llamada' });
   }
-  res.json({ ok: true });
 });
 
-// Marcar como conectado
+// Marcar connected — usa RPC mark_call_connected
 app.post('/api/call/connected', auth, async (req, res) => {
   const { callId } = req.body;
-  await supabase.from('call_sessions').update({ updated_at: new Date().toISOString() }).eq('call_id', callId);
-  res.json({ ok: true });
+  if (!callId) return res.status(400).json({ error: 'callId requerido' });
+  try {
+    const { data, error } = await supabase.rpc('mark_call_connected', { p_call_id: callId, p_user_id: req.user.id });
+    if (error) { return res.json({ ok: true, skipped: true }); }
+    res.json({ ok: true, idempotent: data && data.idempotent ? true : false });
+  } catch (e) {
+    res.json({ ok: true, skipped: true });
+  }
 });
 
-// Anti doble-aceptación
+// Reclamar llamada: el callee confirma antes de aceptar que la llamada sigue
+// siendo suya. Evita que dos dispositivos del mismo usuario, o una UI abierta
+// tarde desde CallKit, crean aceptar una llamada ya resuelta o caducada.
 app.post('/api/calls/claim', auth, async (req, res) => {
   const { callId } = req.body;
-  const { data } = await supabase.from('call_sessions').select('callee_claimed').eq('call_id', callId).eq('ended', false).single();
-  if (!data) return res.status(404).json({ error: 'Llamada no encontrada' });
-  if (data.callee_claimed) return res.json({ alreadyAccepted: true });
-  await supabase.from('call_sessions').update({ callee_claimed: true, updated_at: new Date().toISOString() }).eq('call_id', callId);
-  res.json({ alreadyAccepted: false });
-});
-
-// Terminar llamada
-app.delete('/api/call/:callId', auth, async (req, res) => {
-  const callId = req.params.callId;
-  const { data } = await supabase.from('call_sessions').select('caller_id, target_user_id').eq('call_id', callId).single();
-  await supabase.from('call_sessions').update({ ended: true, updated_at: new Date().toISOString() }).eq('call_id', callId);
-  // Notificar a ambos participantes via SSE
-  const reason = req.query.reason || 'normal';
-  if (data?.caller_id)      emitToUser(String(data.caller_id),      { type: 'call_ended', callId, reason, ts: Date.now() });
-  if (data?.target_user_id) emitToUser(String(data.target_user_id), { type: 'call_ended', callId, reason, ts: Date.now() });
-  // Borrar después de 15 segundos
-  setTimeout(async () => {
-    await supabase.from('call_sessions').delete().eq('call_id', req.params.callId);
-  }, 15000);
-  res.json({ ok: true });
-});
-
-// ══════════════════════════════════════════════════════════════════
-// LLAMADAS GRUPALES — Señalización SFU via HTTP polling
-// Cada room tiene hasta 9 participantes. La señalización WebRTC
-// (offer/answer/ICE) se hace via REST igual que las llamadas 1:1.
-// Los peers intercambian SDPs a través del servidor como intermediario.
-//
-// Tabla en memoria (persiste mientras el proceso corre).
-// Para producción distribuida: persistir en Supabase o Redis.
-// ══════════════════════════════════════════════════════════════════
-
-const groupCallRooms = new Map(); // roomId → Room
-
-function getOrCreateRoom(roomId) {
-  if (!groupCallRooms.has(roomId)) {
-    groupCallRooms.set(roomId, {
-      roomId,
-      participants: new Map(), // userId → { userId, name, avatar, joinedAt }
-      offers: new Map(),        // `${from}_${to}` → { sdp, type }
-      answers: new Map(),       // `${from}_${to}` → { sdp, type }
-      iceCandidates: new Map(), // `${from}_${to}` → [candidate, ...]
-      callType: 'audio',
-      createdAt: Date.now(),
-    });
-    // Auto-destruir el room si todos se van (30 min máx)
-    setTimeout(() => groupCallRooms.delete(roomId), 30 * 60 * 1000);
-  }
-  return groupCallRooms.get(roomId);
-}
-
-const MAX_ROOM_PARTICIPANTS = 9;
-
-// ── Unirse a un room grupal ───────────────────────────────────────
-app.post('/api/call/room/:roomId/join', auth, async (req, res) => {
-  try {
-    const { roomId } = req.params;
-    const { name, avatar, callType } = req.body;
-    const userId = String(req.user.id);
-
-    const room = getOrCreateRoom(roomId);
-
-    if (room.participants.size >= MAX_ROOM_PARTICIPANTS && !room.participants.has(userId)) {
-      return res.status(400).json({ message: `Sala llena (máx ${MAX_ROOM_PARTICIPANTS} participantes)` });
-    }
-
-    room.participants.set(userId, { userId, name: name || userId, avatar, joinedAt: Date.now() });
-    if (callType) room.callType = callType;
-
-    // Devolver lista de participantes ya en el room (para crear offers hacia ellos)
-    const others = [...room.participants.values()].filter(p => p.userId !== userId);
-
-    // Notificar a los demás via SSE
-    for (const p of others) {
-      emitToUser(p.userId, {
-        type: 'group_call_participant_joined',
-        roomId,
-        userId,
-        name: name || userId,
-        avatar,
-        callType: room.callType,
-        ts: Date.now(),
-      });
-    }
-
-    res.json({
-      ok: true,
-      roomId,
-      callType: room.callType,
-      participants: others,
-    });
-  } catch (e) {
-    console.error('Room join error:', e);
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── Estado del room ───────────────────────────────────────────────
-app.get('/api/call/room/:roomId/state', auth, async (req, res) => {
-  try {
-    const room = groupCallRooms.get(req.params.roomId);
-    if (!room) return res.json({ exists: false, participants: [] });
-
-    res.json({
-      exists: true,
-      roomId: room.roomId,
-      callType: room.callType,
-      participants: [...room.participants.values()],
-    });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── Publicar offer hacia un peer ──────────────────────────────────
-app.post('/api/call/room/:roomId/offer', auth, async (req, res) => {
-  try {
-    const { roomId } = req.params;
-    const { toUserId, sdp } = req.body;
-    const fromUserId = String(req.user.id);
-
-    const room = getOrCreateRoom(roomId);
-    const key = `${fromUserId}_${toUserId}`;
-    room.offers.set(key, { sdp, from: fromUserId, to: toUserId, ts: Date.now() });
-
-    // Notificar via SSE al destinatario
-    emitToUser(toUserId, {
-      type: 'group_call_offer',
-      roomId,
-      fromUserId,
-      sdp,
-      callType: room.callType,
-      ts: Date.now(),
-    });
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── Publicar answer hacia un peer ─────────────────────────────────
-app.post('/api/call/room/:roomId/answer', auth, async (req, res) => {
-  try {
-    const { roomId } = req.params;
-    const { toUserId, sdp } = req.body;
-    const fromUserId = String(req.user.id);
-
-    const room = getOrCreateRoom(roomId);
-    const key = `${fromUserId}_${toUserId}`;
-    room.answers.set(key, { sdp, from: fromUserId, to: toUserId, ts: Date.now() });
-
-    // Notificar via SSE
-    emitToUser(toUserId, {
-      type: 'group_call_answer',
-      roomId,
-      fromUserId,
-      sdp,
-      ts: Date.now(),
-    });
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── Obtener offer/answer pendiente hacia mí ───────────────────────
-// El cliente hace polling de este endpoint para recibir SDPs
-app.get('/api/call/room/:roomId/signals', auth, async (req, res) => {
-  try {
-    const { roomId } = req.params;
-    const myUserId = String(req.user.id);
-    const room = groupCallRooms.get(roomId);
-    if (!room) return res.json({ offers: [], answers: [], iceCandidates: [] });
-
-    // Recoger todos los offers dirigidos a mí
-    const offers = [...room.offers.entries()]
-      .filter(([, v]) => v.to === myUserId)
-      .map(([, v]) => v);
-
-    // Recoger todas las respuestas dirigidas a mí
-    const answers = [...room.answers.entries()]
-      .filter(([, v]) => v.to === myUserId)
-      .map(([, v]) => v);
-
-    // Recoger ICE candidates dirigidos a mí
-    const iceCandidates = [];
-    for (const [key, candidates] of room.iceCandidates.entries()) {
-      const [from, to] = key.split('_');
-      if (to === myUserId) {
-        iceCandidates.push({ from, candidates });
-        // Limpiar después de entregar
-        room.iceCandidates.delete(key);
-      }
-    }
-
-    res.json({ offers, answers, iceCandidates });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── Publicar ICE candidate ────────────────────────────────────────
-app.post('/api/call/room/:roomId/ice', auth, async (req, res) => {
-  try {
-    const { roomId } = req.params;
-    const { toUserId, candidate } = req.body;
-    const fromUserId = String(req.user.id);
-
-    const room = getOrCreateRoom(roomId);
-    const key = `${fromUserId}_${toUserId}`;
-    const arr = room.iceCandidates.get(key) || [];
-    arr.push(candidate);
-    room.iceCandidates.set(key, arr);
-
-    // Notificar via SSE para velocidad máxima
-    emitToUser(toUserId, {
-      type: 'group_call_ice',
-      roomId,
-      fromUserId,
-      candidate,
-      ts: Date.now(),
-    });
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── Salir del room ────────────────────────────────────────────────
-app.delete('/api/call/room/:roomId/leave', auth, async (req, res) => {
-  try {
-    const { roomId } = req.params;
-    const userId = String(req.user.id);
-
-    const room = groupCallRooms.get(roomId);
-    if (room) {
-      room.participants.delete(userId);
-      // Limpiar signals de/hacia este usuario
-      for (const key of [...room.offers.keys(), ...room.answers.keys(), ...room.iceCandidates.keys()]) {
-        if (key.startsWith(`${userId}_`) || key.includes(`_${userId}`)) {
-          room.offers.delete(key);
-          room.answers.delete(key);
-          room.iceCandidates.delete(key);
-        }
-      }
-      // Notificar a los demás
-      for (const p of room.participants.values()) {
-        emitToUser(p.userId, {
-          type: 'group_call_participant_left',
-          roomId,
-          userId,
-          ts: Date.now(),
-        });
-      }
-      // Destruir room si está vacío
-      if (room.participants.size === 0) groupCallRooms.delete(roomId);
-    }
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── Stickers — catálogo y paquetes ───────────────────────────────
-
-// Catálogo de paquetes disponibles
-app.get('/api/stickers/catalog', auth, async (req, res) => {
-  try {
-    const { data: packs } = await supabase
-      .from('sticker_packs')
-      .select('*')
-      .eq('is_active', true)
-      .order('download_count', { ascending: false })
-      .limit(50);
-
-    if (!packs?.length) {
-      // Fallback con paquetes integrados si la tabla está vacía
-      return res.json([
-        { id: 'guinea_eq',    name: 'Guinea Ecuatorial', author: 'EGChat', downloadCount: 1420, coverUrl: 'https://media.tenor.com/KWBXqCNb-0AAAAAi/party-celebration.gif', stickers: [] },
-        { id: 'africa_vibes', name: 'África Vibes',       author: 'EGChat', downloadCount: 890,  coverUrl: 'https://media.tenor.com/fRQXPTpRZqUAAAAi/clapping-applause.gif',  stickers: [] },
-        { id: 'fun_animals',  name: 'Animales Divertidos', author: 'EGChat', downloadCount: 2100, coverUrl: 'https://media.tenor.com/wnRH0YZDlmAAAAAi/laugh-lol.gif',           stickers: [] },
-      ]);
-    }
-
-    res.json(packs.map(p => ({
-      id: p.id, name: p.name, author: p.author,
-      coverUrl: p.cover_url, downloadCount: p.download_count,
-      stickers: typeof p.stickers === 'string' ? JSON.parse(p.stickers) : (p.stickers || []),
-    })));
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Instalar paquete
-app.post('/api/stickers/packs/:packId/install', auth, async (req, res) => {
-  try {
-    const { packId } = req.params;
-    await supabase.from('user_sticker_packs').upsert(
-      { user_id: req.user.id, pack_id: packId, installed_at: new Date().toISOString() },
-      { onConflict: 'user_id,pack_id' },
-    );
-    // Incrementar contador de descargas
-    await supabase.rpc('increment', { table: 'sticker_packs', id: packId, col: 'download_count' }).catch(() => {
-      supabase.from('sticker_packs').select('download_count').eq('id', packId).single()
-        .then(({ data }) => {
-          if (data) supabase.from('sticker_packs').update({ download_count: (data.download_count || 0) + 1 }).eq('id', packId);
-        });
-    });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Desinstalar paquete
-app.delete('/api/stickers/packs/:packId/install', auth, async (req, res) => {
-  try {
-    await supabase.from('user_sticker_packs')
-      .delete()
-      .eq('user_id', req.user.id)
-      .eq('pack_id', req.params.packId);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Paquetes instalados del usuario
-app.get('/api/stickers/installed', auth, async (req, res) => {
+  if (!callId) return res.status(400).json({ error: 'callId requerido' });
   try {
     const { data } = await supabase
-      .from('user_sticker_packs')
-      .select('pack_id, installed_at')
-      .eq('user_id', req.user.id);
-    res.json((data || []).map(r => r.pack_id));
+      .from('call_sessions')
+      .select('call_id, caller_id, target_user_id, status, ended, answer, expires_at')
+      .eq('call_id', callId)
+      .maybeSingle();
+    if (!data) return res.status(404).json({ error: 'Llamada no encontrada', alreadyAccepted: true });
+    if (String(data.target_user_id) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'No autorizado', alreadyAccepted: true });
+    }
+    const taken = data.ended
+      || !!data.answer
+      || ['accepted', 'connecting', 'connected', 'ended', 'rejected', 'missed', 'failed', 'expired'].includes(data.status)
+      || (data.expires_at && new Date(data.expires_at).getTime() < Date.now());
+    if (taken) return res.json({ alreadyAccepted: true, status: data.status });
+
+    await supabase.from('call_events').insert({
+      call_id: callId,
+      user_id: req.user.id,
+      event: 'accepted',
+      metadata: { claimed: true },
+    });
+    res.json({ alreadyAccepted: false, status: data.status });
   } catch (e) {
-    res.status(500).json({ message: e.message });
+    console.error('[calls/claim]', e.message);
+    // Si la consulta falla no se bloquea la aceptación: el cliente ignora este error.
+    res.status(500).json({ error: 'Error reclamando llamada' });
   }
 });
 
-// ── Mini-Apps — catálogo dinámico ────────────────────────────────
-
-app.get('/api/mini-apps', auth, async (req, res) => {
+// Llamadas entrantes — solo status='ringing' y no expiradas
+app.get('/api/call/incoming/:userId', auth, async (req, res) => {
   try {
-    const { data: apps } = await supabase
-      .from('mini_apps')
+    if (String(req.user.id) !== String(req.params.userId)) return res.status(403).json({ error: 'No autorizado' });
+    const { data } = await supabase.from('call_sessions')
       .select('*')
-      .eq('is_active', true)
-      .order('installs_count', { ascending: false })
-      .limit(50);
-
-    if (!apps?.length) {
-      // Fallback con apps integradas si la tabla está vacía
-      return res.json([]);
-    }
-
-    res.json(apps.map(a => ({
-      id: a.id, name: a.name, description: a.description,
-      icon: a.icon_url, accentColor: a.accent_color || '#00c8a0',
-      url: a.url, category: a.category || 'utilities',
-      permissions: a.permissions || [],
-      verified: a.is_verified, developer: a.developer_name || 'Terceros',
-      installsCount: a.installs_count || 0,
+      .eq('target_user_id', req.params.userId)
+      .in('status', ['ringing'])
+      .eq('ended', false)
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(3);
+    if (!data || data.length === 0) return res.json([]);
+    const callerIds = [...new Set(data.map(s => s.caller_id).filter(Boolean))];
+    const { data: callers } = await supabase.from('users').select('id, full_name, avatar_url').in('id', callerIds);
+    const callersById = new Map((callers || []).map(user => [String(user.id), user]));
+    res.json(data.map(s => ({
+      callId: s.call_id, callerId: s.caller_id,
+      type: s.type, offer: JSON.parse(s.offer || 'null'), status: s.status,
+      callerName: callersById.get(String(s.caller_id))?.full_name || 'Usuario',
+      callerAvatar: callersById.get(String(s.caller_id))?.avatar_url || '',
     })));
   } catch (e) {
-    res.status(500).json({ message: e.message });
+    console.error('[call/incoming]', e.message);
+    res.json([]);
   }
 });
 
-// Instalar mini-app (registrar uso)
-app.post('/api/mini-apps/:appId/install', auth, async (req, res) => {
-  try {
-    const { appId } = req.params;
-    await supabase.from('user_mini_apps').upsert(
-      { user_id: req.user.id, app_id: appId, last_used_at: new Date().toISOString() },
-      { onConflict: 'user_id,app_id' },
-    );
-    // Incrementar contador
-    const { data: app } = await supabase.from('mini_apps').select('installs_count').eq('id', appId).single();
-    if (app) {
-      await supabase.from('mini_apps').update({ installs_count: (app.installs_count || 0) + 1 }).eq('id', appId);
-    }
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Notificar llamada entrante (el callee hace polling de esto)
-app.get('/api/call/incoming/:userId', auth, async (req, res) => {
-  const { data } = await supabase
-    .from('call_sessions')
-    .select('*')
-    .eq('target_user_id', req.params.userId)
-    .eq('ended', false)
-    .is('answer', null)
-    .order('created_at', { ascending: false })
-    .limit(5);
-  if (!data || data.length === 0) return res.json([]);
-  // Limpiar sesiones muy antiguas (más de 150 segundos — tiempo para desbloquear teléfono hibernado)
-  const now = Date.now();
-  const valid = data.filter(s => now - new Date(s.created_at).getTime() < 150000);
-  res.json(valid.map(s => ({
-    callId: s.call_id,
-    callerId: s.caller_id,
-    type: s.type,
-    offer: JSON.parse(s.offer || 'null'),
-  })));
-});
-
-// Limpiar sesiones antiguas cada 5 minutos
+// Limpieza periódica usando RPC expire_stale_calls
 setInterval(async () => {
-  const cutoff = new Date(Date.now() - 300000).toISOString();
-  await supabase.from('call_sessions').delete().lt('created_at', cutoff);
+  try {
+    await supabase.rpc('expire_stale_calls');
+    const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    await supabase.from('call_sessions').delete()
+      .in('status', ['ended','rejected','missed','failed'])
+      .lt('ended_at', cutoff);
+  } catch (e) { console.warn('[cleanup]', e.message); }
 }, 300000);
-
-// ── Cron de notificaciones de mora djangue — cada 6 horas ────────
-setInterval(async () => {
-  try {
-    const now = new Date();
-    // Buscar grupos activos cuyo período está por vencer o ya venció
-    const { data: groups } = await supabase
-      .from('djangue_groups')
-      .select('id, name, period_end_date, notification_days_before, notification_final_days, current_turn')
-      .eq('status', 'active');
-
-    for (const group of (groups || [])) {
-      const end = new Date(group.period_end_date);
-      const daysLeft = Math.ceil((end - now) / 86400000);
-
-      const shouldNotify =
-        daysLeft <= (group.notification_days_before || 3) ||
-        daysLeft <= (group.notification_final_days || 1);
-
-      if (!shouldNotify) continue;
-
-      // Buscar miembros que no han pagado
-      const { data: members } = await supabase
-        .from('djangue_members')
-        .select('user_id')
-        .eq('group_id', group.id)
-        .eq('status', 'active')
-        .neq('turn_order', group.current_turn); // el beneficiario no paga
-
-      const { data: paid } = await supabase
-        .from('djangue_contributions')
-        .select('user_id')
-        .eq('group_id', group.id)
-        .eq('turn_number', group.current_turn)
-        .eq('status', 'paid');
-
-      const paidIds = new Set((paid || []).map(p => String(p.user_id)));
-      const unpaid = (members || []).filter(m => !paidIds.has(String(m.user_id)));
-
-      // Registrar notificación pendiente para cada moroso
-      for (const member of unpaid) {
-        await supabase.from('djangue_notifications').upsert({
-          group_id: group.id,
-          user_id: member.user_id,
-          type: daysLeft <= (group.notification_final_days || 1) ? 'final_warning' : 'reminder',
-          message: daysLeft <= 1
-            ? `⚠️ ÚLTIMO DÍA: Paga tu cuota al djangue "${group.name}" antes de medianoche`
-            : `⏰ Recuerda: faltan ${daysLeft} días para pagar tu cuota al djangue "${group.name}"`,
-          sent: false,
-          created_at: now.toISOString(),
-        }, { onConflict: 'group_id,user_id,type', ignoreDuplicates: false });
-      }
-    }
-  } catch (e) {
-    console.error('[Djangue cron mora]', e.message);
-  }
-}, 6 * 60 * 60 * 1000); // cada 6 horas
-
-// ── D1: Dispatcher de notificaciones djangue pendientes — cada 15 min ─────
-setInterval(async () => {
-  try {
-    // Leer notificaciones pendientes
-    const { data: pending } = await supabase
-      .from('djangue_notifications')
-      .select('id, user_id, message, type, group_id')
-      .eq('sent', false)
-      .limit(50);
-
-    if (!pending?.length) return;
-
-    for (const notif of pending) {
-      // Enviar push via Expo Push API
-      await sendPushToUser(notif.user_id, {
-        title: notif.type === 'final_warning' ? '⚠️ Último aviso — Djangue' : '⏰ Recordatorio — Djangue',
-        body: notif.message,
-        data: { type: 'djangue_notification', groupId: notif.group_id, notificationType: 'djangue' },
-      });
-
-      // Marcar como enviada
-      await supabase.from('djangue_notifications')
-        .update({ sent: true, sent_at: new Date().toISOString() })
-        .eq('id', notif.id);
-    }
-  } catch (e) {
-    console.error('[Djangue dispatcher]', e.message);
-  }
-}, 15 * 60 * 1000); // cada 15 minutos
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADMIN — Ejecutar migraciones SQL (temporal, usar una sola vez)
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/admin/run-migration', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.body?.adminKey;
+  if (!isAdminKeyValid(key)) return res.status(403).json({ message: 'No autorizado' });
+  const { migration } = req.body; // 'calls' | 'tokens'
+  const results = [];
+
+  // Migración 1: sistema de llamadas (tablas + RPCs atómicas)
+  const callsMigration = `
+    -- Ampliar call_sessions
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='call_sessions' AND column_name='status') THEN
+        ALTER TABLE call_sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'ringing' CHECK (status IN ('ringing','accepted','connecting','connected','reconnecting','rejected','missed','ended','failed'));
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='call_sessions' AND column_name='expires_at') THEN
+        ALTER TABLE call_sessions ADD COLUMN expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '5 minutes');
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='call_sessions' AND column_name='connected_at') THEN
+        ALTER TABLE call_sessions ADD COLUMN connected_at TIMESTAMPTZ;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='call_sessions' AND column_name='ended_at') THEN
+        ALTER TABLE call_sessions ADD COLUMN ended_at TIMESTAMPTZ;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='call_sessions' AND column_name='duration_seconds') THEN
+        ALTER TABLE call_sessions ADD COLUMN duration_seconds INTEGER;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='call_sessions' AND column_name='end_reason') THEN
+        ALTER TABLE call_sessions ADD COLUMN end_reason TEXT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='call_sessions' AND column_name='version') THEN
+        ALTER TABLE call_sessions ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='call_sessions' AND column_name='chat_id') THEN
+        ALTER TABLE call_sessions ADD COLUMN chat_id UUID;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='call_sessions' AND column_name='offer_nonce') THEN
+        ALTER TABLE call_sessions ADD COLUMN offer_nonce TEXT;
+      END IF;
+    END $$;
+
+    -- Tabla call_participants
+    CREATE TABLE IF NOT EXISTS call_participants (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      call_id VARCHAR(100) NOT NULL REFERENCES call_sessions(call_id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      role TEXT NOT NULL CHECK (role IN ('caller','callee')),
+      joined_at TIMESTAMPTZ DEFAULT NOW(),
+      left_at TIMESTAMPTZ,
+      UNIQUE (call_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_call_participants_user ON call_participants(user_id, call_id);
+
+    -- Tabla call_signals
+    CREATE TABLE IF NOT EXISTS call_signals (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      call_id VARCHAR(100) NOT NULL REFERENCES call_sessions(call_id) ON DELETE CASCADE,
+      from_user UUID NOT NULL,
+      to_user UUID,
+      signal_type TEXT NOT NULL CHECK (signal_type IN ('offer','answer','ice','restart_ice')),
+      payload JSONB NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      nonce TEXT UNIQUE
+    );
+    CREATE INDEX IF NOT EXISTS idx_call_signals_call ON call_signals(call_id, created_at);
+
+    -- Tabla call_events
+    CREATE TABLE IF NOT EXISTS call_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      call_id VARCHAR(100) NOT NULL REFERENCES call_sessions(call_id) ON DELETE CASCADE,
+      user_id UUID,
+      event TEXT NOT NULL CHECK (event IN ('initiated','push_sent','ringing','accepted','connecting','connected','reconnecting','ended','rejected','missed','failed','expired')),
+      metadata JSONB DEFAULT '{}',
+      occurred_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_call_events_call ON call_events(call_id, occurred_at);
+
+    -- Índices adicionales
+    CREATE INDEX IF NOT EXISTS idx_call_sessions_status ON call_sessions(status, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_call_sessions_caller ON call_sessions(caller_id, status);
+    CREATE INDEX IF NOT EXISTS idx_call_sessions_expires ON call_sessions(expires_at) WHERE status NOT IN ('ended','rejected','missed','failed');
+  `;
+
+  // RPC initiate_call
+  const rpcInitiate = `
+    CREATE OR REPLACE FUNCTION initiate_call(p_call_id TEXT, p_caller_id UUID, p_callee_id UUID, p_call_type TEXT DEFAULT 'audio', p_offer JSONB DEFAULT NULL, p_chat_id UUID DEFAULT NULL, p_nonce TEXT DEFAULT NULL)
+    RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+    DECLARE v_existing call_sessions%ROWTYPE; v_expires_at TIMESTAMPTZ := NOW() + INTERVAL '90 seconds';
+    BEGIN
+      IF p_nonce IS NOT NULL THEN
+        SELECT * INTO v_existing FROM call_sessions WHERE offer_nonce = p_nonce LIMIT 1;
+        IF FOUND THEN RETURN jsonb_build_object('call_id', v_existing.call_id, 'status', v_existing.status, 'idempotent', true); END IF;
+      END IF;
+      IF EXISTS (SELECT 1 FROM call_sessions WHERE caller_id = p_caller_id::TEXT AND status NOT IN ('ended','rejected','missed','failed') AND expires_at > NOW()) THEN
+        RAISE EXCEPTION 'caller_already_in_call';
+      END IF;
+      INSERT INTO call_sessions (call_id, offer, caller_candidates, callee_candidates, type, caller_id, target_user_id, ended, status, expires_at, chat_id, offer_nonce, created_at, updated_at, version)
+      VALUES (p_call_id, CASE WHEN p_offer IS NOT NULL THEN p_offer::TEXT ELSE NULL END, '[]', '[]', p_call_type, p_caller_id::TEXT, p_callee_id::TEXT, FALSE, 'ringing', v_expires_at, p_chat_id, p_nonce, NOW(), NOW(), 1)
+      ON CONFLICT (call_id) DO NOTHING;
+      INSERT INTO call_participants (call_id, user_id, role) VALUES (p_call_id, p_caller_id, 'caller'), (p_call_id, p_callee_id, 'callee') ON CONFLICT (call_id, user_id) DO NOTHING;
+      INSERT INTO call_events (call_id, user_id, event, metadata) VALUES (p_call_id, p_caller_id, 'initiated', jsonb_build_object('type', p_call_type));
+      RETURN jsonb_build_object('call_id', p_call_id, 'status', 'ringing', 'expires_at', v_expires_at, 'idempotent', false);
+    END; $$;
+  `;
+
+  const rpcAccept = `
+    CREATE OR REPLACE FUNCTION accept_call(p_call_id TEXT, p_callee_id UUID, p_answer JSONB DEFAULT NULL)
+    RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+    DECLARE v_session call_sessions%ROWTYPE;
+    BEGIN
+      SELECT * INTO v_session FROM call_sessions WHERE call_id = p_call_id FOR UPDATE;
+      IF NOT FOUND THEN RAISE EXCEPTION 'call_not_found'; END IF;
+      IF v_session.target_user_id <> p_callee_id::TEXT THEN RAISE EXCEPTION 'not_authorized'; END IF;
+      IF v_session.expires_at < NOW() THEN
+        UPDATE call_sessions SET status='missed', ended=TRUE, ended_at=NOW(), updated_at=NOW() WHERE call_id=p_call_id;
+        RAISE EXCEPTION 'call_expired';
+      END IF;
+      IF v_session.status <> 'ringing' THEN
+        IF v_session.status = 'accepted' THEN RETURN jsonb_build_object('call_id', p_call_id, 'status', 'accepted', 'idempotent', true); END IF;
+        RAISE EXCEPTION 'invalid_transition: %', v_session.status;
+      END IF;
+      UPDATE call_sessions SET status='accepted', answer=CASE WHEN p_answer IS NOT NULL THEN p_answer::TEXT ELSE answer END, expires_at=NOW()+INTERVAL '30 minutes', updated_at=NOW(), version=version+1 WHERE call_id=p_call_id AND version=v_session.version;
+      IF NOT FOUND THEN RAISE EXCEPTION 'concurrent_modification'; END IF;
+      INSERT INTO call_events (call_id, user_id, event) VALUES (p_call_id, p_callee_id, 'accepted');
+      RETURN jsonb_build_object('call_id', p_call_id, 'status', 'accepted', 'idempotent', false);
+    END; $$;
+  `;
+
+  const rpcReject = `
+    CREATE OR REPLACE FUNCTION reject_call(p_call_id TEXT, p_callee_id UUID)
+    RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+    DECLARE v_session call_sessions%ROWTYPE;
+    BEGIN
+      SELECT * INTO v_session FROM call_sessions WHERE call_id=p_call_id FOR UPDATE;
+      IF NOT FOUND THEN RAISE EXCEPTION 'call_not_found'; END IF;
+      IF v_session.target_user_id <> p_callee_id::TEXT THEN RAISE EXCEPTION 'not_authorized'; END IF;
+      IF v_session.status IN ('rejected','ended','missed','failed') THEN RETURN jsonb_build_object('call_id',p_call_id,'status',v_session.status,'idempotent',true); END IF;
+      IF v_session.status NOT IN ('ringing') THEN RAISE EXCEPTION 'invalid_transition: %', v_session.status; END IF;
+      UPDATE call_sessions SET status='rejected',ended=TRUE,ended_at=NOW(),updated_at=NOW(),version=version+1 WHERE call_id=p_call_id AND version=v_session.version;
+      INSERT INTO call_events (call_id, user_id, event) VALUES (p_call_id, p_callee_id, 'rejected');
+      RETURN jsonb_build_object('call_id',p_call_id,'status','rejected');
+    END; $$;
+  `;
+
+  const rpcCancel = `
+    CREATE OR REPLACE FUNCTION cancel_call(p_call_id TEXT, p_caller_id UUID)
+    RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+    DECLARE v_session call_sessions%ROWTYPE;
+    BEGIN
+      SELECT * INTO v_session FROM call_sessions WHERE call_id=p_call_id FOR UPDATE;
+      IF NOT FOUND THEN RAISE EXCEPTION 'call_not_found'; END IF;
+      IF v_session.caller_id <> p_caller_id::TEXT THEN RAISE EXCEPTION 'not_authorized'; END IF;
+      IF v_session.status IN ('ended','rejected','missed','failed') THEN RETURN jsonb_build_object('call_id',p_call_id,'status',v_session.status,'idempotent',true); END IF;
+      UPDATE call_sessions SET status='ended',ended=TRUE,ended_at=NOW(),end_reason='cancelled_by_caller',updated_at=NOW(),version=version+1 WHERE call_id=p_call_id AND version=v_session.version;
+      INSERT INTO call_events (call_id, user_id, event, metadata) VALUES (p_call_id, p_caller_id, 'ended', '{"reason":"cancelled_by_caller"}');
+      RETURN jsonb_build_object('call_id',p_call_id,'status','ended');
+    END; $$;
+  `;
+
+  const rpcMarkConnected = `
+    CREATE OR REPLACE FUNCTION mark_call_connected(p_call_id TEXT, p_user_id UUID)
+    RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+    DECLARE v_session call_sessions%ROWTYPE;
+    BEGIN
+      SELECT * INTO v_session FROM call_sessions WHERE call_id=p_call_id FOR UPDATE;
+      IF NOT FOUND THEN RAISE EXCEPTION 'call_not_found'; END IF;
+      IF v_session.caller_id <> p_user_id::TEXT AND v_session.target_user_id <> p_user_id::TEXT THEN RAISE EXCEPTION 'not_authorized'; END IF;
+      IF v_session.status = 'connected' THEN RETURN jsonb_build_object('call_id',p_call_id,'status','connected','idempotent',true); END IF;
+      IF v_session.status NOT IN ('accepted','connecting','reconnecting') THEN RAISE EXCEPTION 'invalid_transition: %', v_session.status; END IF;
+      UPDATE call_sessions SET status='connected',connected_at=COALESCE(connected_at,NOW()),updated_at=NOW(),version=version+1 WHERE call_id=p_call_id AND version=v_session.version;
+      INSERT INTO call_events (call_id, user_id, event) VALUES (p_call_id, p_user_id, 'connected');
+      RETURN jsonb_build_object('call_id',p_call_id,'status','connected');
+    END; $$;
+  `;
+
+  const rpcEnd = `
+    CREATE OR REPLACE FUNCTION end_call(p_call_id TEXT, p_user_id UUID, p_reason TEXT DEFAULT 'normal')
+    RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+    DECLARE v_session call_sessions%ROWTYPE; v_duration INTEGER := 0; v_final_status TEXT;
+    BEGIN
+      SELECT * INTO v_session FROM call_sessions WHERE call_id=p_call_id FOR UPDATE;
+      IF NOT FOUND THEN RETURN jsonb_build_object('call_id',p_call_id,'status','ended','idempotent',true); END IF;
+      IF v_session.caller_id <> p_user_id::TEXT AND v_session.target_user_id <> p_user_id::TEXT THEN RAISE EXCEPTION 'not_authorized'; END IF;
+      IF v_session.status IN ('ended','rejected','missed','failed') THEN RETURN jsonb_build_object('call_id',p_call_id,'status',v_session.status,'idempotent',true); END IF;
+      v_final_status := CASE WHEN p_reason='ice_failed' THEN 'failed' WHEN p_reason='missed' THEN 'missed' ELSE 'ended' END;
+      IF v_session.connected_at IS NOT NULL THEN v_duration := EXTRACT(EPOCH FROM (NOW()-v_session.connected_at))::INTEGER; END IF;
+      UPDATE call_sessions SET status=v_final_status,ended=TRUE,ended_at=NOW(),end_reason=p_reason,duration_seconds=CASE WHEN v_duration>0 THEN v_duration ELSE NULL END,updated_at=NOW(),version=version+1 WHERE call_id=p_call_id AND version=v_session.version;
+      INSERT INTO call_events (call_id, user_id, event, metadata) VALUES (p_call_id, p_user_id, CASE WHEN v_final_status='failed' THEN 'failed' WHEN v_final_status='missed' THEN 'missed' ELSE 'ended' END, jsonb_build_object('reason',p_reason,'duration_seconds',v_duration));
+      RETURN jsonb_build_object('call_id',p_call_id,'status',v_final_status,'duration_seconds',v_duration);
+    END; $$;
+  `;
+
+  const rpcExpire = `
+    CREATE OR REPLACE FUNCTION expire_stale_calls()
+    RETURNS INTEGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+    DECLARE v_count INTEGER;
+    BEGIN
+      WITH expired AS (UPDATE call_sessions SET status='missed',ended=TRUE,ended_at=NOW(),end_reason='timeout',updated_at=NOW() WHERE status NOT IN ('ended','rejected','missed','failed') AND expires_at < NOW() RETURNING call_id, caller_id)
+      INSERT INTO call_events (call_id, user_id, event, metadata) SELECT call_id, caller_id::UUID, 'expired', '{"reason":"timeout"}' FROM expired;
+      GET DIAGNOSTICS v_count = ROW_COUNT;
+      RETURN v_count;
+    END; $$;
+  `;
+
+  const rpcGetState = `
+    CREATE OR REPLACE FUNCTION get_call_state(p_call_id TEXT, p_user_id UUID)
+    RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+    DECLARE v_session call_sessions%ROWTYPE;
+    BEGIN
+      SELECT * INTO v_session FROM call_sessions WHERE call_id=p_call_id;
+      IF NOT FOUND THEN RETURN jsonb_build_object('found',false); END IF;
+      IF v_session.caller_id <> p_user_id::TEXT AND v_session.target_user_id <> p_user_id::TEXT THEN RAISE EXCEPTION 'not_authorized'; END IF;
+      RETURN jsonb_build_object('found',true,'call_id',v_session.call_id,'status',v_session.status,'ended',v_session.ended,'type',v_session.type,'caller_id',v_session.caller_id,'target_user_id',v_session.target_user_id,'offer',CASE WHEN v_session.offer IS NOT NULL THEN v_session.offer::JSONB ELSE NULL END,'answer',CASE WHEN v_session.answer IS NOT NULL THEN v_session.answer::JSONB ELSE NULL END,'caller_candidates',v_session.caller_candidates::JSONB,'callee_candidates',v_session.callee_candidates::JSONB,'expires_at',v_session.expires_at,'connected_at',v_session.connected_at,'version',v_session.version);
+    END; $$;
+  `;
+
+  const stepsToRun = migration === 'tokens' ? [] : [
+    ['create tables', callsMigration],
+    ['rpc initiate_call', rpcInitiate],
+    ['rpc accept_call', rpcAccept],
+    ['rpc reject_call', rpcReject],
+    ['rpc cancel_call', rpcCancel],
+    ['rpc mark_call_connected', rpcMarkConnected],
+    ['rpc end_call', rpcEnd],
+    ['rpc expire_stale_calls', rpcExpire],
+    ['rpc get_call_state', rpcGetState],
+  ];
+
+  for (const [label, sql] of stepsToRun) {
+    try {
+      const { error } = await supabase.rpc('exec_sql', { sql });
+      if (error) {
+        results.push({ step: label, ok: false, error: error.message });
+      } else {
+        results.push({ step: label, ok: true });
+      }
+    } catch(e) {
+      results.push({ step: label, ok: false, error: e.message });
+    }
+  }
+
+  // Migración de tokens de dispositivo (más simple)
+  if (!migration || migration === 'tokens') {
+    const tokenMigration = `
+      DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='expo_push_tokens' AND column_name='token_type') THEN
+          ALTER TABLE expo_push_tokens ADD COLUMN token_type TEXT NOT NULL DEFAULT 'expo' CHECK (token_type IN ('expo','fcm','apns','voip'));
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='expo_push_tokens' AND column_name='is_active') THEN
+          ALTER TABLE expo_push_tokens ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT TRUE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='expo_push_tokens' AND column_name='failure_count') THEN
+          ALTER TABLE expo_push_tokens ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='expo_push_tokens' AND column_name='device_id') THEN
+          ALTER TABLE expo_push_tokens ADD COLUMN device_id TEXT;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='expo_push_tokens' AND column_name='last_used_at') THEN
+          ALTER TABLE expo_push_tokens ADD COLUMN last_used_at TIMESTAMPTZ DEFAULT NOW();
+        END IF;
+      END $$;
+      CREATE INDEX IF NOT EXISTS idx_expo_push_tokens_active ON expo_push_tokens(user_id, is_active, token_type) WHERE is_active = TRUE;
+    `;
+    try {
+      const { error } = await supabase.rpc('exec_sql', { sql: tokenMigration });
+      results.push({ step: 'token_migration', ok: !error, note: error?.message });
+    } catch(e) {
+      results.push({ step: 'token_migration', ok: false, error: e.message });
+    }
+  }
+
+  res.json({ results, message: 'Migración ejecutada. Verificar resultados.' });
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WEB PUSH — VAPID
@@ -6582,68 +9280,6 @@ app.get('/api/push/vapid-public-key', (req, res) => {
   res.json({ publicKey: VAPID_PUBLIC_KEY });
 });
 
-// ── Enviar alert push directo a APNs (mensajes con mutable-content) ──────────
-async function sendApnsAlertPush(deviceToken, payload) {
-  return new Promise((resolve, reject) => {
-    const jwt = getApnsJwt();
-    if (!jwt) return resolve({ ok: false, error: 'No JWT' });
-
-    const BUNDLE_ID = process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat';
-    const isCall = payload.notificationType === 'incoming_call';
-    const extra = Object.entries(payload).reduce((acc, [k, v]) => {
-      if (v !== undefined && v !== null) acc[k] = v;
-      return acc;
-    }, {});
-
-    const body = JSON.stringify({
-      aps: {
-        alert: { title: payload.title || 'EGChat', body: payload.body || 'Nuevo mensaje' },
-        sound: isCall ? 'default' : 'notification.wav',
-        badge: isCall ? undefined : 1,
-        'content-available': 1,
-        ...(isCall ? {} : { 'mutable-content': 1 }),
-      },
-      ...extra,
-    });
-
-    const options = {
-      hostname: 'api.push.apple.com',
-      port: 443,
-      path: `/3/device/${deviceToken}`,
-      method: 'POST',
-      headers: {
-        'authorization': `bearer ${jwt}`,
-        'apns-push-type': 'alert',
-        'apns-topic': BUNDLE_ID,
-        'apns-priority': '10',
-        'content-type': 'application/json',
-        'content-length': Buffer.byteLength(body),
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        if (res.statusCode === 200) resolve({ ok: true });
-        else {
-          const reason = (() => { try { return JSON.parse(data).reason; } catch { return data; } })();
-          // Reintentar en sandbox si el entorno no coincide
-          if (/BadEnvironmentKeyInToken|BadDeviceToken/.test(reason)) {
-            resolve({ ok: false, error: reason });
-          } else {
-            resolve({ ok: false, error: `APNs ${res.statusCode}: ${reason}` });
-          }
-        }
-      });
-    });
-    req.on('error', err => resolve({ ok: false, error: err.message }));
-    req.setTimeout(10000, () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
-    req.write(body);
-    req.end();
-  });
-}
-
 // Función interna para enviar push a un usuario
 const sendPushToUser = async (userId, payload) => {
   try {
@@ -6678,94 +9314,109 @@ const sendPushToUser = async (userId, payload) => {
       );
     }
 
-    // ── Expo Push + APNs nativo (app movil nativa) ────
+    // ── Expo Push (app movil nativa — funciona con telefono hibernado) ────
     const { data: expoSubs } = await supabase
       .from('expo_push_tokens')
-      .select('token, platform')
-      .eq('user_id', userId);
+      .select('token, token_type')
+      .eq('user_id', userId)
+      .in('token_type', ['expo', 'fcm', 'apns'])
+      .neq('is_active', false);
 
-    const apnsSubs  = (expoSubs || []).filter(sub => {
-      const token = String(sub.token || '');
-      // Token APNs nativo: no empieza con ExponentPushToken, no es FCM (largo hex), es iOS
-      return !token.startsWith('ExponentPushToken') &&
-             !token.startsWith('ExponentPushToken') &&
-             (sub.platform === 'ios' || sub.platform === 'apns' || (!sub.platform && token.length === 64 && /^[0-9a-f]+$/i.test(token)));
-    });
-    const iosHasNativeToken = apnsSubs.length > 0;
-    const expoOnlySubs = (expoSubs || []).filter(sub => {
-      if (!String(sub.token || '').startsWith('ExponentPushToken')) return false;
-      if (sub.platform === 'ios' && iosHasNativeToken) return false; // usar APNs nativo en su lugar
-      return true;
-    });
+    // Se envían TODOS los tokens guardados, incluidos los APNs crudos (64 hex):
+    // exp.host los entrega con la clave APNs del proyecto, y muchos iPhone están
+    // registrados así. Filtrar solo por forma Expo dejó esos dispositivos sin
+    // ninguna notificación (2026-11-02).
+    const expoTokens = [...new Set((expoSubs || []).map(s => s.token).filter(Boolean))];
 
-    // APNs directo para iOS (soporta mutable-content para fotos en notificaciones)
-    if (apnsSubs.length > 0 && typeof sendApnsAlertPush === 'function') {
-      const apnsPayload = {
-        ...payload,
-        imageUrl: payload.senderAvatar || payload.imageUrl || '',
-      };
-      const apnsResults = await Promise.allSettled(apnsSubs.map(sub => sendApnsAlertPush(sub.token, apnsPayload)));
-      // Si el token APNs falla con BadEnvironmentKeyInToken, caer de vuelta a Expo
-      const apnsAllFailed = apnsResults.every(r => r.status === 'rejected' ||
-        (r.status === 'fulfilled' && r.value?.error?.includes?.('BadEnvironmentKeyInToken')));
-      if (apnsAllFailed) {
-        console.warn('[Push] APNs nativo falló, usando ExponentPushToken como fallback');
-        // Incluir ExponentPushToken iOS aunque haya token APNs nativo
-        const expoFallback = (expoSubs || []).filter(sub =>
-          String(sub.token || '').startsWith('ExponentPushToken')
-        );
-        if (expoFallback.length > 0) {
-          for (const sub of expoFallback) {
-            try {
-              await fetch('https://exp.host/--/api/v2/push/send', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                body: JSON.stringify({
-                  to: sub.token, title: payload.title, body: payload.body,
-                  sound: 'notification.wav', badge: 1, channelId: 'egchat-messages',
-                  priority: 'normal', data: payload, mutableContent: true,
-                }),
-              });
-            } catch { /* silencioso */ }
-          }
-        }
-      }
-    }
-
-    if (expoOnlySubs && expoOnlySubs.length > 0) {
-      const expoMessages = expoOnlySubs.map(sub => ({
-        to: sub.token,
+    if (expoTokens.length > 0) {
+      const expoMessages = expoTokens.map(token => ({
+        to: token,
         title: payload.title || 'EGChat',
-        body: payload.body || 'Nueva notificacion',
-        sound: isCall ? 'default' : 'notification.wav',
-        badge: 1,
-        channelId: isCall ? 'egchat-calls' : 'egchat-messages',
+        body: payload.body || (isCall ? 'Llamada entrante' : 'Nuevo mensaje'),
+        // El nombre debe coincidir con el archivo que la app instala en
+        // Library/Sounds del contenedor (useSounds.installIosPushSound).
+        sound: isCall ? 'default' : 'egchat-message.wav',
+        badge: isCall ? 0 : Number(payload.badge ?? 1),
+        channelId: isCall ? 'egchat-calls-v2' : 'egchat-messages',
+        // En iOS el channelId no existe: la categoría con acciones (Aceptar /
+        // Rechazar) se registra desde la app con setNotificationCategoryAsync.
+        ...(isCall ? { categoryIdentifier: 'EGCHAT_CALL' } : {}),
         priority: isCall ? 'high' : 'normal',
-        data: payload,
-        mutableContent: true,
+        // Campo EXACTO que acepta la API REST de Expo (no "_mutableContent"):
+        // exp.host lo traduce a aps["mutable-content"]=1 y hace que iOS lance
+        // la Notification Service Extension, donde se descarga y pega la foto.
+        // El "mutable-content" de dentro de `data` NO sirve: cae en el diccionario
+        // data, no en aps, y la extensión nunca corre. En llamadas no se activa
+        // para no interferir con CallKit.
+        ...(!isCall ? { mutableContent: true } : {}),
+        data: {
+          ...payload,
+          'mutable-content': 1,
+          // Asegurar que notificationType siempre está presente para que el cliente
+          // pueda distinguir mensajes de llamadas
+          notificationType: payload.notificationType || 'message',
+          imageUrl: payload.imageUrl || payload.callerAvatar || payload.icon || '',
+          senderName: payload.senderName || payload.callerName || '',
+          senderAvatar: payload.senderAvatar || payload.callerAvatar || payload.icon || '',
+          messageType: payload.messageType || 'text',
+          chatId: payload.chatId || '',
+          // Llamadas: incluir el offer en el push para que el callee
+          // no tenga que esperar a Render al despertar
+          ...(isCall && payload.offer ? { offer: payload.offer } : {}),
+          ...(isCall ? {
+            callId: payload.callId || '',
+            callerId: payload.callerId || '',
+            callerName: payload.callerName || '',
+            callType: payload.callType || 'audio',
+          } : {}),
+        },
+        // richContent es un campo de web-push (PWA), Expo lo ignora en nativo;
+        // la foto nativa la pone la extensión gracias a mutableContent arriba.
+        // Se mantiene solo para la PWA.
+        ...(!isCall && (payload.callerAvatar || payload.senderAvatar || payload.imageUrl || (typeof payload.icon === 'string' && /^https?:\/\//.test(payload.icon)))
+          ? { richContent: { image: payload.callerAvatar || payload.senderAvatar || payload.imageUrl || payload.icon } }
+          : {}),
+        // Llamadas: TTL de 120s
         ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
       }));
-
-      console.log('[DEBUG] Expo Messages:', JSON.stringify(expoMessages, null, 2));
 
       for (let i = 0; i < expoMessages.length; i += 100) {
         const batch = expoMessages.slice(i, i + 100);
         try {
           const expoRes = await fetch('https://exp.host/--/api/v2/push/send', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+              // Con Expo Access Token el envío usa la vía autenticada de la
+              // cuenta; sin él se queda en el modo anónimo y limitado.
+              ...(process.env.EXPO_ACCESS_TOKEN
+                ? { Authorization: `Bearer ${process.env.EXPO_ACCESS_TOKEN}` }
+                : {}),
+            },
             body: JSON.stringify(batch),
           });
           const result = await expoRes.json();
+          if (result.errors?.length) {
+            console.warn(`[Push Expo] user=${userId} exp.host rechazó el lote:`, JSON.stringify(result.errors).slice(0, 400));
+          }
           if (result.data) {
-            const invalid = result.data
-              .map((r, idx) => ({ r, token: batch[idx].to }))
+            const tickets = result.data
+              .map((r, idx) => ({ r, token: batch[idx].to }));
+            const invalid = tickets
               .filter(({ r }) => r.status === 'error' && r.details?.error === 'DeviceNotRegistered');
             if (invalid.length > 0) {
               await Promise.allSettled(
                 invalid.map(({ token }) => supabase.from('expo_push_tokens').delete().eq('token', token))
               );
             }
+            // Cualquier otro fallo se registra con el usuario: antes desaparecía
+            // en silencio y no sabíamos si el mensaje llegó o no al teléfono.
+            tickets
+              .filter(({ r }) => r.status === 'error' && r.details?.error !== 'DeviceNotRegistered')
+              .forEach(({ r, token }) => {
+                console.warn(`[Push Expo] user=${userId} token=${String(token).slice(0, 22)}… error=${r.details?.error || 'desconocido'}: ${r.message || ''}`);
+              });
           }
         } catch (expoErr) {
           console.warn('Expo push error:', expoErr.message);
@@ -6778,42 +9429,162 @@ const sendPushToUser = async (userId, payload) => {
 };
 
 // ── Registrar token Expo Push (app movil nativa) ──────────────────────────
+// ── Registrar token push (Expo, FCM, APNs, VoIP) ──────────────────────────
+// Punto de entrada unificado para todos los tipos de token.
+// Delega a la Supabase Edge Function register-device-token.
 app.post('/api/push/register-expo-token', auth, async (req, res) => {
   try {
-    const { expoPushToken, platform } = req.body;
-    if (!expoPushToken || !expoPushToken.startsWith('ExponentPushToken[')) {
-      return res.status(400).json({ message: 'Token Expo invalido' });
+    const { expoPushToken, platform, tokenType } = req.body;
+    const token = expoPushToken || req.body.token;
+
+    if (!token || token.length < 10) {
+      return res.status(400).json({ message: 'Token inválido' });
     }
+
+    // Determinar tipo de token automáticamente si no se especifica
+    const isExpoToken = token.startsWith('ExponentPushToken');
+    const isHexAPNs = token.length === 64 && /^[0-9a-f]+$/i.test(token);
+    const type = tokenType || (isExpoToken ? 'expo' : isHexAPNs ? 'apns' : 'fcm');
+    // Tokens APNs nativos: guardar en DB pero no enviar directo a APNs.
+    // El ExponentPushToken iOS usa APNs via Expo internamente (correcto).
+    console.log(`[Push] Registrando token tipo=${type} platform=${platform||'unknown'} user=${req.user.id}`);
+
+    // Intentar via Edge Function primero (tiene soporte completo de tipos)
+    const edgeFnUrl = process.env.SUPABASE_URL
+      ? `${process.env.SUPABASE_URL}/functions/v1/register-device-token`
+      : null;
+
+    if (edgeFnUrl) {
+      try {
+        const edgeRes = await fetch(edgeFnUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type':  'application/json',
+            'Authorization': `Bearer ${req.headers.authorization?.replace('Bearer ', '')}`,
+          },
+          body: JSON.stringify({
+            token,
+            tokenType:  type,
+            platform:   platform || 'android',
+            deviceId:   req.body.deviceId || null,
+          }),
+        });
+        if (edgeRes.ok) {
+          return res.json({ message: 'Token registrado', tokenType: type });
+        }
+      } catch (edgeErr) {
+        console.warn('[push/register] Edge Function falló, usando fallback:', edgeErr.message);
+      }
+    }
+
+    // Fallback: upsert directo en Supabase (compatibilidad hacia atrás)
     await supabase.from('expo_push_tokens').upsert({
-      user_id: req.user.id,
-      token: expoPushToken,
-      platform: platform || 'android',
+      user_id:    req.user.id,
+      token,
+      token_type: type,
+      platform:   platform || 'android',
+      is_active:  true,
       updated_at: new Date().toISOString(),
     }, { onConflict: 'token' });
-    res.json({ message: 'Token registrado' });
+
+    res.json({ message: 'Token registrado', tokenType: type });
   } catch (e) {
-    console.error('Expo token register error:', e.message);
+    console.error('Token register error:', e.message);
     res.status(500).json({ message: e.message });
   }
 });
 
-// ── Registrar token APNs nativo (iOS, para NSE con fotos) ────────────────────
-app.post('/api/push/register-apns-token', auth, async (req, res) => {
+// ── Registrar token VoIP (iOS PushKit) ────────────────────────────────────
+app.post('/api/push/register-voip-token', auth, async (req, res) => {
   try {
-    const { apnsToken, platform } = req.body;
-    if (!apnsToken || apnsToken.length < 32) {
-      return res.status(400).json({ message: 'Token APNs invalido' });
+    const { voipToken } = req.body;
+    if (!voipToken || voipToken.length < 32) {
+      return res.status(400).json({ message: 'Token VoIP inválido' });
     }
     await supabase.from('expo_push_tokens').upsert({
-      user_id: req.user.id,
-      token: apnsToken,
-      platform: platform || 'apns',
+      user_id:    req.user.id,
+      token:      voipToken,
+      token_type: 'voip',
+      platform:   'ios',
+      is_active:  true,
       updated_at: new Date().toISOString(),
     }, { onConflict: 'token' });
-    console.log(`[Push] Token APNs nativo registrado para user=${req.user.id.substring(0,8)}`);
-    res.json({ message: 'Token APNs registrado' });
+    // Solo longitudes: el token VoIP es un secreto de dispositivo y los logs de
+    // Render son legibles por cualquiera con acceso al servicio.
+    console.log(`[voip] token registrado user=${String(req.user.id).slice(0, 8)} len=${voipToken.length}`);
+    res.json({ message: 'Token VoIP registrado' });
   } catch (e) {
-    console.error('APNs token register error:', e.message);
+    console.error('VoIP token register error:', e.message);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── Diagnóstico del canal de llamadas ──────────────────────────────────────
+// Devuelve solo booleanos y conteos (nunca valores de secretos ni tokens):
+// permite ver desde la app por qué una llamada se entrega como banner.
+app.get('/api/push/voip-status', auth, async (req, res) => {
+  try {
+    const { data: subs } = await supabase
+      .from('expo_push_tokens')
+      .select('token_type')
+      .eq('user_id', req.user.id)
+      .neq('is_active', false);
+    const counts = {};
+    for (const s of (subs || [])) counts[s.token_type] = (counts[s.token_type] || 0) + 1;
+
+    res.json({
+      apnsConfigured:   !!(process.env.APNS_KEY_P8 && process.env.APNS_KEY_ID && process.env.APNS_TEAM_ID),
+      signalEnabled:    process.env.VOIP_SIGNAL_ENABLED === '1',
+      apnsEnv:          process.env.APNS_ENV || 'production',
+      apnsBundle:       process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat',
+      edgeFnConfigured: !!(process.env.SUPABASE_URL && process.env.SERVICE_TOKEN),
+      tokens:           counts,
+      turn: {
+        conCloudflare: !!(process.env.CF_TURN_KEY_ID && (process.env.CF_TURN_KEY_SECRET || process.env.CF_TURN_KEY_API_TOKEN)),
+        conApiKey:  !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_API_KEY_SID && process.env.TWILIO_API_KEY_SECRET),
+        conMaestro: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN),
+        ultimo:     TURN_ULTIMO,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ── Entregar llamada entrante via push ────────────────────────────────────
+// deliverIncomingCall elige el canal: VoIP nativo → Edge Function → banner Expo.
+app.post('/api/push/voip-call', auth, async (req, res) => {
+  try {
+    const { targetUserId, callId, callType, offer, callerName: bodyCallerName } = req.body;
+
+    if (!targetUserId || !callId) {
+      return res.status(400).json({ message: 'targetUserId y callId son requeridos' });
+    }
+
+    // Obtener nombre del caller si no viene en el body
+    let callerName = bodyCallerName;
+    if (!callerName) {
+      const { data: caller } = await supabase
+        .from('users')
+        .select('full_name, avatar_url')
+        .eq('id', req.user.id)
+        .single();
+      callerName = caller?.full_name || 'EGChat';
+    }
+
+    const delivery = await deliverIncomingCall(targetUserId, {
+      callId, callerId: req.user.id, callerName,
+      callType: callType || 'audio', offer: offer || null,
+    });
+
+    res.json({
+      voipPushSent: delivery.channel === 'voip' || delivery.channel === 'edge-voip',
+      expoPushSent: delivery.channel === 'banner' || delivery.channel === 'edge-banner',
+      delivered:    delivery.delivered,
+      channel:      delivery.channel,
+    });
+  } catch (e) {
+    console.error('/api/push/voip-call error:', e.message);
     res.status(500).json({ message: e.message });
   }
 });
@@ -6825,7 +9596,7 @@ app.post('/api/push/register-apns-token', auth, async (req, res) => {
 // Admin: verificar suscripciones por teléfono
 app.get('/api/push/check/:phone', async (req, res) => {
   const key = req.headers['x-admin-key'] || req.query.key;
-  if (!key || key !== (process.env.ADMIN_RESET_KEY || JWT_SECRET)) {
+  if (!isAdminKeyValid(key)) {
     return res.status(403).json({ message: 'No autorizado' });
   }
   try {
@@ -6842,7 +9613,7 @@ app.get('/api/push/check/:phone', async (req, res) => {
 // Admin: enviar push de prueba por teléfono
 app.post('/api/push/send-test/:phone', async (req, res) => {
   const key = req.headers['x-admin-key'] || req.query.key;
-  if (!key || key !== (process.env.ADMIN_RESET_KEY || JWT_SECRET)) {
+  if (!isAdminKeyValid(key)) {
     return res.status(403).json({ message: 'No autorizado' });
   }
   try {
@@ -7126,6 +9897,10 @@ async function checkAndNotifyNewGovNews() {
 
 function startGovNewsScheduler() {
   if (govNewsSchedulerStarted) return;
+  if (!enableExternalNewsScraping) {
+    console.log('[GovNews] Scheduler desactivado por ENABLE_EXTERNAL_NEWS_SCRAPING!=1');
+    return;
+  }
   govNewsSchedulerStarted = true;
   console.log('[GovNews] Scheduler iniciado — revisando cada 10 minutos');
   // Primera ejecución inmediata
@@ -7152,6 +9927,14 @@ const NOTICIAS_FALLBACK = [
 
 app.get('/api/noticias/gobierno', async (req, res) => {
   try {
+    if (!enableExternalNewsScraping) {
+      return res.json({
+        noticias: NOTICIAS_FALLBACK.map((n, i) => ({ id: `gov-fb-${i}`, ...n, scrapedAt: Date.now() })),
+        fromCache: true,
+        updatedAt: Date.now(),
+        externalScrapingDisabled: true,
+      });
+    }
     const now = Date.now();
     // Devolver cache si es reciente
     if (noticiasCache.data.length > 0 && now - noticiasCache.timestamp < NOTICIAS_TTL) {
@@ -7194,1439 +9977,839 @@ app.get('/api/noticias/gobierno', async (req, res) => {
   }
 });
 
-// ── Endpoint de migración SQL (ejecutar una vez, luego eliminar) ──
-const MIGRATION_KEY = 'egchat_migrate_v2_2026';
-app.post('/api/admin/run-migration', async (req, res) => {
-  const { key } = req.body;
-  if (key !== MIGRATION_KEY) {
-    return res.status(403).json({ message: 'Forbidden' });
-  }
+const RSS_FEEDS_PROXY = [
+  { url: 'https://lagacetadeguinea.com/feed/', source: 'La Gaceta de Guinea' },
+  { url: 'https://www.guineaecuatorialpress.com/feed/', source: 'Guinea Ecuatorial Press' },
+];
 
-  const migrations = [
-    // Task #1 — Doble check real
-    `ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'sent'`,
-    `CREATE INDEX IF NOT EXISTS idx_chat_messages_status ON chat_messages(chat_id, status)`,
-    `CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_sender ON chat_messages(chat_id, sender_id)`,
-    // Task #5 — E2E key backup
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS e2e_public_key TEXT`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS e2e_key_backup JSONB`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS e2e_backup_updated TIMESTAMPTZ`,
-    // Task #7 — Stickers
-    `CREATE TABLE IF NOT EXISTS sticker_packs (id VARCHAR(100) PRIMARY KEY, name VARCHAR(100) NOT NULL, author VARCHAR(100) DEFAULT 'EGChat', cover_url TEXT, stickers JSONB DEFAULT '[]', download_count INTEGER DEFAULT 0, is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW())`,
-    `CREATE TABLE IF NOT EXISTS user_sticker_packs (user_id UUID REFERENCES users(id) ON DELETE CASCADE, pack_id VARCHAR(100) NOT NULL, installed_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY(user_id, pack_id))`,
-    `CREATE TABLE IF NOT EXISTS user_custom_stickers (id UUID DEFAULT gen_random_uuid() PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE, file_url TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())`,
-    `INSERT INTO sticker_packs (id, name, author, cover_url, stickers) VALUES ('egchat_classic','EGChat Clásico','EGChat','https://media.tenor.com/RHpFOybx63oAAAAi/hi-wave.gif','[{"id":"eg_hi","url":"https://media.tenor.com/RHpFOybx63oAAAAi/hi-wave.gif","label":"👋"}]') ON CONFLICT (id) DO NOTHING`,
-    `INSERT INTO sticker_packs (id, name, author, cover_url, stickers) VALUES ('guinea_eq','Guinea Ecuatorial','EGChat','https://media.tenor.com/KWBXqCNb-0AAAAAi/party-celebration.gif','[{"id":"ge1","url":"https://media.tenor.com/KWBXqCNb-0AAAAAi/party-celebration.gif","label":"🇬🇶"}]') ON CONFLICT (id) DO NOTHING`,
-    // Task #8 — Mini-apps
-    `CREATE TABLE IF NOT EXISTS mini_apps (id UUID DEFAULT gen_random_uuid() PRIMARY KEY, name VARCHAR(100) NOT NULL, description TEXT, icon_url TEXT, accent_color VARCHAR(20) DEFAULT '#00c8a0', url TEXT NOT NULL, category VARCHAR(50) DEFAULT 'utilities', permissions JSONB DEFAULT '[]', developer_name VARCHAR(100) DEFAULT 'EGChat', is_verified BOOLEAN DEFAULT FALSE, is_active BOOLEAN DEFAULT TRUE, installs_count INTEGER DEFAULT 0, created_at TIMESTAMPTZ DEFAULT NOW())`,
-    `CREATE TABLE IF NOT EXISTS user_mini_apps (user_id UUID REFERENCES users(id) ON DELETE CASCADE, app_id UUID REFERENCES mini_apps(id) ON DELETE CASCADE, installed_at TIMESTAMPTZ DEFAULT NOW(), last_used_at TIMESTAMPTZ, PRIMARY KEY(user_id, app_id))`,
-    // Task #9 — Pagos
-    `CREATE TABLE IF NOT EXISTS payment_transactions (id TEXT PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL, type VARCHAR(20) NOT NULL, amount DECIMAL(15,2) NOT NULL, currency VARCHAR(10) DEFAULT 'XAF', gateway VARCHAR(30) NOT NULL, gateway_txn_id TEXT, status VARCHAR(20) DEFAULT 'pending', metadata JSONB DEFAULT '{}', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`,
-    `CREATE INDEX IF NOT EXISTS idx_payment_txns_user ON payment_transactions(user_id, created_at DESC)`,
-    // Task #10 — Sesiones multi-dispositivo
-    `CREATE TABLE IF NOT EXISTS user_sessions (id TEXT PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL, device_name VARCHAR(150), device_type VARCHAR(30), platform VARCHAR(80), last_seen TIMESTAMPTZ DEFAULT NOW(), is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW())`,
-    `CREATE INDEX IF NOT EXISTS idx_user_sessions_user_active ON user_sessions(user_id, is_active)`,
-    // Nuevas features — columnas delta
-    `ALTER TABLE chats ADD COLUMN IF NOT EXISTS settings JSONB DEFAULT '{}'`,
-    `ALTER TABLE djangue_members ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'member'`,
-    `ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS album_urls TEXT[] DEFAULT '{}'`,
-    `ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS voice_transcript TEXT`,
-    `ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS forwarded_from TEXT`,
-    `ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ`,
-    `CREATE TABLE IF NOT EXISTS story_reactions (id UUID DEFAULT gen_random_uuid() PRIMARY KEY, story_id UUID NOT NULL, user_id UUID REFERENCES users(id) ON DELETE CASCADE, emoji VARCHAR(10) NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(story_id, user_id))`,
-    `ALTER TABLE djangue_notifications ADD COLUMN IF NOT EXISTS sent BOOLEAN DEFAULT FALSE`,
-    `ALTER TABLE djangue_notifications ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ`,
-  ];
+function stripXmlText(str) {
+  return String(str || '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .trim();
+}
 
-  const results = [];
-  for (const sql of migrations) {
-    try {
-      const { error } = await supabase.rpc('exec_sql', { sql }).catch(() => ({ error: null }));
-      // Intentar directamente si exec_sql no existe
-      if (error) {
-        // Usar pg directamente
-        const { Pool } = require('pg');
-        const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-        await pool.query(sql);
-        await pool.end();
-        results.push({ sql: sql.slice(0, 60), ok: true });
-      } else {
-        results.push({ sql: sql.slice(0, 60), ok: true });
+function parseRssItems(xml, source) {
+  const items = [];
+  const blocks = xml.split(/<item[\s>]/i).slice(1);
+  for (let index = 0; index < blocks.length && items.length < 12; index++) {
+    const block = blocks[index];
+    const titleMatch = block.match(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/i) || block.match(/<title>([\s\S]*?)<\/title>/i);
+    const linkMatch = block.match(/<link>([\s\S]*?)<\/link>/i);
+    const pubMatch = block.match(/<pubDate>([\s\S]*?)<\/pubDate>/i) || block.match(/<dc:date>([\s\S]*?)<\/dc:date>/i);
+    const title = titleMatch ? stripXmlText(titleMatch[1]) : '';
+    if (!title || title.length < 4) continue;
+    let time = 'Reciente';
+    if (pubMatch) {
+      const date = new Date(pubMatch[1].trim());
+      if (!Number.isNaN(date.getTime())) {
+        const hours = Math.round((Date.now() - date.getTime()) / 3600000);
+        time = hours < 1 ? 'Hace un momento' : hours < 24 ? `Hace ${hours} h` : 'Ayer';
       }
-    } catch (e) {
-      results.push({ sql: sql.slice(0, 60), ok: false, error: e.message });
     }
+    items.push({
+      id: `rss-${source}-${index}`,
+      title,
+      source,
+      time,
+      url: linkMatch ? stripXmlText(linkMatch[1]) : undefined,
+    });
   }
+  return items;
+}
 
-  const allOk = results.every(r => r.ok);
-  res.json({ ok: allOk, results, total: migrations.length, passed: results.filter(r => r.ok).length });
+async function fetchRssFeed(feed) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(feed.url, {
+      headers: { Accept: 'application/rss+xml, application/xml, text/xml', 'User-Agent': 'Mozilla/5.0 (compatible; EGChatProxy/1.0)' },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return [];
+    const xml = await res.text();
+    return parseRssItems(xml, feed.source);
+  } catch (err) {
+    return [];
+  }
+}
+
+app.get('/api/news/rss', async (req, res) => {
+  try {
+    if (!enableExternalNewsScraping) {
+      return res.json({ news: [], externalScrapingDisabled: true });
+    }
+    const results = await Promise.allSettled(RSS_FEEDS_PROXY.map(fetchRssFeed));
+    const news = results
+      .filter(r => r.status === 'fulfilled')
+      .flatMap(r => r.status === 'fulfilled' ? r.value : []);
+    const uniqueNews = news.filter((item, idx, arr) => arr.findIndex(x => x.title === item.title) === idx).slice(0, 12);
+    return res.json({ news: uniqueNews });
+  } catch (e) {
+    return res.json({ news: [] });
+  }
 });
 
-// ══════════════════════════════════════════════════════════════════════
-// MI DJANGUE ROUTES — Sistema de tanda/caja de ahorro rotativo
-// ══════════════════════════════════════════════════════════════════════
-const djangueRoutes = require('./djangueRoutes');
-app.use('/api', djangueRoutes);
-
-// ── KYC Routes ──────────────────────────────────────────────────────
-try {
-  const kycRoutes = require('./egchat-api/kyc/kycRoutes');
-  app.use('/api/kyc', kycRoutes);
-} catch (e) {
-  console.log('[startup] kycRoutes no disponible:', e.message);
-}
-
-// ── AML Routes ──────────────────────────────────────────────────────
-try {
-  const amlRoutes = require('./routes/aml');
-  app.use('/api/aml', amlRoutes);
-} catch (e) {
-  console.log('[startup] amlRoutes no disponible:', e.message);
-}
-
-// ── Admin Auth Routes (login + 2FA + stats) ─────────────────────────
-try {
-  const adminAuthRoutes = require('./routes/adminAuth');
-  app.use('/api/admin', adminAuthRoutes);
-} catch (e) {
-  console.log('[startup] adminAuthRoutes no disponible:', e.message);
-}
-
-// ── Updates server (Tauri auto-update) ──────────────────────────────
-try {
-  const updatesRoutes = require('./routes/updates');
-  app.use('/updates', updatesRoutes);
-} catch (e) {
-  console.log('[startup] updatesRoutes no disponible:', e.message);
-}
-
 if (require.main === module) {
-  // El puerto ya está abierto desde el early bind arriba.
-  // Solo iniciamos schedulers y mostramos el log de confirmación.
-  _earlyServer.on('listening', () => {});
-  console.log(`\n😎 EGCHAT API + Supabase en http://localhost:${PORT}`);
+  // ── Servidor HTTP + WebSocket SFU ──────────────────────────────
+  const http = require('http');
+  const { WebSocketServer } = require('ws');
+
+  const httpServer = http.createServer(app);
+
+  // Salas SFU: roomId → Map<userId, { ws, userId, name, avatar }>
+  const sfuRooms = new Map();
+
+  const wss = new WebSocketServer({ server: httpServer, path: '/api/call/sfu-ws' });
+
+  wss.on('connection', (ws, req) => {
+    const url    = new URL(req.url, 'http://localhost');
+    const roomId = url.searchParams.get('roomId') || '';
+    const token  = url.searchParams.get('token') || '';
+
+    let myUserId = '';
+    let myName   = 'Usuario';
+
+    // Verificar token
+    try { const decoded = verifyToken(token); myUserId = String(decoded.id); }
+    catch { ws.close(4001, 'Token inválido'); return; }
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        switch (msg.type) {
+
+          case 'join': {
+            myName = msg.name || 'Usuario';
+            const avatar = msg.avatar || '';
+
+            if (!sfuRooms.has(roomId)) sfuRooms.set(roomId, new Map());
+            const room = sfuRooms.get(roomId);
+
+            // Enviar estado actual de la sala al nuevo participante
+            const currentParticipants = [...room.values()].map(p => ({
+              userId: p.userId, name: p.name, avatar: p.avatar,
+            }));
+            ws.send(JSON.stringify({ type: 'room_state', participants: currentParticipants }));
+
+            // Notificar a todos de la llegada
+            room.forEach(p => {
+              if (p.ws.readyState === p.ws.OPEN) {
+                p.ws.send(JSON.stringify({
+                  type: 'participant_joined', userId: myUserId, name: myName, avatar,
+                }));
+              }
+            });
+
+            room.set(myUserId, { ws, userId: myUserId, name: myName, avatar });
+            break;
+          }
+
+          case 'offer':
+          case 'answer':
+          case 'ice': {
+            const room = sfuRooms.get(roomId);
+            const target = room?.get(msg.to);
+            if (target?.ws?.readyState === target.ws.OPEN) {
+              target.ws.send(JSON.stringify({ ...msg, from: myUserId }));
+            }
+            break;
+          }
+
+          case 'mute_update': {
+            const room = sfuRooms.get(roomId);
+            room?.forEach(p => {
+              if (p.userId !== myUserId && p.ws.readyState === p.ws.OPEN) {
+                p.ws.send(JSON.stringify({
+                  type: 'mute_update', userId: myUserId,
+                  isMuted: msg.isMuted, isCamOff: msg.isCamOff,
+                }));
+              }
+            });
+            break;
+          }
+
+          case 'leave': handleLeave(); break;
+        }
+      } catch {}
+    });
+
+    function handleLeave() {
+      const room = sfuRooms.get(roomId);
+      if (!room) return;
+      room.delete(myUserId);
+      room.forEach(p => {
+        if (p.ws.readyState === p.ws.OPEN) {
+          p.ws.send(JSON.stringify({ type: 'participant_left', userId: myUserId }));
+        }
+      });
+      if (room.size === 0) sfuRooms.delete(roomId);
+    }
+
+    ws.on('close', handleLeave);
+    ws.on('error', handleLeave);
+  });
+
+  httpServer.listen(PORT, '0.0.0.0', async () => {
+    console.log(`\n😎 EGCHAT API + WebSocket SFU en http://0.0.0.0:${PORT}`);
+    console.log(`   SFU WebSocket: ws://0.0.0.0:${PORT}/api/call/sfu-ws`);
+    console.log(`   Max participantes por sala: 9`);
     console.log(`   Supabase: ${process.env.SUPABASE_URL ? '✅ Conectado' : '❌ Sin configurar'}`);
+    // Iniciar scheduler de noticias del gobierno
     startGovNewsScheduler();
     console.log(`   Auth:   POST /api/auth/register | /api/auth/login`);
     console.log(`   Wallet: GET  /api/wallet/balance | POST /api/wallet/deposit`);
-    console.log(`   Lia-25: POST /api/lia/chat`);
-    console.log(`   Djangue: POST /api/djangue | GET /api/djangues (v2.0)\n`);
+    console.log(`   Lia-25: POST /api/lia/chat\n`);
+    // Crear buckets si no existen (avatares + archivos de chat)
+    try {
+      const { data: buckets } = await supabase.storage.listBuckets();
+      const bucketList = buckets || [];
 
-    // ── Auto-migración v2 al arrancar ──────────────────────────────
-    // Se ejecuta solo una vez: si la tabla user_sessions no existe,
-    // crea todas las tablas nuevas del roadmap WhatsApp/WeChat parity.
-    const runAutoMigration = async () => {
-      console.log('[migration] Verificando esquema v2...');
-      const MIGRATIONS_V2 = [
-        `ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'sent'`,
-        `CREATE INDEX IF NOT EXISTS idx_chat_messages_status ON chat_messages(chat_id, status)`,
-        `ALTER TABLE users ADD COLUMN IF NOT EXISTS e2e_public_key TEXT`,
-        `ALTER TABLE users ADD COLUMN IF NOT EXISTS e2e_key_backup JSONB`,
-        `ALTER TABLE users ADD COLUMN IF NOT EXISTS e2e_backup_updated TIMESTAMPTZ`,
-        `CREATE TABLE IF NOT EXISTS sticker_packs (id VARCHAR(100) PRIMARY KEY, name VARCHAR(100) NOT NULL, author VARCHAR(100) DEFAULT 'EGChat', cover_url TEXT, stickers JSONB DEFAULT '[]', download_count INTEGER DEFAULT 0, is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW())`,
-        `CREATE TABLE IF NOT EXISTS user_sticker_packs (user_id UUID REFERENCES users(id) ON DELETE CASCADE, pack_id VARCHAR(100) NOT NULL, installed_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY(user_id, pack_id))`,
-        `CREATE TABLE IF NOT EXISTS user_custom_stickers (id UUID DEFAULT gen_random_uuid() PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE, file_url TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())`,
-        `CREATE TABLE IF NOT EXISTS mini_apps (id UUID DEFAULT gen_random_uuid() PRIMARY KEY, name VARCHAR(100) NOT NULL, description TEXT, icon_url TEXT, accent_color VARCHAR(20) DEFAULT '#00c8a0', url TEXT NOT NULL, category VARCHAR(50) DEFAULT 'utilities', permissions JSONB DEFAULT '[]', developer_name VARCHAR(100) DEFAULT 'EGChat', is_verified BOOLEAN DEFAULT FALSE, is_active BOOLEAN DEFAULT TRUE, installs_count INTEGER DEFAULT 0, created_at TIMESTAMPTZ DEFAULT NOW())`,
-        `CREATE TABLE IF NOT EXISTS user_mini_apps (user_id UUID REFERENCES users(id) ON DELETE CASCADE, app_id UUID REFERENCES mini_apps(id) ON DELETE CASCADE, installed_at TIMESTAMPTZ DEFAULT NOW(), last_used_at TIMESTAMPTZ, PRIMARY KEY(user_id, app_id))`,
-        `CREATE TABLE IF NOT EXISTS payment_transactions (id TEXT PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL, type VARCHAR(20) NOT NULL, amount DECIMAL(15,2) NOT NULL, currency VARCHAR(10) DEFAULT 'XAF', gateway VARCHAR(30) NOT NULL, gateway_txn_id TEXT, status VARCHAR(20) DEFAULT 'pending', metadata JSONB DEFAULT '{}', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`,
-        `CREATE INDEX IF NOT EXISTS idx_payment_txns_user ON payment_transactions(user_id, created_at DESC)`,
-        `CREATE TABLE IF NOT EXISTS user_sessions (id TEXT PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL, device_name VARCHAR(150), device_type VARCHAR(30), platform VARCHAR(80), last_seen TIMESTAMPTZ DEFAULT NOW(), is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW())`,
-        `CREATE INDEX IF NOT EXISTS idx_user_sessions_user_active ON user_sessions(user_id, is_active)`,
-        `INSERT INTO sticker_packs (id, name, author, cover_url, stickers) VALUES ('egchat_classic','EGChat Clasico','EGChat','https://media.tenor.com/RHpFOybx63oAAAAi/hi-wave.gif','[{"id":"eg_hi","url":"https://media.tenor.com/RHpFOybx63oAAAAi/hi-wave.gif","label":"wave"}]') ON CONFLICT (id) DO NOTHING`,
-        `INSERT INTO sticker_packs (id, name, author, cover_url, stickers) VALUES ('guinea_eq','Guinea Ecuatorial','EGChat','https://media.tenor.com/KWBXqCNb-0AAAAAi/party-celebration.gif','[{"id":"ge1","url":"https://media.tenor.com/KWBXqCNb-0AAAAAi/party-celebration.gif","label":"GQ"}]') ON CONFLICT (id) DO NOTHING`,
-      ];
-      let ok = 0, fail = 0;
-      for (const sql of MIGRATIONS_V2) {
-        try {
-          const result = await supabase.rpc('exec_sql', { sql });
-          if (!result.error) { ok++; continue; }
-        } catch {}
-        // Fallback: usar pg directo si exec_sql no existe
-        try {
-          const { Pool } = require('pg');
-          if (process.env.DATABASE_URL) {
-            const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-            await pool.query(sql);
-            await pool.end();
-            ok++;
-          } else { fail++; }
-        } catch (e) {
-          console.warn(`[migration] fallida: ${sql.slice(0, 50)} — ${e.message}`);
-          fail++;
+      for (const bucketName of ['chat-files', 'avatars']) {
+        const exists = bucketList.some(b => b.name === bucketName);
+        if (!exists) {
+          const { error: bErr } = await supabase.storage.createBucket(bucketName, {
+            public: true,
+            allowedMimeTypes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'video/mp4', 'audio/m4a', 'application/octet-stream'],
+            fileSizeLimit: 52428800, // 50MB
+          });
+          if (bErr) console.log(`Bucket ${bucketName} ya existe o error:`, bErr.message);
+          else console.log(`✅ Bucket ${bucketName} creado`);
+        } else {
+          // Asegurar que sea público
+          await supabase.storage.updateBucket(bucketName, { public: true }).catch(() => {});
+          console.log(`✅ Bucket ${bucketName} OK (público)`);
         }
       }
-      console.log(`[migration] ✅ Completada: ${ok} OK, ${fail} skipped`);
+    } catch (e) {
+      console.log('Bucket check error:', e.message);
+    }
 
-      // Crear tabla call_sessions si no existe
-      try {
-        await supabase.rpc('exec_sql', { sql: `
-          CREATE TABLE IF NOT EXISTS call_sessions (
-            call_id VARCHAR(100) PRIMARY KEY,
-            offer TEXT, answer TEXT,
-            caller_candidates TEXT DEFAULT '[]',
-            callee_candidates TEXT DEFAULT '[]',
-            type VARCHAR(10) DEFAULT 'audio',
-            caller_id TEXT NOT NULL,
-            target_user_id TEXT NOT NULL,
-            ended BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            updated_at TIMESTAMPTZ DEFAULT NOW()
-          );
-        `}).catch(() => {});
-      } catch {}
-    };
-    setTimeout(runAutoMigration, 3000); // 3s después del arranque
-    updateUserVersions();
+    try {
+      await supabase.rpc('exec_sql', { sql: `
+        CREATE TABLE IF NOT EXISTS call_sessions (
+          call_id VARCHAR(100) PRIMARY KEY,
+          offer TEXT, answer TEXT,
+          caller_candidates TEXT DEFAULT '[]',
+          callee_candidates TEXT DEFAULT '[]',
+          type VARCHAR(10) DEFAULT 'audio',
+          caller_id TEXT NOT NULL,
+          target_user_id TEXT NOT NULL,
+          ended BOOLEAN DEFAULT FALSE,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+      `});
+    } catch {}
+  });
+  updateUserVersions();
 }
 
-// ════════════════════════════════════════════════════════════════════
-// NUEVOS ENDPOINTS — Paridad WhatsApp/WeChat
-// ════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════
+// ADMIN AUTH — Login de administradores KYC (email + password)
+// Tabla: admin_users (creada por migración 008_kyc_aml_complete.sql)
+// ══════════════════════════════════════════════════════════════════
 
-// ── #1: EDITAR MENSAJE ──────────────────────────────────────────────
-app.patch('/api/messages/:messageId', auth, async (req, res) => {
+app.post('/auth/admin/login', authLimiter, async (req, res) => {
   try {
-    const { messageId } = req.params;
-    const { text } = req.body;
-    if (!text || !text.trim()) return res.status(400).json({ error: 'Texto requerido' });
-    const { data, error } = await supabase
-      .from('messages')
-      .update({ text: text.trim(), edited: true, edited_at: new Date().toISOString() })
-      .eq('id', messageId)
-      .eq('sender_id', req.user.id)
-      .select()
-      .single();
-    if (error) return res.status(404).json({ error: 'Mensaje no encontrado o sin permiso' });
-    res.json(data);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+    const { email, password } = req.body;
+    if (!email || !password)
+      return res.status(400).json({ error: 'MISSING_FIELDS', message: 'email y password son requeridos' });
 
-// ── #2: REACCIONES ──────────────────────────────────────────────────
-app.post('/api/messages/:messageId/reactions', auth, async (req, res) => {
-  try {
-    const { messageId } = req.params;
-    const { emoji } = req.body;
-    if (!emoji) return res.status(400).json({ error: 'Emoji requerido' });
-    const existing = await supabase
-      .from('message_reactions')
-      .select('id')
-      .eq('message_id', messageId)
-      .eq('user_id', req.user.id)
-      .eq('emoji', emoji)
+    if (!supabase)
+      return res.status(503).json({ error: 'DB_UNAVAILABLE', message: 'Base de datos no disponible' });
+
+    const { data: admin, error } = await supabase
+      .from('admin_users')
+      .select('*')
+      .eq('email', email.trim().toLowerCase())
+      .eq('is_active', true)
       .maybeSingle();
-    if (existing.data) {
-      await supabase.from('message_reactions').delete().eq('id', existing.data.id);
-      return res.json({ added: false, emoji });
-    }
-    await supabase.from('message_reactions').insert({ message_id: messageId, user_id: req.user.id, emoji });
 
-    // ── 4a: Emitir evento SSE al dueño del mensaje para notificación push ──
-    try {
-      const { data: msg } = await supabase
-        .from('chat_messages')
-        .select('sender_id, text, chat_id')
-        .eq('id', messageId)
-        .maybeSingle();
-      if (msg && msg.sender_id && String(msg.sender_id) !== String(req.user.id)) {
-        const { data: reactor } = await supabase
-          .from('users').select('full_name').eq('id', req.user.id).single();
-        emitToUser(String(msg.sender_id), {
-          type: 'reaction_added',
-          messageId,
-          chatId: msg.chat_id,
-          emoji,
-          reactorName: reactor?.full_name || 'Alguien',
-          messagePreview: msg.text || '',
-          ts: Date.now(),
-        });
-      }
-    } catch { /* no bloquear la respuesta */ }
+    if (error || !admin)
+      return res.status(401).json({ error: 'INVALID_CREDENTIALS', message: 'Email o contraseña incorrectos' });
 
-    res.json({ added: true, emoji });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+    // Verificar contraseña con bcrypt
+    const ok = await bcrypt.compare(password, admin.password_hash);
+    if (!ok)
+      return res.status(401).json({ error: 'INVALID_CREDENTIALS', message: 'Email o contraseña incorrectos' });
 
-app.get('/api/messages/:messageId/reactions', auth, async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('message_reactions')
-      .select('emoji, user_id, created_at')
-      .eq('message_id', req.params.messageId)
-      .order('created_at', { ascending: true });
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data || []);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+    // Actualizar last_login
+    await supabase.from('admin_users').update({ last_login: new Date().toISOString() }).eq('id', admin.id);
 
-// ── #3: RECEIPTS DE LECTURA ─────────────────────────────────────────
-app.post('/api/messages/:messageId/receipts/read', auth, async (req, res) => {
-  try {
-    const { messageId } = req.params;
-    const { chat_id } = req.body;
-    await supabase.from('message_receipts').upsert({
-      message_id: messageId,
-      chat_id: chat_id || '',
-      user_id: req.user.id,
-      read_at: new Date().toISOString(),
-    }, { onConflict: 'message_id,user_id' });
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+    const token = jwt.sign(
+      { id: admin.id, email: admin.email, role: admin.role, entity: admin.entity, type: 'admin' },
+      JWT_SECRET,
+      { expiresIn: '8h' }
+    );
 
-app.get('/api/messages/:messageId/receipts', auth, async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('message_receipts')
-      .select('user_id, delivered_at, read_at, users(full_name, avatar_url)')
-      .eq('message_id', req.params.messageId);
-    if (error) return res.status(500).json({ error: error.message });
-    const result = (data || []).map(r => ({
-      user_id: r.user_id,
-      full_name: r.users?.full_name,
-      avatar_url: r.users?.avatar_url,
-      delivered_at: r.delivered_at,
-      read_at: r.read_at,
-    }));
-    res.json(result);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── #4: BÚSQUEDA GLOBAL ─────────────────────────────────────────────
-app.get('/api/messages/search', auth, async (req, res) => {
-  try {
-    const q = (req.query.q || '').trim();
-    const limit = Math.min(parseInt(req.query.limit) || 30, 100);
-    if (!q || q.length < 2) return res.json([]);
-    const { data: chats } = await supabase
-      .from('chat_participants')
-      .select('chat_id')
-      .eq('user_id', req.user.id);
-    const chatIds = (chats || []).map(c => c.chat_id);
-    if (!chatIds.length) return res.json([]);
-    const { data, error } = await supabase
-      .from('messages')
-      .select('id, chat_id, text, type, sender_id, created_at, sender:users!sender_id(full_name, avatar_url), chat:chats!chat_id(name, type, avatar_url)')
-      .in('chat_id', chatIds)
-      .ilike('text', `%${q}%`)
-      .order('created_at', { ascending: false })
-      .limit(limit);
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data || []);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── #5: MOMENTS ─────────────────────────────────────────────────────
-app.get('/api/moments', auth, async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('moments')
-      .select(`id, user_id, text, images, likes_count, created_at,
-        user:users!user_id(full_name, avatar_url),
-        comments:moment_comments(id, user_id, text, created_at, user:users!user_id(full_name))`)
-      .order('created_at', { ascending: false })
-      .limit(50);
-    if (error) return res.status(500).json({ error: error.message });
-    const liked = await supabase.from('moment_likes').select('moment_id').eq('user_id', req.user.id);
-    const likedIds = new Set((liked.data || []).map(l => l.moment_id));
-    const result = (data || []).map(m => ({
-      ...m,
-      user_name: m.user?.full_name || 'Usuario',
-      user_avatar: m.user?.avatar_url,
-      liked_by_me: likedIds.has(m.id),
-      comments: (m.comments || []).map(c => ({ ...c, user_name: c.user?.full_name || 'Usuario' })),
-    }));
-    res.json(result);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/moments', auth, async (req, res) => {
-  try {
-    const { text, images } = req.body;
-    if (!text && (!images || !images.length)) return res.status(400).json({ error: 'Texto o imágenes requeridos' });
-    const { data, error } = await supabase
-      .from('moments')
-      .insert({ user_id: req.user.id, text: text || null, images: images || [] })
-      .select()
-      .single();
-    if (error) return res.status(500).json({ error: error.message });
-    const me = await supabase.from('users').select('full_name, avatar_url').eq('id', req.user.id).single();
-    res.json({ ...data, user_name: me.data?.full_name || 'Yo', user_avatar: me.data?.avatar_url, liked_by_me: false, likes: 0, comments: [] });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/moments/:momentId/like', auth, async (req, res) => {
-  try {
-    const { momentId } = req.params;
-    const existing = await supabase.from('moment_likes').select('moment_id').eq('moment_id', momentId).eq('user_id', req.user.id).maybeSingle();
-    if (existing.data) {
-      await supabase.from('moment_likes').delete().eq('moment_id', momentId).eq('user_id', req.user.id);
-      await supabase.from('moments').update({ likes_count: supabase.raw('GREATEST(likes_count - 1, 0)') }).eq('id', momentId);
-      return res.json({ liked: false });
-    }
-    await supabase.from('moment_likes').insert({ moment_id: momentId, user_id: req.user.id });
-    await supabase.from('moments').update({ likes_count: supabase.raw('likes_count + 1') }).eq('id', momentId);
-    res.json({ liked: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/moments/:momentId/comments', auth, async (req, res) => {
-  try {
-    const { text } = req.body;
-    if (!text) return res.status(400).json({ error: 'Texto requerido' });
-    const me = await supabase.from('users').select('full_name').eq('id', req.user.id).single();
-    const { data, error } = await supabase
-      .from('moment_comments')
-      .insert({ moment_id: req.params.momentId, user_id: req.user.id, text })
-      .select()
-      .single();
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ ...data, user_name: me.data?.full_name || 'Usuario' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── #6: CANALES OFICIALES ───────────────────────────────────────────
-app.get('/api/channels', auth, async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('channels')
-      .select('id, name, description, avatar_url, category, verified, followers_count')
-      .order('followers_count', { ascending: false });
-    if (error) return res.status(500).json({ error: error.message });
-    const following = await supabase.from('channel_followers').select('channel_id').eq('user_id', req.user.id);
-    const followedIds = new Set((following.data || []).map(f => f.channel_id));
-    const posts = await supabase.from('channel_posts').select('channel_id, text, created_at').order('created_at', { ascending: false });
-    const lastPost = {};
-    (posts.data || []).forEach(p => { if (!lastPost[p.channel_id]) lastPost[p.channel_id] = p; });
-    res.json((data || []).map(c => ({ ...c, followed: followedIds.has(c.id), last_post: lastPost[c.id] || null })));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/channels/:channelId/follow', auth, async (req, res) => {
-  try {
-    const { channelId } = req.params;
-    const existing = await supabase.from('channel_followers').select('channel_id').eq('channel_id', channelId).eq('user_id', req.user.id).maybeSingle();
-    if (existing.data) {
-      await supabase.from('channel_followers').delete().eq('channel_id', channelId).eq('user_id', req.user.id);
-      await supabase.from('channels').update({ followers_count: supabase.raw('GREATEST(followers_count - 1, 0)') }).eq('id', channelId);
-      return res.json({ followed: false });
-    }
-    await supabase.from('channel_followers').insert({ channel_id: channelId, user_id: req.user.id });
-    await supabase.from('channels').update({ followers_count: supabase.raw('followers_count + 1') }).eq('id', channelId);
-    res.json({ followed: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── #7: PERFIL EMPRESARIAL ──────────────────────────────────────────
-app.get('/api/business/profile', auth, async (req, res) => {
-  try {
-    const { data } = await supabase.from('business_profiles').select('*').eq('user_id', req.user.id).maybeSingle();
-    if (!data) return res.json(null);
-    const catalog = await supabase.from('catalog_items').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
-    res.json({ ...data, catalog: catalog.data || [] });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/api/business/profile', auth, async (req, res) => {
-  try {
-    const fields = ['name', 'category', 'description', 'phone', 'email', 'website', 'address', 'avatar_url'];
-    const patch = {};
-    fields.forEach(f => { if (req.body[f] !== undefined) patch[f] = req.body[f]; });
-    if (!patch.name) return res.status(400).json({ error: 'Nombre requerido' });
-    const { data, error } = await supabase
-      .from('business_profiles')
-      .upsert({ user_id: req.user.id, ...patch, updated_at: new Date().toISOString() }, { onConflict: 'user_id' })
-      .select().single();
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/business/catalog', auth, async (req, res) => {
-  try {
-    const { name, price, currency, description, image, available } = req.body;
-    if (!name) return res.status(400).json({ error: 'Nombre requerido' });
-    const { data, error } = await supabase
-      .from('catalog_items')
-      .insert({ user_id: req.user.id, name, price: price || '0', currency: currency || 'XAF', description: description || '', image_url: image || null, available: available !== false })
-      .select().single();
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.delete('/api/business/catalog/:itemId', auth, async (req, res) => {
-  try {
-    await supabase.from('catalog_items').delete().eq('id', req.params.itemId).eq('user_id', req.user.id);
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── #8: BACKUP EN LA NUBE ───────────────────────────────────────────
-app.post('/api/backup/upload', auth, async (req, res) => {
-  try {
-    const multer = require('multer');
-    const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
-    upload.single('backup')(req, res, async (err) => {
-      if (err) return res.status(400).json({ error: err.message });
-      if (!req.file) return res.status(400).json({ error: 'Archivo requerido' });
-      const fileName = `backups/${req.user.id}/${Date.now()}.json`;
-      const { error: upErr } = await supabase.storage
-        .from('egchat-backups')
-        .upload(fileName, req.file.buffer, { contentType: 'application/json', upsert: true });
-      if (upErr) {
-        // Fallback: guardar registro sin archivo real
-        await supabase.from('user_backups').insert({
-          user_id: req.user.id, file_path: fileName,
-          file_size: req.file.size, chat_count: 0,
-        }).catch(() => {});
-        return res.json({ ok: true, url: null, size: req.file.size });
-      }
-      const { data: urlData } = supabase.storage.from('egchat-backups').getPublicUrl(fileName);
-      await supabase.from('user_backups').insert({
-        user_id: req.user.id, file_path: fileName,
-        file_size: req.file.size, chat_count: 0,
-      }).catch(() => {});
-      res.json({ ok: true, url: urlData?.publicUrl, size: req.file.size });
+    return res.json({
+      access_token: token,
+      token_type:   'bearer',
+      expires_in:   8 * 3600,
+      admin_id:     admin.id,
+      role:         admin.role,
+      entity:       admin.entity,
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── #9: OTP / VERIFICACIÓN SMS ──────────────────────────────────────
-// Enviar código SMS de verificación
-app.post('/api/auth/send-verification', async (req, res) => {
-  try {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ message: 'Teléfono requerido' });
-
-    // Generar código de 6 dígitos
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutos
-
-    // Guardar en memoria (en producción usar Redis o DB)
-    if (!global.verificationCodes) global.verificationCodes = new Map();
-    global.verificationCodes.set(phone, { code, expiresAt });
-
-    // Intentar enviar SMS via Twilio
-    try {
-      const accountSid = process.env.TWILIO_ACCOUNT_SID;
-      const authToken = process.env.TWILIO_AUTH_TOKEN;
-      const fromPhone = process.env.TWILIO_PHONE;
-
-      if (accountSid && authToken && fromPhone) {
-        const twilio = require('twilio')(accountSid, authToken);
-        await twilio.messages.create({
-          body: `Tu código de verificación EGCHAT es: ${code}. Válido 10 minutos.`,
-          from: fromPhone,
-          to: phone
-        });
-        console.log(`[SMS] Código enviado a ${phone}: ${code}`);
-        return res.json({ message: 'Código enviado', sent: true });
-      }
-    } catch (twilioError) {
-      console.error('[SMS] Error Twilio:', twilioError.message);
-    }
-
-    // Si Twilio no está configurado o falló, devolver código en desarrollo
-    if (process.env.NODE_ENV !== 'production') {
-      console.log(`[DEV] Código de verificación para ${phone}: ${code}`);
-      return res.json({ message: 'Código generado (dev mode)', code, sent: false });
-    }
-
-    res.json({ message: 'Código generado', sent: false });
   } catch (e) {
-    console.error('[SMS] Error:', e);
-    res.status(500).json({ message: 'Error al enviar código' });
+    console.error('[Admin login error]', e.message);
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
   }
 });
 
-// El endpoint /api/auth/verify-code ya existe (línea 423)
-// Añadimos el de envío si no existe:
+app.get('/auth/admin/me', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'NO_TOKEN', message: 'Token requerido' });
+
+    let payload;
+    try { payload = verifyToken(token); } catch {
+      return res.status(401).json({ error: 'INVALID_TOKEN', message: 'Token inválido o expirado' });
+    }
+
+    if (payload.type !== 'admin')
+      return res.status(403).json({ error: 'FORBIDDEN', message: 'Token de usuario no válido aquí' });
+
+    if (!supabase)
+      return res.json({ id: payload.id, email: payload.email, role: payload.role, entity: payload.entity, is_active: true, last_login: null });
+
+    const { data: admin } = await supabase
+      .from('admin_users')
+      .select('id, email, role, entity, is_active, last_login')
+      .eq('id', payload.id)
+      .maybeSingle();
+
+    if (!admin)
+      return res.status(401).json({ error: 'ADMIN_NOT_FOUND', message: 'Admin no encontrado' });
+
+    res.json(admin);
+  } catch (e) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+app.post('/auth/admin/logout', async (req, res) => {
+  // JWT stateless — el cliente descarta el token
+  res.status(204).end();
+});
+
+// ── Estadísticas KYC para el dashboard ───────────────────────────
+app.get('/admin/kyc/stats', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.json({ total_applications:0, pending_review:0, approved_today:0, rejected_today:0, avg_risk_score:0, high_risk_count:0, screening_hits_unreviewed:0, sars_overdue:0 });
+
+    const today = new Date(); today.setHours(0,0,0,0);
+
+    const [total, pending, approvedToday, rejectedToday, highRisk, sarsOverdue] = await Promise.all([
+      supabase.from('kyc_verifications').select('id', { count: 'exact', head: true }),
+      supabase.from('kyc_verifications').select('id', { count: 'exact', head: true })
+        .in('status', ['submitted','PENDING_REVIEW','under_review','MANUAL_REVIEW']),
+      supabase.from('kyc_verifications').select('id', { count: 'exact', head: true })
+        .in('status', ['approved','APPROVED','AUTO_APPROVED'])
+        .gte('reviewed_at', today.toISOString()),
+      supabase.from('kyc_verifications').select('id', { count: 'exact', head: true })
+        .in('status', ['rejected','REJECTED'])
+        .gte('reviewed_at', today.toISOString()),
+      supabase.from('kyc_verifications').select('id', { count: 'exact', head: true })
+        .in('risk_level', ['high','HIGH']),
+      supabase.from('suspicious_activity_reports').select('id', { count: 'exact', head: true })
+        .not('status', 'in', '("SENT_TO_ANIF","ACKNOWLEDGED","CLOSED")')
+        .lt('detected_at', new Date(Date.now() - 72*3600*1000).toISOString()),
+    ]);
+
+    res.json({
+      total_applications:        total.count          ?? 0,
+      pending_review:            pending.count        ?? 0,
+      approved_today:            approvedToday.count  ?? 0,
+      rejected_today:            rejectedToday.count  ?? 0,
+      avg_risk_score:            0,
+      high_risk_count:           highRisk.count       ?? 0,
+      screening_hits_unreviewed: 0,
+      sars_overdue:              sarsOverdue.count    ?? 0,
+    });
+  } catch (e) {
+    console.error('[KYC stats error]', e.message);
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
+
+// ── Lista KYC pendientes ──────────────────────────────────────────
+app.get('/admin/kyc/pending', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.json({ items:[], total:0, page:1, page_size:20, pages:0 });
+
+    const page      = parseInt(req.query.page) || 1;
+    const pageSize  = parseInt(req.query.page_size) || 20;
+    const status    = req.query.status;
+    const riskLevel = req.query.risk_level;
+
+    const defaultStatuses = ['submitted','PENDING_REVIEW','under_review','MANUAL_REVIEW'];
+    const statuses = status ? [status] : defaultStatuses;
+
+    let query = supabase
+      .from('kyc_verifications')
+      .select(`id, session_id, status, risk_level, risk_score, bank_decision, submitted_at, created_at,
+               full_name, nationality, doc_type,
+               users:user_id (id, phone, status)`,
+              { count: 'exact' })
+      .in('status', statuses)
+      .order('submitted_at', { ascending: true, nullsFirst: false })
+      .range((page-1)*pageSize, page*pageSize - 1);
+
+    if (riskLevel) query = query.eq('risk_level', riskLevel);
+
+    const { data, count, error } = await query;
+    if (error) throw error;
+
+    const items = (data || []).map((a) => ({
+      application_id:   a.id,
+      session_id:       a.session_id,
+      status:           a.status,
+      risk_level:       a.risk_level || 'low',
+      risk_score:       a.risk_score || 0,
+      bank_decision:    a.bank_decision,
+      submitted_at:     a.submitted_at,
+      created_at:       a.created_at,
+      user_phone:       a.users?.phone,
+      user_status:      a.users?.status,
+      full_name:        a.full_name,
+      nationality:      a.nationality,
+      document_type:    a.doc_type,
+      ocr_confidence:   null,
+      face_match_score: null,
+      liveness_passed:  null,
+      screening_hits:   0,
+    }));
+
+    res.json({ items, total: count || 0, page, page_size: pageSize, pages: Math.ceil((count || 0) / pageSize) });
+  } catch (e) {
+    console.error('[KYC pending error]', e.message);
+    res.status(500).json({ error: 'SERVER_ERROR', message: e.message });
+  }
+});
 
 // ══════════════════════════════════════════════════════════════════
-// MI DJANGUE — Tanda / Caja de Ahorro Grupal
+// FIN ADMIN AUTH
 // ══════════════════════════════════════════════════════════════════
 
-// ── Helpers ───────────────────────────────────────────────────────
-const calcNextPayoutDate = (frequency) => {
-  const d = new Date();
-  if (frequency === 'daily')   d.setDate(d.getDate() + 1);
-  if (frequency === 'weekly')  d.setDate(d.getDate() + 7);
-  if (frequency === 'monthly') d.setMonth(d.getMonth() + 1);
-  if (frequency === 'annual')  d.setFullYear(d.getFullYear() + 1);
-  return d.toISOString();
+// ── Helpers de KYC ───────────────────────────────────────────────
+const KYC_STATUS = {
+  NONE:         'none',
+  PENDING:      'pending',
+  APPROVED:     'approved',
+  REJECTED:     'rejected',
+  SUSPENDED:    'suspended',
 };
 
-// ══════════════════════════════════════════════════════════════════
-// ── NOTIFICACIONES PUSH (EXPO) ────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════
+const KYC_DB_STATUS = {
+  DRAFT:        'draft',
+  SUBMITTED:    'submitted',
+  UNDER_REVIEW: 'under_review',
+  APPROVED:     'approved',
+  REJECTED:     'rejected',
+  SUSPENDED:    'suspended',
+};
 
-const { Expo } = require('expo-server-sdk');
-const expoPush = new Expo();
+// Inicializar bucket kyc-docs en Supabase Storage (idempotente)
+async function ensureKycBucket() {
+  try {
+    const { data: buckets } = await supabase.storage.listBuckets();
+    const exists = (buckets || []).some(b => b.name === 'kyc-docs');
+    if (!exists) {
+      await supabase.storage.createBucket('kyc-docs', {
+        public: false, // privado — solo accesible con token de servicio
+        allowedMimeTypes: ['image/jpeg','image/png','image/webp','application/pdf'],
+        fileSizeLimit: 10 * 1024 * 1024, // 10 MB por documento
+      });
+      console.log('✅ Bucket kyc-docs creado');
+    }
+  } catch (e) {
+    console.warn('[KYC] ensureKycBucket:', e.message);
+  }
+}
+ensureKycBucket();
 
-/*
- * NOTA: sendPushToUser ya está definida anteriormente en la línea 6203
- * Esta es una definición duplicada que se comenta para evitar conflictos
- */
-
-// ══════════════════════════════════════════════════════════════════
-// ── DJANGUE (TANDA / CAJA DE AHORRO GRUPAL) ───────────────────────
-// ══════════════════════════════════════════════════════════════════
-
-// ── GET /api/djangue — Mis djangues (como miembro o responsable) ──
-app.get('/api/djangue', auth, async (req, res) => {
+// ── GET /api/kyc/status — estado actual del KYC del usuario ───────
+app.get('/api/kyc/status', auth, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // Grupos donde soy miembro
-    const { data: memberRows } = await supabase
-      .from('djangue_members')
-      .select('group_id')
-      .eq('user_id', userId)
-      .eq('status', 'active');
-
-    const memberGroupIds = (memberRows || []).map(r => r.group_id);
-
-    // Grupos donde soy dueño o secretario (aunque no esté en members)
-    const { data: ownedGroups } = await supabase
-      .from('djangue_groups')
-      .select('id')
-      .or(`owner_id.eq.${userId},secretary_id.eq.${userId}`);
-
-    const ownedIds = (ownedGroups || []).map(r => r.id);
-    const allIds   = [...new Set([...memberGroupIds, ...ownedIds])];
-
-    if (!allIds.length) return res.json([]);
-
-    const { data: groups, error } = await supabase
-      .from('djangue_groups')
-      .select(`
-        id, name, description, frequency, quota_amount, currency,
-        max_members, status, current_turn, total_turns, next_payout_at,
-        owner_id, secretary_id, created_at,
-        djangue_wallets (balance),
-        djangue_members (count)
-      `)
-      .in('id', allIds)
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
-
-    // Enriquecer con info de si ya pagué este turno
-    const enriched = await Promise.all((groups || []).map(async (g) => {
-      const { data: myMember } = await supabase
-        .from('djangue_members')
-        .select('id, turn_order')
-        .eq('group_id', g.id)
+    // Primero intentar con Supabase
+    if (supabase) {
+      const { data: kyc, error } = await supabase
+        .from('kyc_verifications')
+        .select('id, status, rejection_reason, submitted_at, reviewed_at, full_name, doc_type, doc_number')
         .eq('user_id', userId)
         .maybeSingle();
 
-      const { data: myContrib } = myMember ? await supabase
-        .from('djangue_contributions')
-        .select('status')
-        .eq('group_id', g.id)
-        .eq('user_id', userId)
-        .eq('turn_number', g.current_turn)
-        .maybeSingle() : { data: null };
+      if (error) throw error;
 
-      return {
-        ...g,
-        wallet_balance: g.djangue_wallets?.[0]?.balance ?? 0,
-        member_count: g.djangue_members?.[0]?.count ?? 0,
-        my_role: g.owner_id === userId ? 'owner' : g.secretary_id === userId ? 'secretary' : 'member',
-        my_turn_order: myMember?.turn_order ?? null,
-        my_paid_this_turn: myContrib?.status === 'paid',
-        is_my_turn: myMember?.turn_order === g.current_turn,
-      };
-    }));
+      // Obtener wallet_kyc_status del usuario
+      const { data: userData } = await supabase
+        .from('users')
+        .select('wallet_kyc_status, wallet_kyc_reject_reason')
+        .eq('id', userId)
+        .maybeSingle();
 
-    res.json(enriched);
+      return res.json({
+        kyc_status: userData?.wallet_kyc_status || KYC_STATUS.NONE,
+        kyc_record: kyc || null,
+        rejection_reason: userData?.wallet_kyc_reject_reason || kyc?.rejection_reason || null,
+        wallet_enabled: userData?.wallet_kyc_status === KYC_STATUS.APPROVED,
+      });
+    }
+
+    // Fallback local
+    return res.json({ kyc_status: KYC_STATUS.NONE, kyc_record: null, wallet_enabled: false });
   } catch (e) {
-    res.status(500).json({ message: e.message });
+    console.error('[KYC] status error:', e.message);
+    res.status(500).json({ message: 'Error al obtener estado KYC', error: e.message });
   }
 });
 
-// ── POST /api/djangue — Crear grupo ───────────────────────────────
-app.post('/api/djangue', auth, async (req, res) => {
+// ── POST /api/kyc/draft — guardar borrador (pasos 1 y 2) ─────────
+// Permite guardar progreso sin enviar definitivamente
+app.post('/api/kyc/draft', auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { name, description, frequency, quota_amount, max_members, secretary_phone } = req.body;
+    const {
+      full_name, birth_date, nationality, gender,
+      address, city, occupation,
+      doc_type, doc_number, doc_expiry,
+    } = req.body;
 
-    if (!name || !frequency || !quota_amount)
-      return res.status(400).json({ message: 'name, frequency y quota_amount son requeridos' });
-    if (!['daily','weekly','monthly','annual'].includes(frequency))
-      return res.status(400).json({ message: 'frequency debe ser: daily, weekly, monthly, annual' });
-    if (quota_amount < 100)
-      return res.status(400).json({ message: 'Cuota mínima: 100 XAF' });
-
-    // Buscar secretario por teléfono (opcional)
-    let secretaryId = null;
-    if (secretary_phone) {
-      const { data: sec } = await supabase
-        .from('users').select('id').eq('phone', secretary_phone).maybeSingle();
-      if (!sec) return res.status(404).json({ message: 'Secretario no encontrado. Verifica el teléfono.' });
-      secretaryId = sec.id;
+    if (!supabase) {
+      return res.json({ success: true, message: 'Borrador guardado (modo local)' });
     }
 
-    // Crear grupo
-    const { data: group, error: gErr } = await supabase
-      .from('djangue_groups')
-      .insert({
-        name, description, frequency,
-        quota_amount: Number(quota_amount),
-        max_members: max_members || 12,
-        owner_id: userId,
-        secretary_id: secretaryId,
-        current_turn: 1,
-        total_turns: 0,
-        next_payout_at: calcNextPayoutDate(frequency),
-      })
-      .select()
-      .single();
-    if (gErr) throw gErr;
+    // Upsert: un solo registro por usuario
+    const { data, error } = await supabase
+      .from('kyc_verifications')
+      .upsert({
+        user_id:    userId,
+        status:     KYC_DB_STATUS.DRAFT,
+        full_name:  full_name?.trim() || '',
+        birth_date: birth_date || null,
+        nationality: nationality || 'GQ',
+        gender:     gender || null,
+        address:    address?.trim() || null,
+        city:       city?.trim() || null,
+        occupation: occupation?.trim() || null,
+        doc_type:   doc_type || 'dni',
+        doc_number: doc_number?.trim() || '',
+        doc_expiry: doc_expiry || null,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'user_id' })
+      .select('id')
+      .maybeSingle();
 
-    // Crear monedero del djangue
-    await supabase.from('djangue_wallets').insert({ group_id: group.id, balance: 0 });
-
-    // Actualizar wallet_id en el grupo
-    const { data: wallet } = await supabase
-      .from('djangue_wallets').select('id').eq('group_id', group.id).single();
-    await supabase.from('djangue_groups').update({ wallet_id: wallet.id }).eq('id', group.id);
-
-    // Agregar al owner como primer miembro (turno 1)
-    await supabase.from('djangue_members').insert({
-      group_id: group.id, user_id: userId, turn_order: 1, status: 'active',
-    });
-    await supabase.from('djangue_groups').update({ total_turns: 1 }).eq('id', group.id);
-
-    // Si hay secretario diferente al owner, agregarlo también
-    if (secretaryId && secretaryId !== userId) {
-      await supabase.from('djangue_members').insert({
-        group_id: group.id, user_id: secretaryId, turn_order: 2, status: 'active',
-      });
-      await supabase.from('djangue_groups').update({ total_turns: 2 }).eq('id', group.id);
-    }
-
-    res.status(201).json({ ...group, wallet_id: wallet.id });
+    if (error) throw error;
+    res.json({ success: true, kyc_id: data?.id });
   } catch (e) {
-    res.status(500).json({ message: e.message });
+    console.error('[KYC] draft error:', e.message);
+    res.status(500).json({ message: 'Error al guardar borrador KYC', error: e.message });
   }
 });
 
-// ── GET /api/djangue/:id — Detalle del grupo ──────────────────────
-app.get('/api/djangue/:id', auth, async (req, res) => {
+// ── POST /api/kyc/submit — envío final (paso 3, con selfie lista) ─
+app.post('/api/kyc/submit', auth, kycLimiter, async (req, res) => {
   try {
-    const userId  = req.user.id;
-    const groupId = req.params.id;
+    const userId = req.user.id;
+    const {
+      full_name, birth_date, nationality, gender,
+      address, city, occupation,
+      doc_type, doc_number, doc_expiry,
+      doc_front_url, doc_back_url, selfie_url,
+      device_info,
+    } = req.body;
 
-    const { data: group, error } = await supabase
-      .from('djangue_groups')
+    // Validaciones mínimas
+    if (!full_name?.trim())   return res.status(400).json({ message: 'Nombre completo requerido' });
+    if (!birth_date)           return res.status(400).json({ message: 'Fecha de nacimiento requerida' });
+    if (!doc_number?.trim())  return res.status(400).json({ message: 'Número de documento requerido' });
+    if (!doc_front_url)        return res.status(400).json({ message: 'Foto del documento requerida' });
+    if (!selfie_url)           return res.status(400).json({ message: 'Selfie de verificación requerida' });
+
+    if (!supabase) {
+      // Modo local: simular aprobación inmediata en entorno de desarrollo
+      return res.json({
+        success: true,
+        kyc_status: KYC_STATUS.PENDING,
+        message: 'Solicitud enviada. Revisaremos tu identidad en 24-48 horas.',
+      });
+    }
+
+    const now = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from('kyc_verifications')
+      .upsert({
+        user_id:       userId,
+        status:        KYC_DB_STATUS.SUBMITTED,
+        full_name:     full_name.trim(),
+        birth_date,
+        nationality:   nationality || 'GQ',
+        gender:        gender || null,
+        address:       address?.trim() || null,
+        city:          city?.trim() || null,
+        occupation:    occupation?.trim() || null,
+        doc_type:      doc_type || 'dni',
+        doc_number:    doc_number.trim(),
+        doc_expiry:    doc_expiry || null,
+        doc_front_url: doc_front_url || null,
+        doc_back_url:  doc_back_url || null,
+        selfie_url:    selfie_url || null,
+        device_info:   device_info || {},
+        submitted_at:  now,
+        updated_at:    now,
+      }, { onConflict: 'user_id' })
+      .select('id')
+      .maybeSingle();
+
+    if (error) throw error;
+
+    // El trigger sync_user_kyc_status actualizará users.wallet_kyc_status automáticamente
+
+    res.json({
+      success: true,
+      kyc_id: data?.id,
+      kyc_status: KYC_STATUS.PENDING,
+      message: 'Solicitud enviada correctamente. Revisaremos tu identidad en 24-48 horas hábiles.',
+    });
+  } catch (e) {
+    console.error('[KYC] submit error:', e.message);
+    res.status(500).json({ message: 'Error al enviar solicitud KYC', error: e.message });
+  }
+});
+
+// ── POST /api/kyc/upload — subir imagen de documento o selfie ─────
+// Recibe form-data con campo "file" y tipo "doc_front"|"doc_back"|"selfie"
+app.post('/api/kyc/upload', auth, kycLimiter, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Usar multer en memoria para procesar el archivo
+    const multer = (() => { try { return require('multer'); } catch { return null; } })();
+    if (!multer) {
+      return res.status(500).json({ message: 'Módulo multer no disponible en el servidor' });
+    }
+
+    const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+    upload.single('file')(req, res, async (err) => {
+      if (err) return res.status(400).json({ message: 'Error al procesar archivo', error: err.message });
+      if (!req.file) return res.status(400).json({ message: 'No se recibió ningún archivo' });
+
+      const docType   = (req.body.doc_type || 'doc_front').replace(/[^a-z_]/g, '');
+      const ext       = req.file.mimetype === 'application/pdf' ? 'pdf' : 'jpg';
+      const filePath  = `${userId}/${docType}_${Date.now()}.${ext}`;
+
+      if (!supabase) {
+        return res.json({ success: true, url: `local://${filePath}`, path: filePath });
+      }
+
+      const { data, error: upErr } = await supabase.storage
+        .from('kyc-docs')
+        .upload(filePath, req.file.buffer, {
+          contentType: req.file.mimetype,
+          upsert: true,
+        });
+
+      if (upErr) throw upErr;
+
+      // URL firmada válida por 1 año (para revisión interna)
+      const { data: signedData } = await supabase.storage
+        .from('kyc-docs')
+        .createSignedUrl(filePath, 365 * 24 * 3600);
+
+      const url = signedData?.signedUrl || data?.path || filePath;
+      res.json({ success: true, url, path: filePath });
+    });
+  } catch (e) {
+    console.error('[KYC] upload error:', e.message);
+    res.status(500).json({ message: 'Error al subir archivo KYC', error: e.message });
+  }
+});
+
+// ── GET /api/kyc/draft — recuperar borrador guardado ─────────────
+app.get('/api/kyc/draft', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    if (!supabase) return res.json({ draft: null });
+
+    const { data, error } = await supabase
+      .from('kyc_verifications')
       .select('*')
-      .eq('id', groupId)
-      .single();
-    if (error || !group) return res.status(404).json({ message: 'Djangue no encontrado' });
-
-    // Verificar que el usuario es miembro, owner o secretario
-    const { data: myMember } = await supabase
-      .from('djangue_members')
-      .select('id, turn_order')
-      .eq('group_id', groupId)
       .eq('user_id', userId)
       .maybeSingle();
 
-    if (!myMember && group.owner_id !== userId && group.secretary_id !== userId)
-      return res.status(403).json({ message: 'No eres miembro de este djangue' });
-
-    // Obtener miembros con sus usuarios y estado de pago del turno actual
-    const { data: members } = await supabase
-      .from('djangue_members')
-      .select('id, turn_order, status, user_id, joined_at')
-      .eq('group_id', groupId)
-      .eq('status', 'active')
-      .order('turn_order');
-
-    const membersWithInfo = await Promise.all((members || []).map(async (m) => {
-      const { data: user } = await supabase
-        .from('users').select('id, full_name, phone, avatar_url').eq('id', m.user_id).single();
-      const { data: contrib } = await supabase
-        .from('djangue_contributions')
-        .select('status, amount, paid_at')
-        .eq('group_id', groupId)
-        .eq('user_id', m.user_id)
-        .eq('turn_number', group.current_turn)
-        .maybeSingle();
-      return {
-        ...m,
-        user,
-        paid_current_turn: contrib?.status === 'paid',
-        contribution: contrib || null,
-        is_current_beneficiary: m.turn_order === group.current_turn,
-      };
-    }));
-
-    // Monedero del djangue
-    const { data: wallet } = await supabase
-      .from('djangue_wallets').select('balance, currency').eq('group_id', groupId).single();
-
-    // Total cotizado este turno
-    const { data: contribs } = await supabase
-      .from('djangue_contributions')
-      .select('amount, status')
-      .eq('group_id', groupId)
-      .eq('turn_number', group.current_turn);
-
-    const totalPaidThisTurn = (contribs || [])
-      .filter(c => c.status === 'paid')
-      .reduce((sum, c) => sum + Number(c.amount), 0);
-
-    const expectedTotal = group.quota_amount * (membersWithInfo.length - 1); // todos menos el beneficiario
-
-    res.json({
-      ...group,
-      members: membersWithInfo,
-      wallet,
-      my_role: group.owner_id === userId ? 'owner' : group.secretary_id === userId ? 'secretary' : 'member',
-      my_turn_order: myMember?.turn_order ?? null,
-      is_my_turn: myMember?.turn_order === group.current_turn,
-      total_paid_this_turn: totalPaidThisTurn,
-      expected_total_this_turn: expectedTotal,
-      paid_count: (contribs || []).filter(c => c.status === 'paid').length,
-      pending_count: membersWithInfo.length - (contribs || []).filter(c => c.status === 'paid').length,
-    });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── POST /api/djangue/:id/members — Agregar miembro ───────────────
-app.post('/api/djangue/:id/members', auth, async (req, res) => {
-  try {
-    const userId  = req.user.id;
-    const groupId = req.params.id;
-    const { phone } = req.body;
-
-    if (!phone) return res.status(400).json({ message: 'Teléfono requerido' });
-
-    const { data: group } = await supabase
-      .from('djangue_groups').select('*').eq('id', groupId).single();
-    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
-
-    // Solo owner o secretario pueden agregar
-    if (group.owner_id !== userId && group.secretary_id !== userId)
-      return res.status(403).json({ message: 'Solo el responsable o secretario pueden agregar miembros' });
-
-    // Buscar usuario por teléfono
-    const { data: newUser } = await supabase
-      .from('users').select('id, full_name, phone, avatar_url').eq('phone', phone).maybeSingle();
-    if (!newUser) return res.status(404).json({ message: 'Usuario no encontrado con ese teléfono' });
-
-    // Verificar que no sea ya miembro
-    const { data: existing } = await supabase
-      .from('djangue_members')
-      .select('id').eq('group_id', groupId).eq('user_id', newUser.id).maybeSingle();
-    if (existing) return res.status(409).json({ message: 'Este usuario ya es miembro del djangue' });
-
-    // Verificar capacidad
-    const { data: currentMembers } = await supabase
-      .from('djangue_members').select('id').eq('group_id', groupId).eq('status', 'active');
-    if ((currentMembers || []).length >= group.max_members)
-      return res.status(400).json({ message: `El djangue está lleno (máx. ${group.max_members} miembros)` });
-
-    const nextTurn = group.total_turns + 1;
-
-    const { data: member, error } = await supabase
-      .from('djangue_members')
-      .insert({ group_id: groupId, user_id: newUser.id, turn_order: nextTurn, status: 'active' })
-      .select().single();
     if (error) throw error;
-
-    await supabase.from('djangue_groups')
-      .update({ total_turns: nextTurn })
-      .eq('id', groupId);
-
-    res.status(201).json({ member, user: newUser });
+    res.json({ draft: data || null });
   } catch (e) {
-    res.status(500).json({ message: e.message });
+    console.error('[KYC] get-draft error:', e.message);
+    res.status(500).json({ message: 'Error al recuperar borrador', error: e.message });
   }
 });
 
-// ── POST /api/djangue/:id/pay — Pagar cuota del turno actual ──────
-app.post('/api/djangue/:id/pay', auth, async (req, res) => {
+// ── POST /api/kyc/resubmit — reintentar tras rechazo ─────────────
+app.post('/api/kyc/resubmit', auth, kycLimiter, async (req, res) => {
   try {
-    const userId  = req.user.id;
-    const groupId = req.params.id;
-
-    const { data: group } = await supabase
-      .from('djangue_groups').select('*').eq('id', groupId).single();
-    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
-    if (group.status !== 'active') return res.status(400).json({ message: 'Este djangue no está activo' });
-
-    // Verificar que es miembro
-    const { data: member } = await supabase
-      .from('djangue_members')
-      .select('id, turn_order').eq('group_id', groupId).eq('user_id', userId).eq('status', 'active').maybeSingle();
-    if (!member) return res.status(403).json({ message: 'No eres miembro de este djangue' });
-
-    // El beneficiario del turno actual no paga
-    if (member.turn_order === group.current_turn)
-      return res.status(400).json({ message: 'Es tu turno de recibir, no de pagar' });
-
-    // Verificar que no haya pagado ya
-    const { data: existing } = await supabase
-      .from('djangue_contributions')
-      .select('id, status').eq('group_id', groupId).eq('user_id', userId)
-      .eq('turn_number', group.current_turn).maybeSingle();
-    if (existing?.status === 'paid')
-      return res.status(409).json({ message: 'Ya pagaste tu cuota para este turno' });
-
-    // Verificar saldo en monedero personal
-    const { data: wallet } = await supabase
-      .from('wallets').select('id, balance').eq('user_id', userId).single();
-    if (!wallet) return res.status(404).json({ message: 'Monedero no encontrado' });
-    if (Number(wallet.balance) < Number(group.quota_amount))
-      return res.status(400).json({ message: `Saldo insuficiente. Necesitas ${group.quota_amount} XAF` });
-
-    // Monedero del djangue
-    const { data: djangueWallet } = await supabase
-      .from('djangue_wallets').select('id, balance').eq('group_id', groupId).single();
-
-    // Descontar del monedero personal
-    await supabase.from('wallets')
-      .update({ balance: Number(wallet.balance) - Number(group.quota_amount) })
-      .eq('id', wallet.id);
-
-    // Agregar al monedero del djangue
-    await supabase.from('djangue_wallets')
-      .update({ balance: Number(djangueWallet.balance) + Number(group.quota_amount) })
-      .eq('id', djangueWallet.id);
-
-    // Registrar transacción en historial general
-    const { data: tx } = await supabase.from('transactions').insert({
-      user_id: userId,
-      type: 'djangue_contribution',
-      amount: -Number(group.quota_amount),
-      currency: group.currency,
-      description: `Cuota djangue "${group.name}" — Turno ${group.current_turn}`,
-      status: 'completed',
-    }).select('id').single();
-
-    // Registrar contribución
-    const { data: contrib, error: cErr } = await supabase
-      .from('djangue_contributions')
-      .upsert({
-        group_id: groupId,
-        member_id: member.id,
-        user_id: userId,
-        turn_number: group.current_turn,
-        amount: group.quota_amount,
-        status: 'paid',
-        paid_at: new Date().toISOString(),
-        transaction_id: tx?.id,
-      }, { onConflict: 'group_id,member_id,turn_number' })
-      .select().single();
-    if (cErr) throw cErr;
-
-    // Verificar si todos pagaron → ejecutar payout automático
-    const { data: allMembers } = await supabase
-      .from('djangue_members').select('id, turn_order, user_id')
-      .eq('group_id', groupId).eq('status', 'active');
-
-    const nonBeneficiaries = (allMembers || []).filter(m => m.turn_order !== group.current_turn);
-
-    const { data: paidContribs } = await supabase
-      .from('djangue_contributions')
-      .select('user_id').eq('group_id', groupId)
-      .eq('turn_number', group.current_turn).eq('status', 'paid');
-
-    const allPaid = paidContribs?.length >= nonBeneficiaries.length;
-
-    if (allPaid) {
-      // Encontrar beneficiario
-      const beneficiary = (allMembers || []).find(m => m.turn_order === group.current_turn);
-      if (beneficiary) {
-        const payoutAmount = Number(djangueWallet.balance) + Number(group.quota_amount); // incluye este pago
-
-        // Transferir al monedero del beneficiario
-        const { data: benWallet } = await supabase
-          .from('wallets').select('id, balance').eq('user_id', beneficiary.user_id).single();
-
-        if (benWallet) {
-          await supabase.from('wallets')
-            .update({ balance: Number(benWallet.balance) + payoutAmount })
-            .eq('id', benWallet.id);
-
-          // Vaciar monedero del djangue
-          await supabase.from('djangue_wallets').update({ balance: 0 }).eq('group_id', groupId);
-
-          // Registrar payout
-          await supabase.from('djangue_payouts').insert({
-            group_id: groupId, beneficiary_id: beneficiary.user_id,
-            turn_number: group.current_turn, amount: payoutAmount,
-            status: 'completed', paid_at: new Date().toISOString(),
-          });
-
-          // Registrar transacción para el beneficiario
-          await supabase.from('transactions').insert({
-            user_id: beneficiary.user_id,
-            type: 'djangue_payout',
-            amount: payoutAmount,
-            currency: group.currency,
-            description: `Turno ${group.current_turn} djangue "${group.name}"`,
-            status: 'completed',
-          });
-
-          // Avanzar turno
-          const nextTurn = group.current_turn + 1;
-          const isCompleted = nextTurn > (allMembers || []).length;
-
-          await supabase.from('djangue_groups').update({
-            current_turn: isCompleted ? group.current_turn : nextTurn,
-            status: isCompleted ? 'completed' : 'active',
-            next_payout_at: isCompleted ? null : calcNextPayoutDate(group.frequency),
-          }).eq('id', groupId);
-
-          // Notificar al nuevo beneficiario (si hay siguiente turno)
-          if (!isCompleted) {
-            const nextBeneficiary = (allMembers || []).find(m => m.turn_order === nextTurn);
-            if (nextBeneficiary) {
-              // Enviar notificación push (función definida más abajo en el archivo)
-              try {
-                await sendPushToUser(
-                  nextBeneficiary.user_id,
-                  '🎉 ¡Es tu turno en Mi Djangue!',
-                  `Este turno te toca recibir en "${group.name}". Espera a que todos paguen.`,
-                  { type: 'djangue_turn', group_id: groupId, turn: nextTurn }
-                );
-              } catch (pushErr) {
-                console.error('Error sending push notification:', pushErr);
-                // No bloqueamos el pago si falla la notificación
-              }
-            }
-          }
-        }
-      }
-    }
-
-    res.json({
-      ok: true,
-      contribution: contrib,
-      all_paid: allPaid,
-      new_balance: Number(wallet.balance) - Number(group.quota_amount),
-      message: allPaid
-        ? `¡Todos pagaron! El beneficiario recibió el fondo del turno ${group.current_turn}.`
-        : `Cuota pagada correctamente (${group.quota_amount} ${group.currency})`,
-    });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── POST /api/djangue/:id/manual-payout — Pago manual al beneficiario (admin/secretario) ──
-app.post('/api/djangue/:id/manual-payout', auth, async (req, res) => {
-  try {
-    const userId  = req.user.id;
-    const groupId = req.params.id;
-
-    const { data: group } = await supabase
-      .from('djangue_groups').select('*').eq('id', groupId).single();
-    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
-
-    // Solo admin o secretario pueden forzar payout
-    const { data: me } = await supabase
-      .from('djangue_members').select('role').eq('group_id', groupId).eq('user_id', userId).eq('status', 'active').maybeSingle();
-    if (!me || !['owner', 'secretary'].includes(me.role))
-      return res.status(403).json({ message: 'Solo el administrador o secretario puede ejecutar el pago' });
-
-    // Encontrar beneficiario del turno actual
-    const { data: beneficiaryMember } = await supabase
-      .from('djangue_members').select('user_id').eq('group_id', groupId)
-      .eq('turn_order', group.current_turn).eq('status', 'active').maybeSingle();
-    if (!beneficiaryMember) return res.status(400).json({ message: 'No se encontró el beneficiario del turno actual' });
-
-    // Saldo del monedero del djangue
-    const { data: djangueWallet } = await supabase
-      .from('djangue_wallets').select('id, balance').eq('group_id', groupId).single();
-    if (!djangueWallet || Number(djangueWallet.balance) <= 0)
-      return res.status(400).json({ message: 'El monedero del djangue está vacío' });
-
-    const payoutAmount = Number(djangueWallet.balance);
-
-    // Transferir al beneficiario
-    const { data: benWallet } = await supabase
-      .from('wallets').select('id, balance').eq('user_id', beneficiaryMember.user_id).single();
-    if (!benWallet) return res.status(404).json({ message: 'Monedero del beneficiario no encontrado' });
-
-    await supabase.from('wallets')
-      .update({ balance: Number(benWallet.balance) + payoutAmount })
-      .eq('id', benWallet.id);
-
-    // Vaciar monedero djangue
-    await supabase.from('djangue_wallets').update({ balance: 0 }).eq('group_id', groupId);
-
-    // Registrar payout
-    await supabase.from('djangue_payouts').insert({
-      group_id: groupId, beneficiary_id: beneficiaryMember.user_id,
-      turn_number: group.current_turn, amount: payoutAmount,
-      status: 'completed', paid_at: new Date().toISOString(),
-    });
-
-    // Registrar transacción
-    await supabase.from('transactions').insert({
-      user_id: beneficiaryMember.user_id,
-      type: 'djangue_payout',
-      amount: payoutAmount,
-      currency: group.currency,
-      description: `Pago manual turno ${group.current_turn} — "${group.name}"`,
-      status: 'completed',
-    });
-
-    res.json({ ok: true, amount: payoutAmount, beneficiary_id: beneficiaryMember.user_id });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── POST /api/djangue/:id/advance-turn — Avanzar al siguiente turno ──────────
-app.post('/api/djangue/:id/advance-turn', auth, async (req, res) => {
-  try {
-    const groupId = req.params.id;
     const userId = req.user.id;
+    if (!supabase) return res.json({ success: true });
 
-    const { data: group } = await supabase
-      .from('djangue_groups').select('*').eq('id', groupId).single();
-    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
+    // Verificar que el estado sea "rejected" para poder reintentar
+    const { data: existing } = await supabase
+      .from('kyc_verifications')
+      .select('status')
+      .eq('user_id', userId)
+      .maybeSingle();
 
-    // Solo owner o secretary
-    const { data: me } = await supabase
-      .from('djangue_members').select('role').eq('group_id', groupId).eq('user_id', userId).eq('status', 'active').maybeSingle();
-    if (!me || !['owner', 'secretary'].includes(me.role))
-      return res.status(403).json({ message: 'Solo el administrador o secretario puede avanzar el turno' });
-
-    const { data: members } = await supabase
-      .from('djangue_members').select('id, user_id, turn_order').eq('group_id', groupId).eq('status', 'active');
-    const totalMembers = members?.length || 1;
-    const nextTurn = (group.current_turn % totalMembers) + 1;
-
-    // Calcular próxima fecha según frecuencia
-    const now = new Date();
-    let nextDate = new Date(now);
-    if (group.frequency === 'weekly')       nextDate.setDate(now.getDate() + 7);
-    else if (group.frequency === 'biweekly') nextDate.setDate(now.getDate() + 14);
-    else                                      nextDate.setMonth(now.getMonth() + 1);
-
-    await supabase.from('djangue_groups').update({
-      current_turn: nextTurn,
-      period_end_date: nextDate.toISOString(),
-    }).eq('id', groupId);
-
-    // Notificar al nuevo beneficiario
-    const newBeneficiary = members?.find(m => m.turn_order === nextTurn);
-    if (newBeneficiary) {
-      await supabase.from('djangue_notifications').insert({
-        group_id: groupId,
-        user_id: newBeneficiary.user_id,
-        type: 'your_turn',
-        message: `🎉 ¡Es tu turno! Recibirás el pote del djangue "${group.name}" al finalizar el período.`,
-        sent: false,
-        created_at: now.toISOString(),
+    if (existing && existing.status !== KYC_DB_STATUS.REJECTED) {
+      return res.status(400).json({
+        message: `No puedes reintentar en estado: ${existing.status}`,
       });
     }
 
-    res.json({ ok: true, new_turn: nextTurn, period_end_date: nextDate.toISOString() });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── GET /api/djangue/:id/contributions — Ver quién ha pagado ──────
-app.get('/api/djangue/:id/contributions', auth, async (req, res) => {
-  try {
-    const userId  = req.user.id;
-    const groupId = req.params.id;
-
-    const { data: group } = await supabase
-      .from('djangue_groups').select('*').eq('id', groupId).single();
-    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
-
-    // Verificar acceso
-    const { data: member } = await supabase
-      .from('djangue_members').select('id').eq('group_id', groupId).eq('user_id', userId).maybeSingle();
-    if (!member && group.owner_id !== userId && group.secretary_id !== userId)
-      return res.status(403).json({ message: 'Sin acceso' });
-
-    const turnNumber = req.query.turn ? Number(req.query.turn) : group.current_turn;
-
-    const { data: contribs } = await supabase
-      .from('djangue_contributions')
-      .select('*, users(full_name, phone, avatar_url)')
-      .eq('group_id', groupId)
-      .eq('turn_number', turnNumber)
-      .order('paid_at', { ascending: false });
-
-    res.json({ turn_number: turnNumber, contributions: contribs || [] });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── DELETE /api/djangue/:id — Cancelar djangue (solo owner) ───────
-app.delete('/api/djangue/:id', auth, async (req, res) => {
-  try {
-    const userId  = req.user.id;
-    const groupId = req.params.id;
-
-    const { data: group } = await supabase
-      .from('djangue_groups').select('owner_id').eq('id', groupId).single();
-    if (!group) return res.status(404).json({ message: 'Djangue no encontrado' });
-    if (group.owner_id !== userId) return res.status(403).json({ message: 'Solo el responsable puede cancelar' });
-
-    await supabase.from('djangue_groups').update({ status: 'cancelled' }).eq('id', groupId);
-    res.json({ ok: true, message: 'Djangue cancelado' });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── POST /api/push/register — Registrar token push ────────────────
-app.post('/api/push/register', auth, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { token } = req.body;
-
-    if (!token || !Expo.isExpoPushToken(token)) {
-      return res.status(400).json({ message: 'Token Expo Push inválido' });
-    }
-
-    // Insertar o actualizar token
-    await supabase.from('expo_push_tokens').upsert({
-      user_id: userId,
-      token,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'user_id,token' });
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ── POST /api/push/register-expo-token — Alias para compatibilidad ─
-app.post('/api/push/register-expo-token', auth, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { expoPushToken, platform, tokenType } = req.body;
-    const token = expoPushToken || req.body.token;
-
-    if (!token || typeof token !== 'string' || token.length < 10) {
-      return res.status(400).json({ message: 'Token push inválido' });
-    }
-
-    const resolvedPlatform = platform || 'android';
-    const isExpoToken = token.startsWith('ExponentPushToken');
-    const resolvedType = tokenType || (isExpoToken ? 'expo' : resolvedPlatform === 'ios' ? 'apns' : 'fcm');
-
-    // Para iOS: mantener AMBOS tokens (ExponentPushToken Y APNs nativo)
-    // El APNs nativo permite mutable-content para fotos en notificaciones
-    if (resolvedPlatform === 'ios' && !isExpoToken) {
-      // Token APNs nativo — guardar sin borrar el ExponentPushToken
-      await supabase.from('expo_push_tokens').upsert({
-        user_id: userId,
-        token,
-        platform: 'ios',
+    // Resetear a draft para que pueda volver a rellenar
+    await supabase
+      .from('kyc_verifications')
+      .update({
+        status: KYC_DB_STATUS.DRAFT,
+        rejection_reason: null,
+        reviewer_notes: null,
+        submitted_at: null,
+        reviewed_at: null,
         updated_at: new Date().toISOString(),
-      }, { onConflict: 'token' });
-      console.log(`[Push] Token APNs nativo registrado para user ${userId}: ...${token.slice(-8)}`);
-    } else {
-      // ExponentPushToken o token Android
-      await supabase.from('expo_push_tokens').upsert({
-        user_id: userId,
-        token,
-        platform: resolvedPlatform,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'token' });
-      console.log(`[Push] Token registrado (${resolvedType}/${resolvedPlatform}) para user ${userId}: ...${token.slice(-8)}`);
+      })
+      .eq('user_id', userId);
+
+    res.json({ success: true, message: 'Puedes enviar una nueva solicitud KYC' });
+  } catch (e) {
+    console.error('[KYC] resubmit error:', e.message);
+    res.status(500).json({ message: 'Error al reiniciar KYC', error: e.message });
+  }
+});
+
+// ── [ADMIN/BANCO] POST /api/kyc/review — aprobar o rechazar ──────
+// Solo accesible por revisores autorizados (rol admin en JWT o tabla)
+app.post('/api/kyc/review', requireAdmin, async (req, res) => {
+  try {
+    const reviewerId = req.admin.id;
+    const { kyc_id, decision, rejection_reason, notes } = req.body;
+
+    if (!kyc_id)   return res.status(400).json({ message: 'kyc_id requerido' });
+    if (!decision) return res.status(400).json({ message: 'decision requerida (approved|rejected|suspended)' });
+    if (!['approved','rejected','suspended'].includes(decision)) {
+      return res.status(400).json({ message: 'decision debe ser: approved, rejected o suspended' });
+    }
+    if (decision === 'rejected' && !rejection_reason?.trim()) {
+      return res.status(400).json({ message: 'rejection_reason requerida al rechazar' });
     }
 
-    res.json({ ok: true, message: 'Token registrado', tokenType: resolvedType });
+    if (!supabase) return res.json({ success: true, message: 'Revisión aplicada (modo local)' });
+
+    const now = new Date().toISOString();
+    const { error } = await supabase
+      .from('kyc_verifications')
+      .update({
+        status:           decision,
+        rejection_reason: decision === 'rejected' ? rejection_reason : null,
+        reviewer_notes:   notes || null,
+        reviewer_id:      reviewerId,
+        reviewed_at:      now,
+        updated_at:       now,
+      })
+      .eq('id', kyc_id);
+
+    if (error) throw error;
+    // El trigger sync_user_kyc_status se encarga de actualizar users y el historial
+
+    res.json({ success: true, message: `KYC marcado como ${decision}` });
   } catch (e) {
-    res.status(500).json({ message: e.message });
+    console.error('[KYC] review error:', e.message);
+    res.status(500).json({ message: 'Error al revisar KYC', error: e.message });
+  }
+});
+
+// ── [ADMIN] GET /api/kyc/pending — lista KYC pendientes ──────────
+app.get('/api/kyc/pending', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.json({ verifications: [] });
+
+    const { data, error } = await supabase
+      .from('kyc_verifications')
+      .select(`
+        id, status, submitted_at, full_name, doc_type, doc_number,
+        doc_front_url, doc_back_url, selfie_url, risk_level,
+        users:user_id (id, phone, full_name, avatar_url)
+      `)
+      .in('status', [KYC_DB_STATUS.SUBMITTED, KYC_DB_STATUS.UNDER_REVIEW])
+      .order('submitted_at', { ascending: true })
+      .limit(100);
+
+    if (error) throw error;
+    res.json({ verifications: data || [] });
+  } catch (e) {
+    console.error('[KYC] pending list error:', e.message);
+    res.status(500).json({ message: 'Error al obtener KYC pendientes', error: e.message });
   }
 });
 
 // ══════════════════════════════════════════════════════════════════
-// VoIP PUSH (APNs PushKit) — Llamadas iOS con app cerrada
+// FIN KYC
 // ══════════════════════════════════════════════════════════════════
 
-const https = require('https');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-
-// ── Generar JWT para APNs ─────────────────────────────────────────
-let _apnsJwt = null;
-let _apnsJwtTs = 0;
-
-function getApnsJwt() {
-  const now = Math.floor(Date.now() / 1000);
-  // Reusar JWT si tiene menos de 45 minutos (Apple requiere < 60min)
-  if (_apnsJwt && (now - _apnsJwtTs) < 45 * 60) return _apnsJwt;
-
-  const APNS_KEY_ID  = process.env.APNS_KEY_ID  || 'RCYN4AG5PM';
-  const APNS_TEAM_ID = process.env.APNS_TEAM_ID || 'XU6YD7ZJ2K';
-  const APNS_KEY_PATH = process.env.APNS_KEY_PATH || '/etc/secrets/AuthKey_RCYN4AG5PM.p8';
-
-  let privateKey;
-  try {
-    // En Render: montar el .p8 como secret file en /etc/secrets/
-    privateKey = fs.readFileSync(APNS_KEY_PATH, 'utf8');
-  } catch (e) {
-    // Fallback: variable de entorno con contenido del .p8
-    privateKey = process.env.APNS_PRIVATE_KEY || '';
-    if (!privateKey) {
-      console.error('[APNs] No se encontró la clave privada APNs. Configura APNS_PRIVATE_KEY en Render.');
-      return null;
-    }
-  }
-
-  const header  = Buffer.from(JSON.stringify({ alg: 'ES256', kid: APNS_KEY_ID })).toString('base64url');
-  const payload = Buffer.from(JSON.stringify({ iss: APNS_TEAM_ID, iat: now })).toString('base64url');
-  const sigInput = `${header}.${payload}`;
-
-  const sign = crypto.createSign('SHA256');
-  sign.update(sigInput);
-  const sig = sign.sign({ key: privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url');
-
-  _apnsJwt = `${sigInput}.${sig}`;
-  _apnsJwtTs = now;
-  return _apnsJwt;
-}
-
-// ── Enviar VoIP push via APNs HTTP/2 ─────────────────────────────
-async function sendVoipPush({ deviceToken, payload }) {
-  return new Promise((resolve, reject) => {
-    const jwt = getApnsJwt();
-    if (!jwt) return reject(new Error('APNs JWT no disponible'));
-
-    const BUNDLE_ID = process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat';
-    const body = JSON.stringify(payload);
-
-    // APNs requiere HTTP/2 — usar http2 nativo de Node.js
-    const http2 = require('http2');
-    const client = http2.connect('https://api.push.apple.com');
-    client.on('error', (err) => { client.destroy(); reject(err); });
-
-    const req = client.request({
-      ':method': 'POST',
-      ':path': `/3/device/${deviceToken}`,
-      ':scheme': 'https',
-      ':authority': 'api.push.apple.com',
-      'authorization': `bearer ${jwt}`,
-      'apns-push-type': 'voip',
-      'apns-topic': `${BUNDLE_ID}.voip`,
-      'apns-priority': '10',
-      'apns-expiration': String(Math.floor(Date.now() / 1000) + 30),
-      'content-type': 'application/json',
-      'content-length': Buffer.byteLength(body),
-    });
-
-    let status = 0;
-    let data = '';
-    req.on(':response', (hdrs) => { status = hdrs[':status']; });
-    req.on('data', chunk => { data += chunk; });
-    req.on('end', () => {
-      client.close();
-      if (status === 200) {
-        resolve({ ok: true });
-      } else {
-        try { reject(new Error(`APNs ${status}: ${JSON.parse(data).reason}`)); }
-        catch { reject(new Error(`APNs ${status}: ${data}`)); }
-      }
-    });
-    req.on('error', err => { client.destroy(); reject(err); });
-    req.setTimeout(10000, () => { client.destroy(); reject(new Error('APNs timeout')); });
-    req.write(body);
-    req.end();
-  });
-}
-
-// ── POST /api/push/register-voip-token ───────────────────────────
-// La app iOS registra su token PushKit aquí al arrancar
-app.post('/api/push/register-voip-token', auth, async (req, res) => {
-  try {
-    const { voipToken } = req.body;
-    if (!voipToken || typeof voipToken !== 'string') {
-      return res.status(400).json({ message: 'voipToken requerido' });
-    }
-    await supabase.from('voip_push_tokens').upsert({
-      user_id: req.user.id,
-      token: voipToken,
-      platform: 'ios',
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'user_id' });
-    console.log(`[VoIP] Token registrado para user ${req.user.id}: ...${voipToken.slice(-8)}`);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[VoIP] register-voip-token error:', e.message);
-    res.status(500).json({ message: e.message });
-  }
+// ══════════════════════════════════════════════════════════════════
+// Canales sin teléfono inteligente (USSD / SMS / IVR)
+// ══════════════════════════════════════════════════════════════════
+// El menú de marcación lee y mueve dinero por la misma primitiva que la app —
+// sendP2PByKind() termina en ledger_post_kind(), la plantilla de asiento que
+// vive dentro de la base de datos—, así que no existe un segundo monedero ni
+// una contabilidad aparte para los teléfonos básicos. Sin operadora firmada,
+// egpayChannelInfo.has_real_channel es false y la app no puede prometer menús
+// USSD reales: sólo funciona el canal de pruebas.
+const { buildChannelRegistry } = require('./egpay-channel-providers');
+const egpayChannelInfo = buildChannelRegistry({ env: process.env, log: console });
+const egpayChannels = require('./egpay-channels')({
+  supabase,
+  money: {
+    sendP2P: sendP2PByKind,
+    balanceOf: readWalletBalance,
+  },
+  resolveUser: async (phone) => findUserByRef(phone),
+  // Se valida contra el hash del usuario y no se guarda: la sesión sólo
+  // recuerda que se superó, nunca el número tecleado.
+  verifyPin: async (userId, pin) => checkPinForOperation(userId, pin),
+  applyRechargeCode: async ({ userId, code }) => redeemRechargeCode({ userId, code }),
+  log: console,
+  sessionTtlMinutes: Number(process.env.CHANNEL_SESSION_TTL_MINUTES || 10),
+  maxPinAttempts: Number(process.env.CHANNEL_MAX_PIN_ATTEMPTS || 3),
+  maxPerPayment: Number(process.env.CHANNEL_MAX_PAYMENT || 250000),
+  maxDaily: Number(process.env.CHANNEL_MAX_DAILY || 500000),
 });
 
-// ── POST /api/push/voip-call ──────────────────────────────────────
-// Envía VoIP push a un usuario específico (usado internamente y desde mobile)
-app.post('/api/push/voip-call', auth, async (req, res) => {
-  try {
-    const { targetUserId, callId, callerName, callerAvatar, callType, offer } = req.body;
-    if (!targetUserId || !callId) {
-      return res.status(400).json({ message: 'targetUserId y callId requeridos' });
-    }
-    const result = await sendVoipPushToUser({
-      targetUserId, callId, callerName, callerAvatar, callType, offer,
-    });
-    res.json(result);
-  } catch (e) {
-    console.error('[VoIP] voip-call error:', e.message);
-    res.status(500).json({ message: e.message });
-  }
+const egpayChannelRoutes = require('./egpayChannelRoutes')({
+  express,
+  supabase,
+  requireAdmin,
+  auth,
+  channels: egpayChannels,
+  channelInfo: egpayChannelInfo,
+  log: console,
 });
+app.use('/api/egpay/channel', egpayChannelRoutes.gateway);
+app.use('/api/wallet', egpayChannelRoutes.user);
+app.use('/api/egpay', egpayChannelRoutes.admin);
 
-// ── Helper: enviar VoIP push a un usuario ────────────────────────
-async function sendVoipPushToUser({ targetUserId, callId, callerName, callerAvatar, callType, offer }) {
-  const { data: tokens } = await supabase
-    .from('voip_push_tokens')
-    .select('token')
-    .eq('user_id', targetUserId);
-
-  if (!tokens || tokens.length === 0) {
-    console.log(`[VoIP] Sin token VoIP para user ${targetUserId} — usando Expo push como fallback`);
-    return { voipPushSent: false, expoPushSent: false };
-  }
-
-  const voipPayload = {
-    aps: {
-      'content-available': 1,
-    },
-    callId,
-    callerName: callerName || 'EGChat',
-    callerAvatar: callerAvatar || '',
-    callType: callType || 'audio',
-    offer: offer ? JSON.stringify(offer) : null,
-    targetUserId,
-  };
-
-  const results = await Promise.allSettled(
-    tokens.map(({ token }) => sendVoipPush({ deviceToken: token, payload: voipPayload }))
-  );
-
-  const sent = results.filter(r => r.status === 'fulfilled').length;
-  const failed = results.filter(r => r.status === 'rejected');
-  if (failed.length > 0) {
-    failed.forEach(f => console.warn('[VoIP] Push failed:', f.reason?.message));
-  }
-
-  console.log(`[VoIP] Sent ${sent}/${tokens.length} VoIP pushes para user ${targetUserId}`);
-  return { voipPushSent: sent > 0, expoPushSent: false };
+// Las sesiones caducadas se devuelven al menú en lote: una cola marcada a
+// medias no mueve dinero, pero impediría empezar un recorrido nuevo.
+if (supabase) {
+  setInterval(() => {
+    egpayChannels.closeStale().catch((e) => console.error('[CANAL] cierre de sesiones:', e.message));
+  }, 5 * 60 * 1000).unref();
 }
 
 module.exports = app;
-
-// force rebuild Mon Oct 19 11:09:02 WAT 2026
-// force deploy Thu Oct 22 12:16:01 WAT 2026
