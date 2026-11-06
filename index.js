@@ -1512,7 +1512,9 @@ app.get('/api/chats', auth, async (req, res) => {
       participants: participantsByChat[chat.id] || [],
       last_message: lastMessageByChat[chat.id] || null,
       updated_at: chat.updated_at,
-      unread_count: unreadByChat[chat.id] ?? 0
+      unread_count: unreadByChat[chat.id] ?? 0,
+      broadcast_mode: !!chat.broadcast_mode,
+      ephemeral_seconds: Number(chat.ephemeral_seconds || 0)
     }));
 
     res.json(result);
@@ -1546,9 +1548,20 @@ app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
 
     if (!part) return res.status(403).json({ message: 'No tienes acceso a este chat' });
 
+    // El plazo de autodestruccion vive en el chat: se aplica al leer, asi que
+    // vale para todos y no solo para el que lo configuro en su telefono.
+    // select('*') y no la columna suelta: si el codigo sale antes que el SQL,
+    // la pantalla de mensajes no se queda vacia esperando la migracion.
+    const { data: chatEfimero } = await supabase
+      .from('chats')
+      .select('*')
+      .eq('id', chatId)
+      .maybeSingle();
+    const segundosEfimeros = Number(chatEfimero?.ephemeral_seconds || 0);
+
     const { data: messages } = await supabase
       .from('messages')
-      .select('id, text, type, created_at, sender_id, status, reply_to, file_url')
+      .select('*')
       .eq('chat_id', chatId)
       .order('created_at', { ascending: false })
       .range(from, from + limit - 1);
@@ -1560,7 +1573,12 @@ app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
       .eq('user_id', req.user.id);
 
     const deletedIds = new Set((deletions || []).map((d) => d.message_id));
-    const filtered = (messages || []).filter(m => !deletedIds.has(m.id));
+    const limiteEfimero = segundosEfimeros > 0 ? Date.now() - segundosEfimeros * 1000 : null;
+    const filtered = (messages || []).filter(m => {
+      if (deletedIds.has(m.id)) return false;
+      if (limiteEfimero && new Date(m.created_at).getTime() < limiteEfimero) return false;
+      return true;
+    });
 
     // Obtener info de senders en consulta separada (más robusto que FK join)
     const senderIds = [...new Set(filtered.map(m => m.sender_id).filter(Boolean))];
@@ -1575,6 +1593,7 @@ app.get('/api/chats/:chatId/messages', auth, async (req, res) => {
       const senderUser = sendersById[String(m.sender_id)] || {};
       return {
         ...m,
+        edited: !!m.edited_at,
         sender: senderUser?.id ? {
           id: senderUser.id,
           full_name: senderUser.full_name || '',
@@ -7688,6 +7707,544 @@ app.get('/api/chats/:chatId/wallpaper', auth, async (req, res) => {
     res.json(data);
   } catch (e) {
     console.error('Get wallpaper error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// GRUPOS: salir, expulsar, ascender, ajustes y enlace de invitacion
+// ════════════════════════════════════════════════════════════════════
+// La app ya llamaba a estas rutas y ninguna existia. `fetch` no lanza con un
+// 404, asi que la pantalla daba por hecho lo que el servidor nunca hizo:
+// decia «has salido del grupo» sin salir, «admin asignado» sin asignar.
+const participacionEnChat = async (chatId, userId) => {
+  const { data } = await supabase
+    .from('chat_participants')
+    .select('id, role')
+    .eq('chat_id', chatId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  return data || null;
+};
+
+const esAdminDeChat = async (chatId, userId) => {
+  const part = await participacionEnChat(chatId, userId);
+  if (!part) return false;
+  if (part.role === 'admin') return true;
+  const { data: chat } = await supabase.from('chats').select('created_by').eq('id', chatId).maybeSingle();
+  return !!chat && String(chat.created_by) === String(userId);
+};
+
+// El cliente manda PATCH para renombrar; el servidor solo tenia PUT.
+app.patch('/api/chats/:chatId', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { name, avatar_url } = req.body || {};
+
+    if (!(await esAdminDeChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'Solo un administrador puede editar el grupo' });
+    }
+
+    const { data: chat } = await supabase
+      .from('chats')
+      .select('id, type')
+      .eq('id', chatId)
+      .maybeSingle();
+    if (!chat) return res.status(404).json({ message: 'Chat no encontrado' });
+    if (chat.type !== 'group') return res.status(400).json({ message: 'Solo se pueden editar grupos' });
+
+    const updates = { updated_at: new Date().toISOString() };
+    if (typeof name === 'string' && name.trim() !== '') updates.name = name.trim();
+    if (typeof avatar_url === 'string' && avatar_url !== '') updates.avatar_url = avatar_url;
+    if (Object.keys(updates).length === 1) {
+      return res.status(400).json({ message: 'Nada que actualizar' });
+    }
+
+    const { data: updated, error } = await supabase
+      .from('chats')
+      .update(updates)
+      .eq('id', chatId)
+      .select()
+      .single();
+    if (error) throw error;
+
+    res.json({ message: 'Grupo actualizado', chat: updated });
+  } catch (e) {
+    console.error('Patch group error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Salir de un grupo: se borra mi participacion, no el grupo ni los mensajes
+// de los demas. Si era el ultimo, el chat se queda sin nadie y se borra.
+app.post('/api/chats/:chatId/leave', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    const mia = await participacionEnChat(chatId, req.user.id);
+    if (!mia) return res.status(404).json({ message: 'No participas en este chat' });
+
+    const { error } = await supabase
+      .from('chat_participants')
+      .delete()
+      .eq('chat_id', chatId)
+      .eq('user_id', req.user.id);
+    if (error) throw error;
+
+    await supabase.from('message_reads').delete().eq('chat_id', chatId).eq('user_id', req.user.id);
+
+    const { data: quedan } = await supabase
+      .from('chat_participants')
+      .select('id')
+      .eq('chat_id', chatId);
+
+    let chatBorrado = false;
+    if (!quedan || quedan.length === 0) {
+      // La tabla messages no declara FK a chats: si se borra el chat a secas,
+      // los mensajes quedan huerfanos y nadie puede leerlos. Se limpian antes.
+      await supabase.from('messages').delete().eq('chat_id', chatId);
+      const { error: delErr } = await supabase.from('chats').delete().eq('id', chatId);
+      chatBorrado = !delErr;
+    }
+
+    res.json({ message: 'Has salido del grupo', left: true, chat_deleted: chatBorrado });
+  } catch (e) {
+    console.error('Leave chat error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Expulsar a un miembro: solo un administrador o el creador, y nunca al creador.
+app.delete('/api/chats/:chatId/participants/:userId', auth, async (req, res) => {
+  try {
+    const { chatId, userId } = req.params;
+
+    if (!(await esAdminDeChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'Solo un administrador puede expulsar' });
+    }
+    if (String(userId) === String(req.user.id)) {
+      return res.status(400).json({ message: 'Para irte usa salir del grupo' });
+    }
+
+    const { data: chat } = await supabase.from('chats').select('created_by').eq('id', chatId).maybeSingle();
+    if (chat && String(chat.created_by) === String(userId)) {
+      return res.status(400).json({ message: 'No se puede expulsar al creador del grupo' });
+    }
+
+    const { data: borrado, error } = await supabase
+      .from('chat_participants')
+      .delete()
+      .eq('chat_id', chatId)
+      .eq('user_id', userId)
+      .select('id')
+      .maybeSingle();
+    if (error) throw error;
+    if (!borrado) return res.status(404).json({ message: 'Ese usuario no esta en el grupo' });
+
+    await supabase.from('message_reads').delete().eq('chat_id', chatId).eq('user_id', userId);
+
+    res.json({ message: 'Participante eliminado', removed: true });
+  } catch (e) {
+    console.error('Remove participant error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Cambiar el rol de un miembro. El creador no se toca desde aqui.
+app.patch('/api/chats/:chatId/participants/:userId/role', auth, async (req, res) => {
+  try {
+    const { chatId, userId } = req.params;
+    const role = String(req.body?.role || '').trim();
+
+    if (role !== 'admin' && role !== 'member') {
+      return res.status(400).json({ message: 'Rol no valido' });
+    }
+    if (!(await esAdminDeChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'Solo un administrador puede cambiar roles' });
+    }
+
+    const { data: chat } = await supabase.from('chats').select('created_by').eq('id', chatId).maybeSingle();
+    if (chat && String(chat.created_by) === String(userId)) {
+      return res.status(400).json({ message: 'El creador del grupo siempre es administrador' });
+    }
+
+    const { data: actualizado, error } = await supabase
+      .from('chat_participants')
+      .update({ role })
+      .eq('chat_id', chatId)
+      .eq('user_id', userId)
+      .select('id, role')
+      .maybeSingle();
+    if (error) throw error;
+    if (!actualizado) return res.status(404).json({ message: 'Ese usuario no esta en el grupo' });
+
+    res.json({ message: 'Rol actualizado', role: actualizado.role });
+  } catch (e) {
+    console.error('Change role error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Ajustes del grupo. Hoy solo el modo difusion, que es lo que ofrece la app.
+app.patch('/api/chats/:chatId/settings', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    if (!(await esAdminDeChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'Solo un administrador puede cambiar los ajustes' });
+    }
+
+    const updates = { updated_at: new Date().toISOString() };
+    if (typeof req.body?.broadcast_mode === 'boolean') updates.broadcast_mode = req.body.broadcast_mode;
+    if (Object.keys(updates).length === 1) {
+      return res.status(400).json({ message: 'Nada que actualizar' });
+    }
+
+    const { data: actualizado, error } = await supabase
+      .from('chats')
+      .update(updates)
+      .eq('id', chatId)
+      .select('broadcast_mode')
+      .maybeSingle();
+    if (error) throw error;
+    if (!actualizado) return res.status(404).json({ message: 'Chat no encontrado' });
+
+    res.json({ message: 'Ajustes guardados', broadcast_mode: !!actualizado.broadcast_mode });
+  } catch (e) {
+    console.error('Chat settings error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Enlace de invitacion: el token vive en el chat y no caduca hasta que se
+// cambie. La entrada la da POST /api/chats/join.
+app.post('/api/chats/:chatId/invite-link', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    if (!(await participacionEnChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'No participas en este chat' });
+    }
+
+    let { data: chat } = await supabase
+      .from('chats')
+      .select('id, invite_token')
+      .eq('id', chatId)
+      .maybeSingle();
+    if (!chat) return res.status(404).json({ message: 'Chat no encontrado' });
+
+    if (!chat.invite_token) {
+      const token = require('crypto').randomBytes(12).toString('hex');
+      const { data: guardado, error } = await supabase
+        .from('chats')
+        .update({ invite_token: token })
+        .eq('id', chatId)
+        .select('invite_token')
+        .maybeSingle();
+      if (error) throw error;
+      chat = { ...chat, invite_token: guardado?.invite_token || token };
+    }
+
+    const link = `https://egchat.app/join/${chat.invite_token}`;
+    res.json({ link, invite_link: link, token: chat.invite_token });
+  } catch (e) {
+    console.error('Invite link error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Entrar a un grupo con el token del enlace.
+app.post('/api/chats/join', auth, async (req, res) => {
+  try {
+    const token = String(req.body?.token || '').trim();
+    if (!token) return res.status(400).json({ message: 'Token requerido' });
+
+    const { data: chat } = await supabase
+      .from('chats')
+      .select('id, name, type')
+      .eq('invite_token', token)
+      .maybeSingle();
+    if (!chat) return res.status(404).json({ message: 'Enlace no valido' });
+
+    const yaDentro = await participacionEnChat(chat.id, req.user.id);
+    if (!yaDentro) {
+      const { error } = await supabase
+        .from('chat_participants')
+        .insert({ chat_id: chat.id, user_id: req.user.id });
+      if (error) throw error;
+    }
+
+    res.json({ message: 'Dentro del grupo', chat_id: chat.id, chat_name: chat.name || null });
+  } catch (e) {
+    console.error('Join chat error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Mensajes que se autodestruyen: el plazo se guarda en el chat y se aplica al
+// leer, que es lo unico que hace que valga para todos y no solo para el que lo
+// configuro.
+const PLAZOS_EFIMEROS = [0, 30, 60, 300, 3600, 86400, 604800, 7776000];
+app.patch('/api/chats/:chatId/ephemeral', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const segundos = Number(req.body?.duration_seconds);
+
+    if (!(await participacionEnChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'No participas en este chat' });
+    }
+    if (!PLAZOS_EFIMEROS.includes(segundos)) {
+      return res.status(400).json({ message: 'Plazo no valido' });
+    }
+
+    const { data: actualizado, error } = await supabase
+      .from('chats')
+      .update({ ephemeral_seconds: segundos, updated_at: new Date().toISOString() })
+      .eq('id', chatId)
+      .select('ephemeral_seconds')
+      .maybeSingle();
+    if (error) throw error;
+    if (!actualizado) return res.status(404).json({ message: 'Chat no encontrado' });
+
+    res.json({ duration_seconds: actualizado.ephemeral_seconds });
+  } catch (e) {
+    console.error('Ephemeral error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// MENSAJES: reacciones, acuses de lectura, busqueda y edicion
+// ════════════════════════════════════════════════════════════════════
+const mensajeConAcceso = async (messageId, userId) => {
+  const { data: msg } = await supabase
+    .from('messages')
+    .select('id, chat_id, sender_id, text, created_at')
+    .eq('id', messageId)
+    .maybeSingle();
+  if (!msg) return { msg: null, acceso: false };
+  const acceso = !!(await participacionEnChat(msg.chat_id, userId));
+  return { msg, acceso };
+};
+
+app.get('/api/messages/:messageId/reactions', auth, async (req, res) => {
+  try {
+    const { msg, acceso } = await mensajeConAcceso(req.params.messageId, req.user.id);
+    if (!msg) return res.status(404).json({ message: 'Mensaje no encontrado' });
+    if (!acceso) return res.status(403).json({ message: 'No tienes acceso a este chat' });
+
+    const { data, error } = await supabase
+      .from('message_reactions')
+      .select('emoji, user_id, created_at')
+      .eq('message_id', msg.id)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+
+    res.json(data || []);
+  } catch (e) {
+    console.error('Get reactions error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Alterna mi reaccion: si ya estaba, la quita; si no, la pone.
+app.post('/api/messages/:messageId/reactions', auth, async (req, res) => {
+  try {
+    const emoji = String(req.body?.emoji || '').trim();
+    if (!emoji || emoji.length > 16) return res.status(400).json({ message: 'Emoji no valido' });
+
+    const { msg, acceso } = await mensajeConAcceso(req.params.messageId, req.user.id);
+    if (!msg) return res.status(404).json({ message: 'Mensaje no encontrado' });
+    if (!acceso) return res.status(403).json({ message: 'No tienes acceso a este chat' });
+
+    const { data: existente } = await supabase
+      .from('message_reactions')
+      .select('id')
+      .eq('message_id', msg.id)
+      .eq('user_id', req.user.id)
+      .eq('emoji', emoji)
+      .maybeSingle();
+
+    if (existente) {
+      const { error } = await supabase.from('message_reactions').delete().eq('id', existente.id);
+      if (error) throw error;
+      return res.json({ added: false, emoji });
+    }
+
+    const { error } = await supabase
+      .from('message_reactions')
+      .insert({ message_id: msg.id, user_id: req.user.id, emoji });
+    if (error) throw error;
+
+    res.json({ added: true, emoji });
+  } catch (e) {
+    console.error('Toggle reaction error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.delete('/api/messages/:messageId/reactions/:emoji', auth, async (req, res) => {
+  try {
+    const emoji = String(req.params.emoji || '').trim();
+    if (!emoji) return res.status(400).json({ message: 'Emoji no valido' });
+
+    const { msg, acceso } = await mensajeConAcceso(req.params.messageId, req.user.id);
+    if (!msg) return res.status(404).json({ message: 'Mensaje no encontrado' });
+    if (!acceso) return res.status(403).json({ message: 'No tienes acceso a este chat' });
+
+    const { error } = await supabase
+      .from('message_reactions')
+      .delete()
+      .eq('message_id', msg.id)
+      .eq('user_id', req.user.id)
+      .eq('emoji', emoji);
+    if (error) throw error;
+
+    res.json({ removed: true, emoji });
+  } catch (e) {
+    console.error('Delete reaction error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Acuses: quien ha leido este mensaje. `message_reads` guarda el ultimo
+// mensaje leido por persona, no una fila por mensaje.
+app.get('/api/messages/:messageId/receipts', auth, async (req, res) => {
+  try {
+    const { msg, acceso } = await mensajeConAcceso(req.params.messageId, req.user.id);
+    if (!msg) return res.status(404).json({ message: 'Mensaje no encontrado' });
+    if (!acceso) return res.status(403).json({ message: 'No tienes acceso a este chat' });
+
+    const { data: parts } = await supabase
+      .from('chat_participants')
+      .select('user_id')
+      .eq('chat_id', msg.chat_id);
+    const otros = (parts || [])
+      .map(p => p.user_id)
+      .filter(id => String(id) !== String(req.user.id));
+    if (otros.length === 0) return res.json([]);
+
+    const { data: lecturas } = await supabase
+      .from('message_reads')
+      .select('user_id, last_read_message_id, read_at')
+      .eq('chat_id', msg.chat_id)
+      .in('user_id', otros);
+
+    const lecturasPorUsuario = {};
+    (lecturas || []).forEach(l => { lecturasPorUsuario[String(l.user_id)] = l; });
+
+    const { data: usuarios } = await supabase
+      .from('users')
+      .select('id, full_name, avatar_url')
+      .in('id', otros);
+    const usuariosPorId = {};
+    (usuarios || []).forEach(u => { usuariosPorId[String(u.id)] = u; });
+
+    const leidoEn = new Date(msg.created_at).getTime();
+    const receipts = otros.map(id => {
+      const lectura = lecturasPorUsuario[String(id)];
+      const porId = lectura && String(lectura.last_read_message_id) === String(msg.id);
+      const porFecha = lectura && lectura.read_at && new Date(lectura.read_at).getTime() >= leidoEn;
+      const u = usuariosPorId[String(id)] || {};
+      return {
+        user_id: id,
+        full_name: u.full_name || '',
+        avatar_url: u.avatar_url || '',
+        read_at: porId || porFecha ? (lectura.read_at || new Date().toISOString()) : null,
+      };
+    });
+
+    res.json(receipts);
+  } catch (e) {
+    console.error('Receipts error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Busqueda de mensajes solo en los chats donde participo.
+app.get('/api/messages/search', auth, async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (q.length < 2) return res.json([]);
+    const limite = Math.min(parseInt(req.query.limit) || 30, 50);
+
+    const { data: parts } = await supabase
+      .from('chat_participants')
+      .select('chat_id')
+      .eq('user_id', req.user.id);
+    const chatIds = (parts || []).map(p => p.chat_id);
+    if (chatIds.length === 0) return res.json([]);
+
+    const { data: msgs, error } = await supabase
+      .from('messages')
+      .select('id, chat_id, sender_id, text, type, created_at')
+      .in('chat_id', chatIds)
+      .ilike('text', `%${q}%`)
+      .order('created_at', { ascending: false })
+      .limit(limite);
+    if (error) throw error;
+
+    const encontrados = msgs || [];
+    if (encontrados.length === 0) return res.json([]);
+
+    const senderIds = [...new Set(encontrados.map(m => m.sender_id).filter(Boolean))];
+    const chatIdsConResultado = [...new Set(encontrados.map(m => m.chat_id))];
+
+    const [{ data: senders }, { data: chats }] = await Promise.all([
+      supabase.from('users').select('id, full_name, avatar_url').in('id', senderIds),
+      supabase.from('chats').select('id, name, type, avatar_url').in('id', chatIdsConResultado),
+    ]);
+    const senderPorId = {};
+    (senders || []).forEach(u => { senderPorId[String(u.id)] = u; });
+    const chatPorId = {};
+    (chats || []).forEach(c => { chatPorId[String(c.id)] = c; });
+
+    res.json(encontrados.map(m => ({
+      ...m,
+      sender: senderPorId[String(m.sender_id)] || null,
+      chat: chatPorId[String(m.chat_id)] || null,
+      edited: false,
+    })));
+  } catch (e) {
+    console.error('Search messages error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Editar un mensaje: solo el que lo escribio y solo el texto.
+app.patch('/api/messages/:messageId', auth, async (req, res) => {
+  try {
+    const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+    if (!text) return res.status(400).json({ message: 'Texto requerido' });
+    if (text.length > 4096) return res.status(400).json({ message: 'Texto demasiado largo' });
+
+    const { data: msg } = await supabase
+      .from('messages')
+      .select('id, chat_id, sender_id')
+      .eq('id', req.params.messageId)
+      .maybeSingle();
+    if (!msg) return res.status(404).json({ message: 'Mensaje no encontrado' });
+    if (String(msg.sender_id) !== String(req.user.id)) {
+      return res.status(403).json({ message: 'Solo puedes editar tus mensajes' });
+    }
+
+    const { data: editado, error } = await supabase
+      .from('messages')
+      .update({ text, edited_at: new Date().toISOString() })
+      .eq('id', msg.id)
+      .select('id, chat_id, sender_id, text, type, created_at, edited_at')
+      .maybeSingle();
+    if (error) throw error;
+
+    const { data: sender } = await supabase
+      .from('users')
+      .select('id, full_name, avatar_url')
+      .eq('id', msg.sender_id)
+      .maybeSingle();
+
+    res.json({ ...editado, edited: true, sender: sender || null });
+  } catch (e) {
+    console.error('Edit message error:', e);
     res.status(500).json({ message: e.message });
   }
 });
