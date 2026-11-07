@@ -701,7 +701,16 @@ app.get('/api/me/role', auth, async (req, res) => {
 // Heartbeat — el cliente llama esto cada 30s para mantenerse "online"
 app.post('/api/auth/heartbeat', auth, async (req, res) => {
   if (!String(req.user.id || '').startsWith('local-')) {
-    supabase.from('users').update({ online_status: true, last_seen: new Date().toISOString() }).eq('id', req.user.id).then(() => {});
+    // Se espera la escritura: si responde antes de guardar, el latido se pierde
+    // cuando el proceso se recicla y la persona aparece desconectada.
+    try {
+      await supabase
+        .from('users')
+        .update({ online_status: true, last_seen: new Date().toISOString() })
+        .eq('id', req.user.id);
+    } catch (e) {
+      console.warn('heartbeat:', e.message);
+    }
   }
   res.json({ ok: true });
 });
@@ -2213,7 +2222,7 @@ app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
         full_name: u.full_name || '',
         phone: u.phone || '',
         avatar_url: u.avatar_url || '',
-        online_status: oculta ? false : (u.online_status || false),
+        online_status: oculta ? false : estaEnLineaAhora(u.last_seen),
         last_seen: oculta ? null : (u.last_seen || null),
         role: uid === yoId ? 'admin' : 'member',
       };
@@ -8286,12 +8295,60 @@ app.get('/api/notifications', auth, async (req, res) => {
 // ════════════════════════════════════════════════════════════════════
 // CONTACTOS CON FOTO Y PERFIL
 // ════════════════════════════════════════════════════════════════════
-// Perfil público de un usuario
+// Perfil público de un usuario. La pantalla de chat consulta aqui cada 15s
+// para pintar "en linea" y "visto por ultima vez": antes la consulta no traia
+// ni online_status ni last_seen, asi que todo el mundo salia desconectado.
+const VENTANA_EN_LINEA_MS = 150000;
+
+const estaEnLineaAhora = (lastSeen) => {
+  if (!lastSeen) return false;
+  return Date.now() - new Date(lastSeen).getTime() < VENTANA_EN_LINEA_MS;
+};
+
 app.get('/api/users/:userId', auth, async (req, res) => {
   try {
-    const { data } = await supabase.from('users').select('id, phone, full_name, avatar_url, created_at').eq('id', req.params.userId).single();
+    const { data } = await supabase
+      .from('users')
+      .select('id, phone, full_name, avatar_url, created_at, online_status, last_seen')
+      .eq('id', req.params.userId)
+      .single();
     if (!data) return res.status(404).json({ message: 'Usuario no encontrado' });
-    res.json(data);
+
+    const uid = String(data.id);
+    const yoId = String(req.user.id);
+    if (uid === yoId) {
+      return res.json({ ...data, online_status: true, last_seen_visibility: 'todos' });
+    }
+
+    // La visibilidad la decide el dueño del dato: 'nadie' oculta siempre y
+    // 'contactos' solo enseña a quien lo tiene en su agenda.
+    const { data: pref } = await supabase
+      .from('user_preferences')
+      .select('last_seen_visibility')
+      .eq('user_id', uid)
+      .maybeSingle();
+    let vis = pref?.last_seen_visibility || 'todos';
+    if (!['todos', 'contactos', 'nadie'].includes(vis)) vis = 'todos';
+
+    let oculta = vis === 'nadie';
+    if (vis === 'contactos') {
+      const { data: enAgenda } = await supabase
+        .from('contacts')
+        .select('id')
+        .eq('user_id', req.user.id)
+        .eq('contact_user_id', uid)
+        .maybeSingle();
+      oculta = !enAgenda;
+    }
+
+    // online_status se queda en true desde el ultimo latido y nadie lo apaga:
+    // lo que vale es la marca de tiempo, no la bandera.
+    res.json({
+      ...data,
+      online_status: oculta ? false : estaEnLineaAhora(data.last_seen),
+      last_seen: oculta ? null : (data.last_seen || null),
+      last_seen_visibility: vis,
+    });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
