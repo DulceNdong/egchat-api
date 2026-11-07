@@ -433,14 +433,154 @@ app.post('/api/admin/users/update-version', async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════════════
+// EL TELEFONO ES LA IDENTIDAD DE LA CUENTA
+// Guardarlo sin canonicar convierte '555570323' y '+240555570323' en dos
+// usuarios distintos, cada uno con su monedero y sus chats.
+// ════════════════════════════════════════════════════════════════════
+const PHONE_PAIS = '240';
+
+// Ventanas de digitos nacionales (despues del prefijo, sin el 0 de tráfico)
+// por cada pais que la app ofrece en el selector. Son los planes de numeracion
+// vigentes; donde el plan de verdad varia (Alemania, Italia, China, Argentina)
+// la ventana es amplia, y donde es cerrado (Espana, Mexico, Ghana) no se
+// admitsen ni uno de mas. Solo se exige en las altas: la resolucion de cuentas
+// viejas sigue siendo tolerante para no dejar fuera a nadie.
+const PHONE_PLANES = {
+  '240': [9, 9],   // Guinea Ecuatorial: moviles 2/5, fijos 3
+  '237': [9, 9],   // Camerun: 8 a 9 digitos desde 2014
+  '241': [7, 8],   // Gabon
+  '242': [8, 9],   // Congo-Brazzaville
+  '236': [8, 8],   // Republica Centroafricana
+  '235': [8, 8],   // Chad
+  '244': [9, 9],   // Angola
+  '243': [7, 10],  // RD Congo: el plan esta mal documentado
+  '234': [10, 10], // Nigeria
+  '221': [9, 9],   // Senegal
+  '225': [8, 10],  // Costa de Marfil: paso de 8 a 10 en 2021
+  '254': [9, 9],   // Kenia
+  '233': [9, 9],   // Ghana: cerrado en 2010
+  '27': [9, 9],    // Sudafrica
+  '212': [8, 9],   // Marruecos
+  '34': [9, 9],    // Espana
+  '33': [9, 9],    // Francia
+  '44': [9, 10],   // Reino Unido
+  '49': [6, 13],   // Alemania: el largo varia por indicativo
+  '39': [6, 12],   // Italia
+  '351': [9, 9],   // Portugal
+  '1': [10, 10],   // EE UU y Canada (NANP)
+  '55': [10, 11],  // Brasil
+  '52': [10, 10],  // Mexico
+  '57': [10, 10],  // Colombia
+  '54': [10, 11],  // Argentina
+  '58': [10, 10],  // Venezuela
+  '86': [10, 11],  // China
+};
+const PHONE_PREFIJOS = Object.keys(PHONE_PLANES).sort((a, b) => b.length - a.length);
+
+const toE164 = (phone) => {
+  const digits = String(phone || '').replace(/\D/g, '').replace(/^0+/, '');
+  if (!digits) return '';
+  if (digits.length === 8 || digits.length === 9) return `+${PHONE_PAIS}${digits}`;
+  // Cero de red por delante del numero nacional guineecuatorial: no es parte del
+  // numero, asi que '+240 0555570323' es la misma cuenta que '+240555570323'.
+  // El orden de estas ramas es el mismo que el de public.phone_key en la base.
+  if (digits.startsWith(`${PHONE_PAIS}0`)) return `+${PHONE_PAIS}${digits.slice(PHONE_PAIS.length).replace(/^0+/, '')}`;
+  if ((digits.length === 11 || digits.length === 12) && digits.startsWith(PHONE_PAIS)) return `+${digits}`;
+  return `+${digits}`;
+};
+
+// Devuelve el prefijo y los digitos nacionales que ve el servidor, o el motivo
+// por el que el numero no es de un pais que la app ofrece.
+const desglosarTelefono = (phone) => {
+  const raw = String(phone || '').trim();
+  const digits = raw.replace(/\D/g, '').replace(/^0+/, '');
+  if (!digits) return { motivo: 'El telefono no tiene digitos' };
+  if (!raw.startsWith('+')) return { prefijo: PHONE_PAIS, nacional: digits };
+  const prefijo = PHONE_PREFIJOS.find((p) => digits.startsWith(p));
+  if (!prefijo) return { motivo: 'El prefijo no esta entre los paises disponibles en la app' };
+  const nacional = digits.slice(prefijo.length);
+  // En Guinea Ecuatorial el 0 inicial es prefijo de red, no parte del numero:
+  // '+240 0555570323' y '+240555570323' son la misma cuenta. En los paises donde
+  // el 0 si es parte del numero (Gabon, Costa de Marfil) no se toca.
+  if (prefijo === PHONE_PAIS) return { prefijo, nacional: nacional.replace(/^0+/, '') };
+  return { prefijo, nacional };
+};
+
+// El candado del alta: ni numeros inventados ni prefijos que la app no ofrece.
+const telefonoValido = (phone) => {
+  const partes = desglosarTelefono(phone);
+  if (partes.motivo) return partes;
+  const ventana = PHONE_PLANES[partes.prefijo];
+  const n = partes.nacional.length;
+  if (n < ventana[0] || n > ventana[1]) {
+    return {
+      ok: false,
+      motivo: ventana[0] === ventana[1]
+        ? `Los numeros de +${partes.prefijo} tienen ${ventana[0]} digitos`
+        : `Los numeros de +${partes.prefijo} tienen entre ${ventana[0]} y ${ventana[1]} digitos`,
+    };
+  }
+  return { ok: true, prefijo: partes.prefijo, nacional: partes.nacional };
+};
+
+// Formas en las que el mismo numero marcado puede estar guardado.
+const phoneCandidates = (phone) => {
+  const raw = String(phone || '').trim();
+  const digits = raw.replace(/\D/g, '').replace(/^0+/, '');
+  const formas = [toE164(raw), raw, digits, `+${digits}`];
+  if (digits.length === 8 || digits.length === 9) formas.push(`${PHONE_PAIS}${digits}`);
+  // '+240…' tambien tiene que encontrar la fila guardada sin prefijo ('555570323');
+  // si no, registrarse con el prefijo completo crea una cuenta hermana.
+  if (digits.startsWith(PHONE_PAIS) && (digits.length === 11 || digits.length === 12)) {
+    formas.push(digits.slice(PHONE_PAIS.length));
+  }
+  // Y la forma con el 0 de red dentro del nacional ('+240 0555570323'): es el
+  // mismo numero que la canonica sin el, y sin esta forma quien lo marco asi se
+  // queda fuera de su propia cuenta.
+  if (digits.startsWith(PHONE_PAIS)) {
+    const nacional = digits.slice(PHONE_PAIS.length);
+    if (nacional.startsWith('0') && nacional.length >= 8 && nacional.length <= 10) {
+      const limpia = nacional.replace(/^0+/, '');
+      formas.push(`+${PHONE_PAIS}${limpia}`, limpia);
+    }
+  }
+  return Array.from(new Set(formas.filter(Boolean)));
+};
+
+// Prefiere la fila canonica. Si hay varias y ninguna es canonica no elige:
+// en auth una cuenta ambigua cuesta menos que un acceso equivocado.
+// El limite va por encima de las formas que produce phoneCandidates: si se
+// rellenara, un numero con 5 filas dejaria de verse ambiguo y se elegiria a ciegas.
+const phoneRowLimit = (phone) => Math.max(6, phoneCandidates(phone).length + 2);
+
+const findAuthUserByPhone = async (phone, columns = '*') => {
+  const candidates = phoneCandidates(phone);
+  if (!candidates.length) return { user: null, ambiguous: false };
+  const { data, error } = await supabase
+    .from('users')
+    .select(columns)
+    .in('phone', candidates)
+    .limit(phoneRowLimit(phone));
+  if (error) return { user: null, ambiguous: false };
+  const filas = data || [];
+  const canonica = toE164(phone);
+  const elegido = filas.find((u) => u.phone === canonica) || (filas.length === 1 ? filas[0] : null);
+  return { user: elegido || null, ambiguous: !elegido && filas.length > 1 };
+};
+
+const AMBIGUO_MENSAJE = 'Ese numero tiene varias cuentas. Entra con el formato completo +240…';
+
 // Reset contraseña por admin
 app.post('/api/admin/reset-password', async (req, res) => {
   const key = req.headers['x-admin-key'] || req.body?.adminKey;
   if (!isAdminKeyValid(key)) return res.status(403).json({ message: 'No autorizado' });
   const { phone, newPassword } = req.body;
   if (!phone || !newPassword) return res.status(400).json({ message: 'phone y newPassword requeridos' });
+  const { user: objetivo, ambiguous } = await findAuthUserByPhone(phone);
+  if (!objetivo) return res.status(404).json({ message: ambiguous ? AMBIGUO_MENSAJE : 'Usuario no encontrado' });
   const hashed = await bcrypt.hash(newPassword, 10);
-  const { data, error } = await supabase.from('users').update({ password_hash: hashed }).eq('phone', phone).select('id, phone, full_name').single();
+  const { data, error } = await supabase.from('users').update({ password_hash: hashed }).eq('id', objetivo.id).select('id, phone, full_name').single();
   if (error || !data) return res.status(404).json({ message: 'Usuario no encontrado', error: error?.message });
   res.json({ message: 'Contrasena reseteada', user: data });
 });
@@ -457,11 +597,13 @@ app.post('/api/emergency/reset-pw', authLimiter, async (req, res) => {
   if (!phone || !newPassword) return res.status(400).json({ message: 'phone y newPassword requeridos' });
   if (String(newPassword).length < 8) return res.status(400).json({ message: 'La contraseña debe tener al menos 8 caracteres' });
   try {
+    const { user: objetivo, ambiguous } = await findAuthUserByPhone(phone);
+    if (!objetivo) return res.status(404).json({ message: ambiguous ? AMBIGUO_MENSAJE : 'Usuario no encontrado' });
     const hashed = await bcrypt.hash(newPassword, 10);
     const { data, error } = await supabase
       .from('users')
       .update({ password_hash: hashed })
-      .eq('phone', phone)
+      .eq('id', objetivo.id)
       .select('id, phone, full_name')
       .single();
     if (error || !data) return res.status(404).json({ message: 'Usuario no encontrado', error: error?.message });
@@ -567,19 +709,30 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       return res.status(400).json({ message: 'phone, password y full_name son requeridos' });
 
     const profileAvatar = avatar_url || null;
+    const plan = telefonoValido(phone);
+    if (!plan.ok) return res.status(400).json({ message: plan.motivo });
+    const phoneCanonico = `+${plan.prefijo}${plan.nacional}`;
 
-    // Verificar si ya existe
-    const { data: existing } = await supabase
-      .from('users').select('id').eq('phone', phone).maybeSingle();
-    if (existing) return res.status(409).json({ message: 'El teléfono ya está registrado' });
+    // Verificar si ya existe, en cualquiera de las formas en que este numero
+    // pueda estar guardado: si no, el registro crea una cuenta hermana.
+    const { user: existing, ambiguous } = await findAuthUserByPhone(phone);
+    if (existing || ambiguous) {
+      return res.status(409).json({ message: ambiguous ? AMBIGUO_MENSAJE : 'El teléfono ya está registrado' });
+    }
 
     const hashed = await bcrypt.hash(password, 10);
     const { data: user, error } = await supabase
       .from('users')
-      .insert({ phone, full_name, password_hash: hashed, avatar_url: profileAvatar })
+      .insert({ phone: phoneCanonico, full_name, password_hash: hashed, avatar_url: profileAvatar })
       .select('id, phone, full_name, avatar_url')
       .single();
 
+    // Dos registros concurrentes del mismo numero pasan los dos la comprobacion
+    // anterior; el indice unico es el que decide, y aqui se traduce a 409 en
+    // lugar de un 500 con el mensaje crudo de Postgres.
+    if (error && error.code === '23505') {
+      return res.status(409).json({ message: 'El teléfono ya está registrado' });
+    }
     if (error) throw error;
 
     // Monedero nuevo a cero: el saldo de bienvenida de las pruebas se abona con
@@ -602,7 +755,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       }
     } catch {}
 
-    const token = jwt.sign({ id: user.id, phone }, JWT_SECRET, { expiresIn: '30d' });
+    const token = jwt.sign({ id: user.id, phone: user.phone }, JWT_SECRET, { expiresIn: '30d' });
     res.status(201).json({ token, user: { ...user, app_version: APP_VERSION } });
   } catch (e) {
     console.error('Register error:', e);
@@ -614,8 +767,8 @@ app.post('/api/auth/check-phone', authLimiter, async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.json({ exists: false });
-    const { data } = await supabase.from('users').select('id').eq('phone', phone).maybeSingle();
-    res.json({ exists: !!data });
+    const { user, ambiguous } = await findAuthUserByPhone(phone);
+    res.json({ exists: Boolean(user) || ambiguous });
   } catch {
     res.json({ exists: false }); // En caso de error, dejar continuar
   }
@@ -627,15 +780,27 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     if (!phone || !password)
       return res.status(400).json({ message: 'phone y password son requeridos' });
 
-    const { data: user, error } = await supabase
-      .from('users').select('*').eq('phone', phone).maybeSingle();
+    // La contraseña es la que decide entre las filas del mismo numero: si no,
+    // el dueno de una cuenta guardada sin prefijo se quedara fuera aunque la
+    // sepa, y el prefijo +240 podria abrir la cuenta de otro pais. Entra la
+    // unica que casa; si casan varias (mismas claves en dos cuentas), la
+    // canonica. Ninguna = 401 sin delatar cuantas hay.
+    const { data: filas } = await supabase
+      .from('users').select('*').in('phone', phoneCandidates(phone)).limit(phoneRowLimit(phone));
+    const casan = [];
+    for (const candidato of filas || []) {
+      if (candidato.password_hash && await bcrypt.compare(password, candidato.password_hash)) {
+        casan.push(candidato);
+      }
+    }
+    const canonica = toE164(phone);
+    const user = casan.length === 0
+      ? null
+      : (casan.find((u) => u.phone === canonica) || (casan.length === 1 ? casan[0] : null));
 
-    if (error || !user) {
+    if (!user) {
       return res.status(401).json({ message: 'Credenciales incorrectas' });
     }
-
-    const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) return res.status(401).json({ message: 'Credenciales incorrectas' });
 
     // Después de comprobar la contraseña, no antes: si se rechazara antes del
     // bcrypt el 401 diría «esta sí existe», y el borrado es lógico, no público.
@@ -648,7 +813,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
       await supabase.from('users').update({ last_login: new Date().toISOString() }).eq('id', user.id);
     } catch {}
 
-    const token = jwt.sign({ id: user.id, phone }, JWT_SECRET, { expiresIn: '30d' });
+    const token = jwt.sign({ id: user.id, phone: user.phone }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ token, user: { id: user.id, phone: user.phone, full_name: user.full_name, avatar_url: user.avatar_url, app_version: user.app_version || APP_VERSION } });
   } catch (e) {
     console.error('Login error:', e);
@@ -1286,12 +1451,17 @@ const resetCodes = new Map();
 
 app.post('/api/auth/send-verification', authLimiter, async (req, res) => {
   try {
-    const { phone } = req.body;
+    let { phone } = req.body;
     if (!phone) return res.status(400).json({ message: 'Teléfono requerido' });
+    // La clave del codigo y el destino del SMS van en forma canonica: si no,
+    // quien se registro sin el +240 no puede recuperar su cuenta.
+    phone = toE164(phone) || phone;
 
     // Verificar que el usuario existe
-    const { data: user } = await supabase.from('users').select('id').eq('phone', phone).maybeSingle();
-    if (!user) return res.status(404).json({ message: 'No existe ninguna cuenta con ese número' });
+    const { user, ambiguous } = await findAuthUserByPhone(phone);
+    if (!user) {
+      return res.status(ambiguous ? 409 : 404).json({ message: ambiguous ? AMBIGUO_MENSAJE : 'No existe ninguna cuenta con ese número' });
+    }
 
     // Generar código de 6 dígitos
     const code = String(Math.floor(100000 + Math.random() * 900000));
@@ -1330,8 +1500,9 @@ app.post('/api/auth/send-verification', authLimiter, async (req, res) => {
 
 app.post('/api/auth/verify-code', authLimiter, async (req, res) => {
   try {
-    const { phone, code } = req.body;
+    let { phone, code } = req.body;
     if (!phone || !code) return res.status(400).json({ message: 'Teléfono y código requeridos' });
+    phone = toE164(phone) || phone;
 
     const entry = resetCodes.get(phone);
     if (!entry) return res.status(400).json({ verified: false, message: 'No hay código activo para este número' });
@@ -1349,9 +1520,10 @@ app.post('/api/auth/verify-code', authLimiter, async (req, res) => {
 
 app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   try {
-    const { phone, code, newPassword } = req.body;
+    let { phone, code, newPassword } = req.body;
     if (!phone || !code || !newPassword) return res.status(400).json({ message: 'Faltan datos' });
     if (newPassword.length < 6) return res.status(400).json({ message: 'La contraseña debe tener al menos 6 caracteres' });
+    phone = toE164(phone) || phone;
 
     // Verificar código
     const entry = resetCodes.get(phone);
@@ -1362,9 +1534,13 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
     }
     if (entry.code !== String(code)) return res.status(400).json({ message: 'Código incorrecto' });
 
-    // Actualizar contraseña
+    // Actualizar contraseña. Por id: el numero puede estar guardado en su forma
+    // antigua ('555570323') y un update por el canonico no tocaba ninguna fila,
+    // devolviendo «Contraseña actualizada» sin haberla actualizado.
+    const { user } = await findAuthUserByPhone(phone);
+    if (!user) return res.status(404).json({ message: 'No existe ninguna cuenta con ese número' });
     const hash = await bcrypt.hash(newPassword, 10);
-    const { error } = await supabase.from('users').update({ password_hash: hash }).eq('phone', phone);
+    const { error } = await supabase.from('users').update({ password_hash: hash }).eq('id', user.id);
     if (error) throw error;
 
     resetCodes.delete(phone); // invalidar código usado
@@ -3189,12 +3365,15 @@ const findUserByRef = async (ref) => {
   const raw = String(ref || '').trim();
   if (!raw) return null;
   const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw);
-  const phone = raw.replace(/[^\d+]/g, '');
-  const base = supabase.from('users').select('id, phone, full_name, avatar_url');
-  const { data } = isUuid
-    ? await base.eq('id', raw).maybeSingle()
-    : await base.eq('phone', phone).maybeSingle();
-  return data || null;
+  if (isUuid) {
+    const { data } = await supabase
+      .from('users').select('id, phone, full_name, avatar_url').eq('id', raw).maybeSingle();
+    return data || null;
+  }
+  // Un traspaso no puede adivinar el destinatario: si el numero esta duplicado
+  // y ninguna fila lleva la forma canonica, se devuelve null y el pago no sale.
+  const { user } = await findAuthUserByPhone(raw, 'id, phone, full_name, avatar_url');
+  return user || null;
 };
 
 const getWallet = async (userId) => {
@@ -5830,8 +6009,10 @@ app.post('/api/admin/reset-password', async (req, res) => {
   if (!isAdminKeyValid(key)) return res.status(403).json({ message: 'No autorizado' });
   const { phone, newPassword } = req.body;
   if (!phone || !newPassword) return res.status(400).json({ message: 'phone y newPassword requeridos' });
+  const { user: objetivo, ambiguous } = await findAuthUserByPhone(phone);
+  if (!objetivo) return res.status(404).json({ message: ambiguous ? AMBIGUO_MENSAJE : 'Usuario no encontrado' });
   const hashed = await bcrypt.hash(newPassword, 10);
-  const { data, error } = await supabase.from('users').update({ password_hash: hashed }).eq('phone', phone).select('id, phone, full_name').single();
+  const { data, error } = await supabase.from('users').update({ password_hash: hashed }).eq('id', objetivo.id).select('id, phone, full_name').single();
   if (error || !data) return res.status(404).json({ message: 'Usuario no encontrado', error: error?.message });
   res.json({ message: 'Contraseña reseteada', user: data });
 });
@@ -11720,8 +11901,8 @@ app.get('/api/push/check/:phone', async (req, res) => {
   }
   try {
     const phone = decodeURIComponent(req.params.phone);
-    const { data: user } = await supabase.from('users').select('id, full_name, phone').eq('phone', phone).single();
-    if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
+    const { user, ambiguous } = await findAuthUserByPhone(phone, 'id, full_name, phone');
+    if (!user) return res.status(404).json({ message: ambiguous ? AMBIGUO_MENSAJE : 'Usuario no encontrado' });
     const { data: subs } = await supabase.from('push_subscriptions').select('id, endpoint, updated_at').eq('user_id', user.id);
     res.json({ user: { id: user.id, name: user.full_name, phone: user.phone }, subscriptions: (subs || []).length, details: (subs || []).map(s => ({ id: s.id, endpoint: s.endpoint.slice(0, 80) + '...', updated_at: s.updated_at })) });
   } catch (e) {
@@ -11737,8 +11918,8 @@ app.post('/api/push/send-test/:phone', async (req, res) => {
   }
   try {
     const phone = decodeURIComponent(req.params.phone);
-    const { data: user } = await supabase.from('users').select('id, full_name').eq('phone', phone).single();
-    if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
+    const { user, ambiguous } = await findAuthUserByPhone(phone, 'id, full_name');
+    if (!user) return res.status(404).json({ message: ambiguous ? AMBIGUO_MENSAJE : 'Usuario no encontrado' });
     const result = await sendPushToUser(user.id, {
       title: '🔔 EGChat — Prueba',
       body: `Hola ${user.full_name}, las notificaciones funcionan!`,
