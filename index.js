@@ -8259,6 +8259,28 @@ app.patch('/api/messages/:messageId', auth, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
+// STICKERS
+// ════════════════════════════════════════════════════════════════════
+// El panel de stickers pedia este catalogo y no existia: cada apertura caia
+// al catalogo local y los packs del servidor no aparecian nunca. Si la tabla
+// no esta, se responde error para que el cliente use el catalogo local en vez
+// de pintar una lista vacia.
+app.get('/api/stickers/catalog', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('sticker_packs')
+      .select('*')
+      .order('name', { ascending: true });
+    if (error) {
+      return res.status(502).json({ error: 'STICKERS_SIN_TABLA', message: error.message });
+    }
+    res.json((data || []).filter(p => p.is_active !== false));
+  } catch (e) {
+    res.status(502).json({ error: 'STICKERS_FALLO', message: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
 // NOTIFICACIONES
 // ════════════════════════════════════════════════════════════════════
 app.get('/api/notifications', auth, async (req, res) => {
