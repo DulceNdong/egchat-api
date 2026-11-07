@@ -9325,33 +9325,6 @@ app.post('/api/stories/:storyId/react', auth, async (req, res) => {
 // ════════════════════════════════════════════════════════════════════
 // START
 // ════════════════════════════════════════════════════════════════════
-const updateUserVersions = async () => {
-  const isPlaceholderSupabase =
-    !process.env.SUPABASE_URL ||
-    !process.env.SUPABASE_SERVICE_KEY ||
-    process.env.SUPABASE_URL.includes('TU_PROYECTO') ||
-    process.env.SUPABASE_SERVICE_KEY.includes('TU_SERVICE_ROLE_KEY');
-
-  if (isPlaceholderSupabase) {
-    console.warn('Skipping user version update: Supabase credentials are missing or placeholder values.');
-    return;
-  }
-
-  try {
-    const { error } = await supabase.from('users').update({ app_version: APP_VERSION });
-    if (error) {
-      const missingColumn = /column \"app_version\".*does not exist/i.test(error.message || '');
-      console.warn('User versions update not completed:', error.message);
-      if (missingColumn) {
-        console.warn('The users table is missing the app_version column. Add it before retrying.');
-      }
-      return;
-    }
-    console.log(`Updated app_version for all users to ${APP_VERSION}.`);
-  } catch (e) {
-    console.warn('Failed updating user versions:', e.message);
-  }
-};
 
 // ─── WebRTC Signaling — persistido en Supabase ───────────────────────────────
 
@@ -11386,7 +11359,6 @@ if (require.main === module) {
       `});
     } catch {}
   });
-  updateUserVersions();
 }
 
 // ══════════════════════════════════════════════════════════════════
