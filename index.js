@@ -4872,7 +4872,7 @@ const LIA_COPY = {
   es: {
     emptyMessage: 'Escribe un mensaje para Lia-25.',
     tooLong: 'El mensaje es demasiado largo (máximo 2000 caracteres).',
-    greeting: '¡Hola! Soy Lia-25, tu asistente de EGCHAT. Puedo consultar tu saldo y tus movimientos, darte las noticias y el tiempo, buscar hospitales, farmacias y supermercados, y guiarte para pedir un taxi o enviar dinero. ¿Qué necesitas?',
+    greeting: '¡Hola! Soy Lia-25, tu asistente de EGCHAT. Puedo decirte tus notificaciones y mensajes pendientes, si debes pagar tu Djangue, tu saldo y tus movimientos, las noticias y el tiempo, y guiarte para pedir un taxi o enviar dinero. ¿Qué necesitas?',
     balance: 'Tu saldo actual es *{balance}*.',
     balanceWithMovements: 'Tu saldo actual es *{balance}*.\n\nTus últimos movimientos:\n{movements}',
     movementsTitle: 'Tus últimos movimientos:\n{movements}',
@@ -4891,7 +4891,14 @@ const LIA_COPY = {
     taxi: 'Para pedir un taxi abre MiTaxi, indica el origen y el destino y confirma.\nTarifas: moto 800 XAF, básico 1 500 XAF, premium 3 500 XAF.',
     transfer: 'Para enviar dinero entra en Cartera → Enviar; para retirar, Cartera → Retirar; para recargar, Cartera → Recargar.\nSi quieres, antes te digo tu saldo.',
     thanks: '¡De nada! Estoy aquí para lo que necesites.',
-    help: 'Puedo hacer esto por ti:\n• Consultar tu saldo y tus últimos movimientos.\n• Darte las noticias del día y el tiempo de tu ciudad.\n• Buscar hospitales, farmacias y supermercados.\n• Explicarte cómo pedir un taxi o enviar dinero.\nEscríbemelo o usa los botones de abajo.',
+    help: 'Puedo hacer esto por ti:\n• Consultar tu saldo y tus últimos movimientos.\n• Decirte tus notificaciones y mensajes pendientes.\n• Comprobar si debes pagar tu Djangue o si te toca cobrar.\n• Darte las noticias del día y el tiempo de tu ciudad.\n• Buscar hospitales, farmacias y supermercados.\n• Explicarte cómo pedir un taxi o enviar dinero.\nEscríbemelo o usa los botones de abajo.',
+    notificationsTitle: 'Tus notificaciones:\n{list}',
+    noNotifications: 'No tienes notificaciones ni mensajes pendientes ahora mismo.',
+    djangueTitle: 'Tus djangues:\n{list}',
+    noDjangue: 'Todavía no participas en ningún djangue. Puedes crear uno o unirte desde Mi Djangue.',
+    djangueOwe: 'En {name} te falta la cuota del turno actual: {quota}. Puedes pagarla en Mi Djangue.',
+    djanguePaid: 'En {name} ya pagaste la cuota de este turno.',
+    djangueMyTurn: 'En {name} te toca cobrar este turno.',
     unknown: 'No estoy seguro de haberte entendido. Prueba con: "mi saldo", "últimos movimientos", "noticias", "el tiempo", "taxi" o "hospitales".',
     serviceError: 'No he podido obtener esa información ahora mismo. Inténtalo de nuevo en unos segundos.',
     movementTypes: { deposit: 'Recarga', withdraw: 'Retiro', transfer: 'Transferencia', transfer_sent: 'Envío', transfer_received: 'Recibido', shopping_payment: 'Compra', payment: 'Pago', refund: 'Reembolso', default: 'Movimiento' },
@@ -4899,7 +4906,7 @@ const LIA_COPY = {
   fr: {
     emptyMessage: 'Écrivez un message à Lia-25.',
     tooLong: 'Le message est trop long (2000 caractères maximum).',
-    greeting: 'Bonjour ! Je suis Lia-25, votre assistante EGCHAT. Je peux consulter votre solde et vos transactions, vous donner les actualités et la météo, chercher des hôpitaux, pharmacies et supermarchés, et vous guider pour commander un taxi ou envoyer de l\'argent. Que puis-je faire ?',
+    greeting: 'Bonjour ! Je suis Lia-25, votre assistante EGCHAT. Je peux vous dire vos notifications et messages en attente, si vous devez payer votre Djangue, votre solde et vos opérations, les actualités et la météo, et vous guider pour commander un taxi ou envoyer de l\'argent. Que puis-je faire ?',
     balance: 'Votre solde actuel est de *{balance}*.',
     balanceWithMovements: 'Votre solde actuel est de *{balance}*.\n\nVos dernières transactions :\n{movements}',
     movementsTitle: 'Vos dernières transactions :\n{movements}',
@@ -4918,7 +4925,14 @@ const LIA_COPY = {
     taxi: 'Pour commander un taxi, ouvrez MiTaxi, indiquez le départ et la destination puis confirmez.\nTarifs : moto 800 XAF, basique 1 500 XAF, premium 3 500 XAF.',
     transfer: 'Pour envoyer de l\'argent, allez dans Portefeuille → Envoyer ; pour retirer, Portefeuille → Retirer ; pour recharger, Portefeuille → Recharger.\nJe peux d\'abord vous indiquer votre solde.',
     thanks: 'Avec plaisir ! Je suis là pour vous aider.',
-    help: 'Voici ce que je peux faire :\n• Consulter votre solde et vos dernières transactions.\n• Donner les actualités du jour et la météo de votre ville.\n• Chercher des hôpitaux, pharmacies et supermarchés.\n• Vous expliquer comment commander un taxi ou envoyer de l\'argent.\nÉcrivez-moi ou utilisez les boutons ci-dessous.',
+    help: 'Voici ce que je peux faire :\n• Consulter votre solde et vos dernières transactions.\n• Vous dire vos notifications et messages en attente.\n• Vérifier si vous devez payer votre Djangue ou si c\'est votre tour de recevoir.\n• Donner les actualités du jour et la météo de votre ville.\n• Chercher des hôpitaux, pharmacies et supermarchés.\n• Vous expliquer comment commander un taxi ou envoyer de l\'argent.\nÉcrivez-moi ou utilisez les boutons ci-dessous.',
+    notificationsTitle: 'Vos notifications :\n{list}',
+    noNotifications: 'Vous n\'avez aucune notification ni message en attente pour le moment.',
+    djangueTitle: 'Vos djangues :\n{list}',
+    noDjangue: 'Vous ne participez encore à aucun djangue. Vous pouvez en créer un ou en rejoindre un depuis Mi Djangue.',
+    djangueOwe: 'Dans {name}, il vous manque la cotisation du tour actuel : {quota}. Vous pouvez la payer dans Mi Djangue.',
+    djanguePaid: 'Dans {name}, vous avez déjà payé la cotisation de ce tour.',
+    djangueMyTurn: 'Dans {name}, c\'est à vous de recevoir ce tour.',
     unknown: 'Je ne suis pas sûr de comprendre. Essayez : « mon solde », « dernières transactions », « actualités », « météo », « taxi » ou « hôpitaux ».',
     serviceError: 'Je n\'ai pas pu obtenir cette information. Réessayez dans quelques secondes.',
     movementTypes: { deposit: 'Rechargement', withdraw: 'Retrait', transfer: 'Transfert', transfer_sent: 'Envoi', transfer_received: 'Reçu', shopping_payment: 'Achat', payment: 'Paiement', refund: 'Remboursement', default: 'Mouvement' },
@@ -4926,7 +4940,7 @@ const LIA_COPY = {
   en: {
     emptyMessage: 'Write a message to Lia-25.',
     tooLong: 'The message is too long (2000 characters maximum).',
-    greeting: 'Hi! I am Lia-25, your EGCHAT assistant. I can check your balance and transactions, give you today\'s news and weather, find hospitals, pharmacies and supermarkets, and guide you to request a taxi or send money. What do you need?',
+    greeting: 'Hi! I am Lia-25, your EGCHAT assistant. I can tell you your pending notifications and messages, whether you need to pay your Djangue, your balance and transactions, the news and weather, and guide you to request a taxi or send money. What do you need?',
     balance: 'Your current balance is *{balance}*.',
     balanceWithMovements: 'Your current balance is *{balance}*.\n\nYour latest transactions:\n{movements}',
     movementsTitle: 'Your latest transactions:\n{movements}',
@@ -4945,7 +4959,14 @@ const LIA_COPY = {
     taxi: 'To request a taxi, open MiTaxi, set your pickup and destination, then confirm.\nFares: moto 800 XAF, basic 1 500 XAF, premium 3 500 XAF.',
     transfer: 'To send money go to Wallet → Send; to withdraw, Wallet → Withdraw; to top up, Wallet → Top up.\nI can tell you your balance first.',
     thanks: 'You are welcome! I am here to help.',
-    help: 'Here is what I can do:\n• Check your balance and latest transactions.\n• Give you today\'s news and your city\'s weather.\n• Find hospitals, pharmacies and supermarkets.\n• Guide you to request a taxi or send money.\nType it or use the buttons below.',
+    help: 'Here is what I can do:\n• Check your balance and latest transactions.\n• Tell you your pending notifications and messages.\n• Check if you need to pay your Djangue or if it is your turn to receive.\n• Give you today\'s news and your city\'s weather.\n• Find hospitals, pharmacies and supermarkets.\n• Explain how to request a taxi or send money.\nType it or use the buttons below.',
+    notificationsTitle: 'Your notifications:\n{list}',
+    noNotifications: 'You have no pending notifications or messages right now.',
+    djangueTitle: 'Your djangues:\n{list}',
+    noDjangue: 'You are not in any djangue yet. You can create or join one from Mi Djangue.',
+    djangueOwe: 'In {name} your contribution for the current turn is still due: {quota}. You can pay it in Mi Djangue.',
+    djanguePaid: 'In {name} you already paid this turn\'s contribution.',
+    djangueMyTurn: 'In {name} it is your turn to receive.',
     unknown: 'I am not sure I understood. Try: "my balance", "latest transactions", "news", "weather", "taxi" or "hospitals".',
     serviceError: 'I could not get that information right now. Please try again in a few seconds.',
     movementTypes: { deposit: 'Top-up', withdraw: 'Withdrawal', transfer: 'Transfer', transfer_sent: 'Sent', transfer_received: 'Received', shopping_payment: 'Purchase', payment: 'Payment', refund: 'Refund', default: 'Transaction' },
@@ -4953,7 +4974,7 @@ const LIA_COPY = {
   pt: {
     emptyMessage: 'Escreva uma mensagem para a Lia-25.',
     tooLong: 'A mensagem é demasiado longa (máximo 2000 caracteres).',
-    greeting: 'Olá! Sou a Lia-25, a sua assistente EGCHAT. Posso consultar o seu saldo e as suas transações, dar as notícias e o tempo, procurar hospitais, farmácias e supermercados, e orientá-lo para pedir um táxi ou enviar dinheiro. O que precisa?',
+    greeting: 'Olá! Sou a Lia-25, a sua assistente EGCHAT. Posso dizer-lhe as suas notificações e mensagens pendentes, se tem de pagar o seu Djangue, o seu saldo e as suas transações, as notícias e o tempo, e orientá-lo para pedir um táxi ou enviar dinheiro. O que precisa?',
     balance: 'O seu saldo atual é *{balance}*.',
     balanceWithMovements: 'O seu saldo atual é *{balance}*.\n\nÚltimas transações:\n{movements}',
     movementsTitle: 'Últimas transações:\n{movements}',
@@ -4972,7 +4993,14 @@ const LIA_COPY = {
     taxi: 'Para pedir um táxi, abra o MiTaxi, indique a origem e o destino e confirme.\nTarifas: moto 800 XAF, básico 1 500 XAF, premium 3 500 XAF.',
     transfer: 'Para enviar dinheiro vá a Carteira → Enviar; para levantar, Carteira → Levantar; para recarregar, Carteira → Recarregar.\nPosso dizer-lhe primeiro o seu saldo.',
     thanks: 'De nada! Estou aqui para ajudar.',
-    help: 'Posso fazer isto por si:\n• Consultar o saldo e as últimas transações.\n• Dar as notícias do dia e o tempo da sua cidade.\n• Procurar hospitais, farmácias e supermercados.\n• Explicar como pedir um táxi ou enviar dinheiro.\nEscreva ou use os botões abaixo.',
+    help: 'Posso fazer isto por si:\n• Consultar o saldo e as últimas transações.\n• Dizer-lhe as suas notificações e mensagens pendentes.\n• Verificar se tem de pagar o seu Djangue ou se é a sua vez de receber.\n• Dar as notícias do dia e o tempo da sua cidade.\n• Procurar hospitais, farmácias e supermercados.\n• Explicar como pedir um táxi ou enviar dinheiro.\nEscreva ou use os botões abaixo.',
+    notificationsTitle: 'As suas notificações:\n{list}',
+    noNotifications: 'Não tem notificações nem mensagens pendentes de momento.',
+    djangueTitle: 'Os seus djangues:\n{list}',
+    noDjangue: 'Ainda não participa em nenhum djangue. Pode criar ou entrar num em Mi Djangue.',
+    djangueOwe: 'No {name} falta a sua quota do turno atual: {quota}. Pode pagá-la em Mi Djangue.',
+    djanguePaid: 'No {name} já pagou a quota deste turno.',
+    djangueMyTurn: 'No {name} é a sua vez de receber.',
     unknown: 'Não tenho a certeza de ter entendido. Tente: "o meu saldo", "últimas transações", "notícias", "tempo", "táxi" ou "hospitais".',
     serviceError: 'Não consegui obter essa informação agora. Tente novamente em alguns segundos.',
     movementTypes: { deposit: 'Recarregamento', withdraw: 'Levantamento', transfer: 'Transferência', transfer_sent: 'Envio', transfer_received: 'Recebido', shopping_payment: 'Compra', payment: 'Pagamento', refund: 'Reembolso', default: 'Movimento' },
@@ -4980,6 +5008,8 @@ const LIA_COPY = {
 };
 
 const LIA_INTENTS = [
+  ['djangue', ['djangue', 'djangues', 'tanda', 'tandas', 'cuota', 'cuotas', 'ahorro rotativo', 'cote', 'cotisation', 'tontine', 'poupanca', 'poupança']],
+  ['notifications', ['notificacion', 'notificaciones', 'notification', 'notifications', 'aviso', 'avisos', 'pendiente', 'pendientes', 'mensajes nuevos', 'mensaje nuevo', 'nao lidas', 'nao lidos', 'não lidas', 'não lidos', 'non lus', 'non lues', 'unread']],
   ['activity', ['actividad', 'movimiento', 'movimientos', 'transaccion', 'transacciones', 'resumen', 'historico', 'extracto', 'transaction', 'transactions', 'activity', 'summary', 'historique', 'activite', 'atividade', 'movimentos', 'resumo']],
   ['balance', ['saldo', 'balance', 'solde', 'sald', 'dinero', 'cuanto tengo', 'cuanto dinero', 'tengo en la cuenta', 'cartera', 'wallet', 'argent', 'money', 'dinheiro', 'carteira', 'portefeuille', 'efectivo', 'cash']],
   ['news', ['noticia', 'noticias', 'actualidad', 'actualite', 'actualites', 'news', 'novidade', 'novidades', 'partido', 'futbol', 'deporte', 'deportes', 'match', 'football', 'esporte', 'esportes', 'jogo']],
@@ -5316,8 +5346,20 @@ const liaWeatherReply = async (message, lang, city) => {
   }
 };
 
+// El ancla de idioma va en el propio idioma destino: un system prompt entero
+// en español empujaba al modelo a responder en español (o a saltar al
+// portugués) aunque la app estuviera en francés o inglés.
+const LIA_LANG_PIN = {
+  es: 'IDIOMA OBLIGATORIO: español. Responde SIEMPRE en español, aunque el usuario escriba en otro idioma o el historial esté en otra lengua. Nunca cambies de idioma a mitad de la conversación.',
+  fr: 'LANGUE OBLIGATOIRE : français. Réponds TOUJOURS en français, même si l\'utilisateur écrit dans une autre langue ou si l\'historique est dans une autre langue. Ne change jamais de langue en cours de conversation.',
+  en: 'MANDATORY LANGUAGE: English. ALWAYS reply in English, even if the user writes in another language or the history is in another language. Never switch languages mid-conversation.',
+  pt: 'IDIOMA OBRIGATÓRIO: português. Responde SEMPRE em português, mesmo que o utilizador escreva noutro idioma ou o histórico esteja noutra língua. Nunca mudes de idioma a meio da conversa.',
+};
+
 const liaBuildSystem = (lang, profile, wallet) => [
-  `Eres Lia-25, la asistente de EGCHAT, una superapp de Guinea Ecuatorial: dinero móvil en XAF, chat, MiTaxi, Salud, Supermercados, Noticias, Seguros y zona CEMAC.`,
+  LIA_LANG_PIN[lang] || LIA_LANG_PIN.es,
+  `Eres Lia-25, la asistente de EGCHAT, una superapp de Guinea Ecuatorial: dinero móvil en XAF, chat, Mi Djangue (tandas de ahorro rotativo), MiTaxi, Salud, Supermercados, Noticias, Seguros y zona CEMAC.`,
+  `Eres internacional: entiendes mensajes escritos en cualquier idioma y puedes hablar de cualquier país del mundo; para divisas extranjeras usa convertir_moneda. Pero tu respuesta sale siempre en el idioma obligatorio de arriba.`,
   `Forma de trabajar:`,
   `1. Antes de dar cualquier dato de la cuenta, precios, noticias o lugares, consulta la herramienta correspondiente y responde con lo que devuelva. No inventes cifras, direcciones, teléfonos, horarios ni comisiones.`,
   `2. Si falta un dato imprescindible para resolver o ejecutar (importe, destinatario, ciudad), haz una sola pregunta corta con las opciones concretas.`,
@@ -5325,14 +5367,176 @@ const liaBuildSystem = (lang, profile, wallet) => [
   `4. Para enviar dinero: si el destinatario es un nombre, resuélvelo antes con buscar_destinatario y, si hay varios iguales, pregunta cuál; luego usa preparar_transferencia, muestra el resumen y pide confirmación con el PIN en la app. Nunca afirmes que ya enviaste, pediste o compraste algo.`,
   `5. Para abrir una pantalla usa abrir_pantalla y dile al usuario que la tiene lista; no digas que ya está abierta.`,
   `6. Para «en qué he gastado», «cuánto entra/sale» o comparar periodos usa analizar_gastos. Para «cuánto puedo enviar/retirar hoy» usa consultar_limites. Para cualquier conversión usa convertir_moneda: no hagas la cuenta de memoria.`,
-  `7. Responde solo a la última petición del usuario; si el tema cambió, ignora el anterior por completo.`,
-  `8. Sé precisa y breve (máximo 90 palabras salvo que pidan detalle). No expliques tu proceso, no menciones herramientas, JSON, errores técnicos ni el modelo.`,
+  `7. Para «qué tengo pendiente», «mis notificaciones» o «tengo mensajes nuevos» usa consultar_notificaciones. Para «debo pagar el djangue», «mi tanda» o «mi cuota» usa consultar_djangue y di con claridad si debe pagar, cuánto y en qué tanda; si ya pagó o le toca cobrar, dilo también.`,
+  `8. Responde solo a la última petición del usuario; si el tema cambió, ignora el anterior por completo.`,
+  `9. Sé precisa y breve (máximo 90 palabras salvo que pidan detalle). No expliques tu proceso, no menciones herramientas, JSON, errores técnicos ni el modelo.`,
   `Datos reales del usuario (no los inventes ni los cambies): saldo ${liaMoney(wallet.balance)}; nombre ${profile?.full_name || 'no indicado'}; ciudad ${profile?.city || 'no indicada'}.`,
   `Datos de referencia de la app: tarifas MiTaxi moto 800 XAF, básico 1 500 XAF, premium 3 500 XAF (tarifa plana por viaje, no por km).`,
-  `Pantallas de la app: Cartera (saldo, recargar, retirar, enviar), MiTaxi, Salud, Supermercados, Noticias, Seguros, CEMAC, Bancos, Tarjetas.`,
+  `Pantallas de la app: Cartera (saldo, recargar, retirar, enviar), Mi Djangue, MiTaxi, Salud, Supermercados, Noticias, Seguros, CEMAC, Bancos, Tarjetas.`,
   `Responde SIEMPRE en ${LIA_LANG_NAMES[lang] || 'español'}, de forma clara y amable, con negritas solo cuando aporten.`,
   `Si no puedes resolver algo, dilo en una frase y ofrece la pantalla exacta donde se hace.`,
 ].join('\n');
+
+// ── Candado de idioma ───────────────────────────────────────────────
+// El modelo a veces contesta en portugués cuando la app está en español.
+// Se puntúa la lengua real de la respuesta y, si no coincide con la pedida,
+// se reescribe una sola vez en el idioma correcto antes de entregarla.
+const LIA_LANG_STOPWORDS = {
+  es: ['el', 'la', 'los', 'las', 'tu', 'tus', 'puedes', 'gracias', 'hola', 'qué', 'cómo', 'está', 'estás', 'esto', 'ahora', 'tienes', 'tiene', 'aquí', 'todavía', 'consulta', 'puedo', 'quieres', 'según'],
+  fr: ['le', 'les', 'votre', 'vos', 'vous', 'est', 'pour', 'avec', 'bonjour', 'merci', 'des', 'une', 'nous', 'êtes', 'votre', 'solde', 'français', 'maintenant', 'peux', 'veux', 'consultez'],
+  en: ['the', 'your', 'you', 'is', 'are', 'balance', 'thanks', 'hello', 'please', 'what', 'how', 'can', 'with', 'and', 'have', 'this', 'now', 'check', 'want', 'english'],
+  pt: ['você', 'seu', 'sua', 'seus', 'suas', 'olá', 'obrigado', 'obrigada', 'não', 'também', 'então', 'está', 'isto', 'agora', 'pode', 'posso', 'consulta', 'português', 'ainda', 'aqui'],
+};
+const LIA_LANG_MARKS = {
+  es: /[ñ¿¡]/g,
+  fr: /[èêëùûœç]/g,
+  en: null,
+  pt: /[ãõ]/g,
+};
+
+const liaLangScores = (text) => {
+  const s = ` ${String(text || '').toLowerCase().replace(/[.,;:!?"'(){}\[\]…—–*]/g, ' ').replace(/\s+/g, ' ')} `;
+  const scores = {};
+  for (const lang of LIA_LANGS) {
+    let n = LIA_LANG_STOPWORDS[lang].reduce((acc, w) => (s.includes(` ${w} `) ? acc + 1 : acc), 0);
+    const marks = LIA_LANG_MARKS[lang];
+    if (marks) n += (s.match(marks) || []).length * 2;
+    scores[lang] = n;
+  }
+  return scores;
+};
+
+const liaEnsureLang = async (text, lang) => {
+  if (!text || text.length < 60) return text;
+  const scores = liaLangScores(text);
+  const best = LIA_LANGS.slice().sort((a, b) => scores[b] - scores[a])[0];
+  if (best === lang || scores[best] < 3 || scores[best] <= (scores[lang] || 0) + 1) return text;
+  const provider = liaProvider();
+  if (!provider) return text;
+  const targetNames = { es: 'Spanish', fr: 'French', en: 'English', pt: 'European Portuguese' };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  try {
+    const response = await fetch(`${provider.base}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.key}` },
+      body: JSON.stringify({
+        model: provider.chatModel,
+        temperature: 0,
+        max_tokens: 800,
+        messages: [
+          { role: 'system', content: `You are a translation editor. Rewrite the assistant text into ${targetNames[lang] || 'Spanish'}. Keep EXACTLY the same data, numbers, names, currency amounts and **bold** formatting. Do not add, remove or comment anything. Output only the rewritten text.` },
+          { role: 'user', content: text.slice(0, 3000) },
+        ],
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) return text;
+    const rewritten = (await response.json())?.choices?.[0]?.message?.content;
+    return typeof rewritten === 'string' && rewritten.trim() ? rewritten.trim() : text;
+  } catch (e) {
+    console.warn('LIA language guard failed:', e?.message || e);
+    return text;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+// ── Datos de la app para LIA ────────────────────────────────────────
+// Mensajes sin leer y avisos de djangue: lo mismo que ve la pantalla de
+// notificaciones, para que LIA pueda decir qué tiene pendiente el usuario.
+const liaGetNotifications = async (userId, limit = 8) => {
+  const out = [];
+  try {
+    const { data: parts } = await supabase.from('chat_participants').select('chat_id').eq('user_id', userId);
+    const chatIds = (parts || []).map((p) => p.chat_id);
+    if (chatIds.length) {
+      const { data: msgs } = await supabase.from('messages')
+        .select('id, text, chat_id, sender_id, created_at')
+        .in('chat_id', chatIds)
+        .neq('sender_id', userId)
+        .eq('status', 'sent')
+        .order('created_at', { ascending: false })
+        .limit(limit);
+      const senderIds = [...new Set((msgs || []).map((m) => m.sender_id).filter(Boolean))];
+      const { data: senders } = senderIds.length
+        ? await supabase.from('users').select('id, full_name').in('id', senderIds)
+        : { data: [] };
+      const byId = Object.fromEntries((senders || []).map((u) => [String(u.id), u.full_name]));
+      (msgs || []).forEach((m) => out.push({
+        tipo: 'mensaje',
+        de: byId[String(m.sender_id)] || 'un contacto',
+        texto: String(m.text || '').slice(0, 120),
+        fecha: m.created_at,
+      }));
+    }
+  } catch (e) {
+    console.warn('LIA notifications messages error:', e?.message || e);
+  }
+  try {
+    const { data: dj } = await supabase.from('djangue_notifications')
+      .select('title, message, sent_at, type')
+      .eq('user_id', userId)
+      .eq('read', false)
+      .order('sent_at', { ascending: false })
+      .limit(limit);
+    (dj || []).forEach((n) => out.push({
+      tipo: 'djangue',
+      de: n.title,
+      texto: String(n.message || '').slice(0, 160),
+      fecha: n.sent_at,
+    }));
+  } catch (e) {
+    console.warn('LIA notifications djangue error:', e?.message || e);
+  }
+  out.sort((a, b) => new Date(b.fecha || 0) - new Date(a.fecha || 0));
+  return out.slice(0, limit);
+};
+
+// Estado de cada tanda del usuario: si ya pagó el turno actual, cuánto debe,
+// si le toca cobrar y las multas pendientes.
+const liaDjangueSummary = async (userId) => {
+  const { data: filas, error } = await supabase.from('djangue_members')
+    .select('group_id, turn_order, status')
+    .eq('user_id', userId)
+    .neq('status', 'removed');
+  if (error) {
+    return { error: djFaltaEsquema(error) ? 'El esquema de djangue no está en la base' : 'No se pudieron leer tus djangues' };
+  }
+  const ids = [...new Set((filas || []).map((f) => f.group_id))];
+  if (!ids.length) return { djangues: [] };
+  const [{ data: grupos }, { data: contribs }, { data: multas }] = await Promise.all([
+    supabase.from('djangue_groups').select('*').in('id', ids),
+    supabase.from('djangue_contributions').select('group_id,user_id,turn_number,status').in('group_id', ids),
+    supabase.from('djangue_penalties').select('group_id,penalty_amount,status').eq('user_id', userId).in('group_id', ids),
+  ]);
+  const djangues = (grupos || []).map((g) => {
+    const turno = Number(g.current_turn) || 1;
+    const mia = (contribs || []).find((c) => c.group_id === g.id && c.user_id === userId && Number(c.turn_number) === turno);
+    const pagada = !!mia && mia.status === 'paid';
+    const justificada = !!mia && mia.status === 'justified';
+    const esMiTurno = (filas || []).some((f) => f.group_id === g.id && Number(f.turn_order) === turno);
+    const multa = (multas || [])
+      .filter((p) => p.group_id === g.id && p.status !== 'paid')
+      .reduce((s, p) => s + djNum(p.penalty_amount), 0);
+    return {
+      nombre: g.name,
+      cuota: djNum(g.quota_amount),
+      moneda: g.currency || 'XAF',
+      frecuencia: g.frequency,
+      estado: g.status || 'active',
+      turno_actual: turno,
+      mi_rol: g.owner_id === userId ? 'owner' : g.secretary_id === userId ? 'secretary' : 'member',
+      es_mi_turno: esMiTurno,
+      cuota_pagada: pagada,
+      cuota_justificada: justificada,
+      debo_pagar: !esMiTurno && !pagada && !justificada && (g.status || 'active') === 'active',
+      multas_pendientes: roundAmount(multa),
+      proxima_entrega: g.next_payout_at || null,
+    };
+  });
+  return { djangues };
+};
 
 // ── Herramientas de LIA ─────────────────────────────────────────────
 // Cada herramienta devuelve datos reales y el modelo decide cuál usar.
@@ -5508,11 +5712,32 @@ const LIA_TOOL_DEFS = [
         properties: {
           pantalla: {
             type: 'string',
-            enum: ['cartera', 'enviar', 'recargar', 'retirar', 'taxi', 'salud', 'supermercados', 'noticias', 'bancos', 'tarjetas', 'seguros', 'cemac'],
+            enum: ['cartera', 'enviar', 'recargar', 'retirar', 'taxi', 'salud', 'supermercados', 'noticias', 'bancos', 'tarjetas', 'seguros', 'cemac', 'djangue'],
           },
         },
         required: ['pantalla'],
       },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'consultar_notificaciones',
+      description: 'Notificaciones y mensajes sin leer del usuario: quién le escribió, qué dice y avisos de sus djangues.',
+      parameters: {
+        type: 'object',
+        properties: {
+          limite: { type: 'integer', description: 'Cantidad entre 1 y 10. Por defecto 8.', minimum: 1, maximum: 10 },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'consultar_djangue',
+      description: 'Tandas de ahorro (djangue) del usuario: cuota, si ya pagó el turno actual, si debe pagar, si le toca cobrar y multas pendientes.',
+      parameters: { type: 'object', properties: {} },
     },
   },
 ];
@@ -5676,6 +5901,13 @@ const liaRunTool = async (name, args, userId, lang) => {
     }
     case 'abrir_pantalla':
       return { pantalla: a.pantalla, abrir_en_app: true, ejecutado: false };
+    case 'consultar_notificaciones': {
+      const limite = Math.min(Math.max(Number(a.limite) || 8, 1), 10);
+      const items = await liaGetNotifications(userId, limite);
+      return { total: items.length, notificaciones: items };
+    }
+    case 'consultar_djangue':
+      return await liaDjangueSummary(userId);
     default:
       return { error: `Herramienta desconocida: ${name}` };
   }
@@ -5803,6 +6035,23 @@ const liaAnswer = async (intent, message, lang, userId, history) => {
       if (!movements.length) return copy.noMovements;
       return liaFill(copy.movementsTitle, { movements: movements.map((tx) => liaMovementLine(tx, lang)).join('\n') });
     }
+    case 'notifications': {
+      const items = await liaGetNotifications(userId, 6);
+      if (!items.length) return copy.noNotifications;
+      const list = items.map((n) => `• ${n.de}: ${n.texto}`).join('\n');
+      return liaFill(copy.notificationsTitle, { list });
+    }
+    case 'djangue': {
+      const res = await liaDjangueSummary(userId);
+      if (res.error) return res.error;
+      if (!res.djangues.length) return copy.noDjangue;
+      const lines = res.djangues.map((d) => {
+        if (d.es_mi_turno) return liaFill(copy.djangueMyTurn, { name: d.nombre });
+        if (d.debo_pagar) return liaFill(copy.djangueOwe, { name: d.nombre, quota: liaMoney(d.cuota) });
+        return liaFill(copy.djanguePaid, { name: d.nombre });
+      });
+      return liaFill(copy.djangueTitle, { list: lines.join('\n') });
+    }
     case 'news': {
       if (!Array.isArray(NOTICIAS) || !NOTICIAS.length) return copy.noNews;
       const list = NOTICIAS.slice(0, 5).map((item) => `• ${item.title} (${item.source})`).join('\n');
@@ -5894,7 +6143,7 @@ app.post('/api/lia/chat', auth, async (req, res) => {
         lang, message, history: req.body?.history, userId: req.user.id, profile, wallet,
       });
       if (agent) {
-        reply = agent.text;
+        reply = await liaEnsureLang(agent.text, lang);
         tools = agent.used;
         nav = agent.nav || null;
         transfer = agent.transfer || null;
@@ -5968,7 +6217,7 @@ app.get('/api/lia/status', auth, (_req, res) => {
     tools: LIA_TOOL_DEFS.map((tool) => tool.function.name),
     dictation: Boolean(provider),
     languages: LIA_LANGS,
-    features: ['balance', 'movements', 'spending_analysis', 'limits', 'contacts', 'conversion', 'news', 'weather', 'health', 'markets', 'atm', 'banks', 'rates', 'cards', 'taxi', 'transfers', 'help', 'attachments', 'vision', 'documents'],
+    features: ['balance', 'movements', 'spending_analysis', 'limits', 'contacts', 'conversion', 'news', 'weather', 'health', 'markets', 'atm', 'banks', 'rates', 'cards', 'taxi', 'transfers', 'notifications', 'djangue', 'languages', 'help', 'attachments', 'vision', 'documents'],
   });
 });
 
@@ -8703,7 +8952,7 @@ const liaAttachHandler = async (req, res) => {
       attachmentKind = 'image';
       const imageMime = mime.startsWith('image/') ? mime : (ext === 'png' ? 'image/png' : 'image/jpeg');
       userContent = [
-        { type: 'text', text: caption || copy.imagePrompt },
+        { type: 'text', text: caption ? `${caption}\n\n${copy.imagePrompt}` : copy.imagePrompt },
         { type: 'image_url', image_url: { url: `data:${imageMime};base64,${file.buffer.toString('base64')}` } },
       ];
       models = liaVisionModels(provider);
@@ -8753,6 +9002,7 @@ const liaAttachHandler = async (req, res) => {
     if (!reply) {
       return res.status(502).json({ message: copy.readError, code: 'ATTACH_LLM_FAILED' });
     }
+    reply = await liaEnsureLang(reply, lang);
 
     if (!isLocalUserId(req.user.id)) {
       try {
