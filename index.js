@@ -827,7 +827,7 @@ app.get('/api/auth/me', auth, async (req, res) => {
     return res.json(user);
   }
   const { data: user } = await supabase
-    .from('users').select('id, phone, full_name, avatar_url, created_at').eq('id', req.user.id).single();
+    .from('users').select('id, phone, full_name, avatar_url, banner_url, created_at').eq('id', req.user.id).single();
   if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
   // Marcar como online
   supabase.from('users').update({ online_status: true, last_seen: new Date().toISOString() }).eq('id', req.user.id).then(() => {});
@@ -1003,12 +1003,17 @@ app.post('/api/feedback', auth, async (req, res) => {
 
 app.put('/api/auth/profile', auth, async (req, res) => {
   try {
-    const { full_name, avatar_url } = req.body;
+    const { full_name, avatar_url, banner_url } = req.body;
+    const cambios = {};
+    if (full_name !== undefined) cambios.full_name = full_name;
+    if (avatar_url !== undefined) cambios.avatar_url = avatar_url;
+    if (banner_url !== undefined) cambios.banner_url = banner_url;
+    if (!Object.keys(cambios).length) return res.status(400).json({ message: 'Nada que actualizar' });
     const { data: user, error } = await supabase
       .from('users')
-      .update({ full_name, avatar_url })
+      .update(cambios)
       .eq('id', req.user.id)
-      .select('id, phone, full_name, avatar_url')
+      .select('id, phone, full_name, avatar_url, banner_url')
       .single();
     if (error) throw error;
     res.json(user);
@@ -4760,6 +4765,9 @@ app.post('/api/cemac/transfers', auth, walletLimiter, async (req, res) => {
       });
     }
     
+    const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+    if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
+
     // Reintentar el mismo pedido devuelve la transferencia ya creada.
     if (external_id) {
       const { data: existing } = await supabase.from('cemac_transfers')
@@ -6485,6 +6493,8 @@ app.post('/api/servicios/segesa/pagar', auth, walletLimiter, async (req, res) =>
     message: 'factura_id requerido: se paga una factura consultada, no un importe libre',
     code: 'BILL_ID_REQUIRED',
   });
+  const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+  if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
   const out = await servicePay('segesa', factura_id, req.user.id);
   if (!out.ok) return res.status(out.http || 400).json(out);
   await createServiceOrder(req.user.id, 'segesa', 'pagar', out.response.importe, out.response.bill_id, req.body, out.response);
@@ -6506,6 +6516,8 @@ app.post('/api/servicios/snge/pagar', auth, walletLimiter, async (req, res) => {
     message: 'factura_id requerido: se paga una factura consultada, no un importe libre',
     code: 'BILL_ID_REQUIRED',
   });
+  const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+  if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
   const out = await servicePay('snge', factura_id, req.user.id);
   if (!out.ok) return res.status(out.http || 400).json(out);
   await createServiceOrder(req.user.id, 'snge', 'pagar', out.response.importe, out.response.bill_id, req.body, out.response);
@@ -6527,6 +6539,8 @@ app.post('/api/servicios/dgi/pagar', auth, walletLimiter, async (req, res) => {
     message: 'factura_id requerido: se paga una factura consultada, no un importe libre',
     code: 'BILL_ID_REQUIRED',
   });
+  const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+  if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
   const out = await servicePay('dgi', factura_id, req.user.id);
   if (!out.ok) return res.status(out.http || 400).json(out);
   await createServiceOrder(req.user.id, 'dgi', 'pagar', out.response.importe, out.response.bill_id, req.body, out.response);
@@ -6663,6 +6677,8 @@ app.get('/api/servicios/solicitudes', auth, async (req, res) => {
 app.post('/api/servicios/correos/enviar', auth, walletLimiter, async (req, res) => {
   const { destinatario, peso, tipo } = req.body;
   if (!destinatario) return res.status(400).json({ message: 'destinatario requerido', code: 'VALIDATION_ERROR' });
+  const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+  if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
   const variant = ['nacional', 'express', 'internacional', 'apartado'].includes(tipo) ? tipo : 'nacional';
 
   const tarifa = await readTariff('correos', variant);
@@ -6716,6 +6732,8 @@ app.get('/api/supermarkets/:smId/products', auth, async (req, res) => {
 
 app.post('/api/supermarkets/orders', auth, walletLimiter, async (req, res) => {
   const { items, supermarketId, address, external_id } = req.body;
+  const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+  if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
   if (external_id) {
     const { data: existing } = await supabase.from('service_orders').select('*').eq('order_ref', external_id).eq('user_id', req.user.id).maybeSingle();
     if (existing) return res.json({ orderId: existing.order_ref, status: existing.status, total: existing.amount, balance: null, eta: '30-45 min', idempotent: true });
@@ -6813,6 +6831,8 @@ app.get('/api/salud/medicamentos', auth, async (req, res) => {
 
 app.post('/api/salud/medicamentos/pedido', auth, walletLimiter, async (req, res) => {
   const { items, farmaciaId, direccion, external_id } = req.body || {};
+  const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+  if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
   const pedido = (Array.isArray(items) ? items : []).map(i => ({
     product_id: String(i?.product_id ?? i?.id ?? '').trim(),
     qty: Number(i?.qty ?? i?.cantidad ?? 1),
@@ -6854,6 +6874,8 @@ app.post('/api/taxi/request', auth, walletLimiter, async (req, res) => {
   try {
     const { origin, dest, type } = req.body;
     if (!origin || !dest) return res.status(400).json({ message: 'origin y dest requeridos', code: 'VALIDATION_ERROR' });
+    const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+    if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
     const variant = ['moto', 'basic', 'premium'].includes(type) ? type : 'basic';
 
     const tarifa = await readTariff('taxi', variant);
@@ -7160,6 +7182,9 @@ app.post('/api/insurance/contract', auth, walletLimiter, async (req, res) => {
     if (!insurance_type || !coverage_amount || !duration_months) {
       return res.status(400).json({ message: 'Datos incompletos para contratar' });
     }
+
+    const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+    if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
 
     // Verificar saldo
     const { data: wallet } = await supabase
@@ -7550,6 +7575,9 @@ app.post('/api/seguros/solicitar', auth, walletLimiter, async (req, res) => {
   const { companyId, producto, datos, external_id } = req.body || {};
   if (!companyId || !producto) return res.status(400).json({ message: 'companyId y producto requeridos', code: 'VALIDATION_ERROR' });
   if (!ASEGURADORAS.some(a => a.id === companyId)) return res.status(400).json({ message: 'Aseguradora no encontrada', code: 'COMPANY_NOT_FOUND' });
+
+  const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+  if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
 
   const ref = String(external_id || '').trim() || safeRef('POL');
   const { data, error } = await supabase.rpc('insurance_take_out', {
@@ -8334,6 +8362,9 @@ app.post('/api/djangue/:id/pay', auth, walletLimiter, async (req, res) => {
       return res.json({ ok: true, already: true, amount: djNum(previa.amount), new_balance: await readWalletBalance(uid), all_paid: false, message: 'Tu cuota de este turno ya estaba pagada' });
     }
 
+    const pinCheck = await checkPinForOperation(uid, req.body?.pin);
+    if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
+
     const cobro = await djCobrarCuota({ grupo: d.grupo, userId: uid });
     if (!cobro.ok) return res.status(cobro.http).json({ message: cobro.message, code: cobro.code });
 
@@ -8472,6 +8503,9 @@ app.post('/api/djangue/:id/manual-payout', auth, walletLimiter, async (req, res)
     if (!d) return res.status(404).json({ message: 'Djangue no encontrado', code: 'GROUP_NOT_FOUND' });
     if (d.miRol !== 'owner' && d.miRol !== 'secretary') return res.status(403).json({ message: 'Solo el administrador entrega el pozo', code: 'FORBIDDEN' });
     if (!d.beneficiario) return res.status(400).json({ message: 'No hay beneficiario para este turno', code: 'NO_BENEFICIARY' });
+
+    const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+    if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
 
     const previo = d.pagos.find(p => Number(p.turn_number) === d.turnoActual && p.status === 'completed');
     if (previo) return res.json({ ok: true, already: true, payout: previo, amount: djNum(previo.amount) });
