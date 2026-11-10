@@ -736,8 +736,10 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     if (error) throw error;
 
     // Monedero nuevo a cero: el saldo de bienvenida de las pruebas se abona con
-    // su asiento (SYS-CASH paga, el cliente cobra). Antes se insertaba el saldo
-    // a pelo y el libro mayor no tenía ni idea de de dónde salían esos 5.000.
+    // su asiento, y la contrapartida es SYS-DISCREPANCY, no SYS-CASH: esos 5.000
+    // los pone la casa, no un cliente que los haya depositado, y afirmar caja
+    // sin extracto seria inventar un activo. Antes se insertaba el saldo a pelo
+    // y el libro mayor no tenia ni idea de de donde salian.
     try {
       const { error: walletError } = await supabase.from('wallets').insert({
         user_id: user.id,
@@ -747,7 +749,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       if (!walletError && WALLET_SANDBOX) {
         await creditWallet(user.id, 5000, {
           operation: 'saldo_inicial',
-          account: 'SYS-CASH',
+          account: 'SYS-DISCREPANCY',
           concept: 'Saldo de bienvenida (modo pruebas)',
           key: `OPENING-${user.id}`,
           reference: `OPENING:${user.id}`,
