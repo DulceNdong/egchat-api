@@ -10030,7 +10030,9 @@ const ensureSpacesSchema = async () => {
   for (const t of ['spaces', 'space_follows', 'space_posts', 'space_post_likes', 'space_post_comments', 'stories',
                    'moments', 'moment_likes', 'moment_comments', 'live_streams']) {
     try {
-      const { error } = await supabase.from(t).select('id').limit(1);
+      // moment_likes nace con clave compuesta (moment_id, user_id) y sin `id` en
+      // la base que ya tenia la tabla antes de E1: sondear `id` la daba por rota.
+      const { error } = await supabase.from(t).select(t === 'moment_likes' ? 'moment_id' : 'id').limit(1);
       if (error) faltan.push(`${t}: ${error.message}`);
     } catch (e) {
       faltan.push(`${t}: ${e.message}`);
@@ -10442,7 +10444,7 @@ app.patch('/api/moments/:id', auth, async (req, res) => {
     const { data: autor } = await supabase
       .from('users').select('id, full_name, avatar_url').eq('id', data.user_id).single();
     const { data: misLikes } = await supabase
-      .from('moment_likes').select('id').eq('moment_id', data.id).eq('user_id', req.user.id).maybeSingle();
+      .from('moment_likes').select('moment_id').eq('moment_id', data.id).eq('user_id', req.user.id).maybeSingle();
     res.json(momentoSinComentarios(data, { [data.user_id]: autor || {} }, new Set(misLikes ? [data.id] : [])));
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
@@ -10465,16 +10467,20 @@ app.post('/api/moments/:id/like', auth, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.id;
+    // La clave del like es el par (moment_id, user_id): esa tabla puede no tener
+    // columna `id`, y pedirla hacia que el alta saliera como error de columna y
+    // el borrado del like existente no encontrara nada.
     const { data: existing } = await supabase
-      .from('moment_likes').select('id').eq('moment_id', id).eq('user_id', userId).single();
+      .from('moment_likes').select('moment_id').eq('moment_id', id).eq('user_id', userId).maybeSingle();
     if (existing) {
-      await supabase.from('moment_likes').delete().eq('id', existing.id);
+      const { error } = await supabase.from('moment_likes').delete().eq('moment_id', id).eq('user_id', userId);
+      if (error) throw error;
     } else {
       const { error } = await supabase.from('moment_likes').insert({ moment_id: id, user_id: userId });
       if (error) throw error;
     }
     const { count } = await supabase
-      .from('moment_likes').select('id', { count: 'exact', head: true }).eq('moment_id', id);
+      .from('moment_likes').select('moment_id', { count: 'exact', head: true }).eq('moment_id', id);
     res.json({ liked: !existing, likes: count || 0 });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
