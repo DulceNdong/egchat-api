@@ -2197,6 +2197,81 @@ app.post('/api/chats/:chatId/avatar', auth, async (req, res) => {
   }
 });
 
+// Portada del grupo: la imagen ancha que se ve detras de la foto del perfil.
+app.post('/api/chats/:chatId/cover', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { base64, mimeType = 'image/jpeg' } = req.body || {};
+
+    if (!base64) return res.status(400).json({ message: 'base64 requerido' });
+
+    if (!(await puedeEditarInfoChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'No tienes permiso para cambiar la portada del grupo' });
+    }
+
+    const buffer = Buffer.from(String(base64).replace(/^data:image\/\w+;base64,/, ''), 'base64');
+    if (!buffer.length) return res.status(400).json({ message: 'Imagen inválida' });
+    if (buffer.length > 8 * 1024 * 1024) return res.status(413).json({ message: 'Imagen demasiado grande' });
+
+    const ext = (String(mimeType).split('/')[1] || 'jpg').replace(/[^a-z0-9]/gi, '').slice(0, 5) || 'jpg';
+    const fileName = `group-covers/${chatId}-${Date.now()}.${ext}`;
+
+    let publicUrl = base64;
+    const { error: uploadError } = await supabase.storage
+      .from('avatars')
+      .upload(fileName, buffer, { contentType: mimeType, upsert: true });
+
+    if (!uploadError) {
+      const { data: publicData } = supabase.storage.from('avatars').getPublicUrl(fileName);
+      publicUrl = publicData?.publicUrl || base64;
+    }
+
+    const { error } = await supabase
+      .from('chats')
+      .update({ cover_url: publicUrl, updated_at: new Date().toISOString() })
+      .eq('id', chatId);
+
+    if (error) {
+      if (/cover_url/.test(String(error.message || ''))) {
+        return res.status(503).json({ message: 'Falta la columna chats.cover_url' });
+      }
+      throw error;
+    }
+
+    res.json({ cover_url: publicUrl });
+  } catch (e) {
+    console.error('Upload group cover error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.delete('/api/chats/:chatId/cover', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    if (!(await puedeEditarInfoChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'No tienes permiso para cambiar la portada del grupo' });
+    }
+
+    const { error } = await supabase
+      .from('chats')
+      .update({ cover_url: null, updated_at: new Date().toISOString() })
+      .eq('id', chatId);
+
+    if (error) {
+      if (/cover_url/.test(String(error.message || ''))) {
+        return res.status(503).json({ message: 'Falta la columna chats.cover_url' });
+      }
+      throw error;
+    }
+
+    res.json({ cover_url: null });
+  } catch (e) {
+    console.error('Delete group cover error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // ════════════════════════════════════════════════════════════════════
 // Actualizar nombre y/o avatar de un grupo
 // ════════════════════════════════════════════════════════════════════
@@ -9561,6 +9636,7 @@ app.get('/api/chats/:chatId/info', auth, async (req, res) => {
       name: chat.name,
       description: chat.description || null,
       avatar_url: chat.avatar_url || null,
+      cover_url: chat.cover_url || null,
       created_by: chat.created_by || null,
       created_at: chat.created_at || null,
       broadcast_mode: !!chat.broadcast_mode,
