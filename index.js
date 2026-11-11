@@ -9176,13 +9176,15 @@ app.get('/api/chats/:chatId/wallpaper', auth, async (req, res) => {
 // 404, asi que la pantalla daba por hecho lo que el servidor nunca hizo:
 // decia «has salido del grupo» sin salir, «admin asignado» sin asignar.
 const participacionEnChat = async (chatId, userId) => {
+  // limit(1) y no maybeSingle: una fila duplicada hacia que la consulta
+  // fallara y el socio quedara fuera de su propio grupo.
   const { data } = await supabase
     .from('chat_participants')
     .select('id, role')
     .eq('chat_id', chatId)
     .eq('user_id', userId)
-    .maybeSingle();
-  return data || null;
+    .limit(1);
+  return (data && data[0]) || null;
 };
 
 const esAdminDeChat = async (chatId, userId) => {
@@ -9436,7 +9438,10 @@ app.get('/api/chats/:chatId/info', auth, async (req, res) => {
     const enDjangue = !!d && ((d.miFila && d.miFila.status !== 'removed') || d.miRol === 'owner' || d.miRol === 'secretary');
 
     const mia = await participacionEnChat(chatId, req.user.id);
-    if (!mia && !enDjangue) return res.status(403).json({ message: 'No tienes acceso a este grupo' });
+    const soyCreador = !!chat.created_by && String(chat.created_by) === miId;
+    if (!mia && !soyCreador && !enDjangue) {
+      return res.status(403).json({ message: 'No tienes acceso a este grupo' });
+    }
 
     // Participantes del chat con su rol real
     const { data: parts } = await supabase
