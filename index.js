@@ -9798,6 +9798,56 @@ app.patch('/api/chats/:chatId/ephemeral', auth, async (req, res) => {
   }
 });
 
+// Reportar un grupo: queda para revision del equipo y no avisa al grupo.
+// Una fila por persona y chat; un segundo reporte actualiza el motivo.
+const MOTIVOS_REPORTE = ['spam', 'inappropriate', 'scam', 'other'];
+app.post('/api/chats/:chatId/report', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const motivo = String(req.body?.reason || '').trim();
+
+    if (!MOTIVOS_REPORTE.includes(motivo)) {
+      return res.status(400).json({ message: 'Motivo no valido' });
+    }
+
+    const { data: chat } = await supabase
+      .from('chats')
+      .select('id, type, created_by')
+      .eq('id', chatId)
+      .maybeSingle();
+    if (!chat) return res.status(404).json({ message: 'Chat no encontrado' });
+    if (chat.type !== 'group') return res.status(400).json({ message: 'Solo se pueden reportar grupos' });
+
+    const mia = await participacionEnChat(chatId, req.user.id);
+    const soyCreador = !!chat.created_by && String(chat.created_by) === String(req.user.id);
+    if (!mia && !soyCreador) {
+      return res.status(403).json({ message: 'No participas en este chat' });
+    }
+
+    const { error } = await supabase
+      .from('chat_reports')
+      .upsert(
+        {
+          chat_id: chatId,
+          reporter_id: req.user.id,
+          reason: motivo,
+          created_at: new Date().toISOString(),
+        },
+        { onConflict: 'chat_id,reporter_id' },
+      );
+    if (error) throw error;
+
+    res.json({ message: 'Reporte recibido', reported: true });
+  } catch (e) {
+    console.error('Report chat error:', e);
+    const tablaFalta = /chat_reports|does not exist|schema cache/i.test(String(e?.message || ''));
+    res.status(tablaFalta ? 503 : 500).json({
+      message: e.message,
+      code: tablaFalta ? 'TABLE_MISSING' : 'REPORT_FAILED',
+    });
+  }
+});
+
 // ════════════════════════════════════════════════════════════════════
 // MENSAJES: reacciones, acuses de lectura, busqueda y edicion
 // ════════════════════════════════════════════════════════════════════
