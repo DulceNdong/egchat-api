@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
+const { crearSalasDeLlamada, MAX_PARTICIPANTES: MAX_LLAMADA_GRUPAL } = require('./callRooms');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -2104,12 +2105,22 @@ app.post('/api/chats/group', auth, async (req, res) => {
 
     if (createError) throw createError;
 
-    // Insertar participantes en chat_participants para que aparezca en getChats
-    const participantRows = participant_ids.map(uid => ({
+    // Insertar participantes en chat_participants para que aparezca en getChats.
+    // El creador entra como admin: antes todos entraban sin rol y el grupo
+    // recien creado se quedaba sin administrador en la base.
+    const idsUnicos = [...new Set(participant_ids.map(String))];
+    const participantRows = idsUnicos.map(uid => ({
       chat_id: chat.id,
       user_id: uid,
+      role: String(uid) === String(req.user.id) ? 'admin' : 'member',
     }));
-    await supabase.from('chat_participants').insert(participantRows);
+    const { error: partError } = await supabase.from('chat_participants').insert(participantRows);
+    if (partError) {
+      // Sin participantes el grupo no aparece en ninguna lista: mejor no
+      // dejar el chat huerfano que devolver un 201 de algo inservible.
+      await supabase.from('chats').delete().eq('id', chat.id);
+      throw partError;
+    }
 
     // Formatear respuesta
     const formattedChat = {
@@ -11743,6 +11754,176 @@ app.get('/api/call/incoming/:userId', auth, async (req, res) => {
     res.json([]);
   }
 });
+
+// ════════════════════════════════════════════════════════════════════
+// LLAMADAS GRUPALES — mesh WebRTC (hasta 9) con senalizacion por REST
+// ════════════════════════════════════════════════════════════════════
+// `group-call.tsx` y `useSFUGroupCall` ya existian en la app y pedian estas
+// seis rutas; el servidor no las tenia, asi que la pantalla nunca llegaba a
+// conectar. La app arma el roomId como `group_<chatId>_<Date.now()>`, distinto
+// en cada arranque: se normaliza a `group_<chatId>` para que todos los del
+// grupo caigan en la misma sala sin tocar la app ya instalada.
+const salasLlamada = crearSalasDeLlamada();
+
+const salaDeLlamada = (roomId) => {
+  const m = /^group_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:_\d+)?$/
+    .exec(String(roomId || ''));
+  return m ? { sala: `group_${m[1]}`, chatId: m[1] } : null;
+};
+
+// Cada cliente solo reconoce el roomId con el que arranco, asi que el aviso
+// se emite uno a uno con el suyo, no con el canonico.
+const avisarSala = (sala, excepto, payload) => {
+  for (const m of salasLlamada.miembros(sala)) {
+    if (String(m.userId) === String(excepto)) continue;
+    emitToUser(m.userId, { ...payload, roomId: m.roomIdCrudo });
+  }
+};
+
+app.post('/api/call/room/:roomId/join', auth, async (req, res) => {
+  try {
+    const ref = salaDeLlamada(req.params.roomId);
+    if (!ref) return res.status(400).json({ error: 'ROOM_INVALIDO', message: 'Sala de llamada invalida' });
+
+    const mia = await participacionEnChat(ref.chatId, req.user.id);
+    if (!mia) return res.status(403).json({ error: 'FORBIDDEN', message: 'No perteneces a este grupo' });
+
+    let nombre = String(req.body?.name || '').trim();
+    const avatar = String(req.body?.avatar || '');
+    if (!nombre) {
+      const { data: u } = await supabase.from('users').select('full_name').eq('id', req.user.id).maybeSingle();
+      nombre = u?.full_name || 'Usuario';
+    }
+
+    const r = salasLlamada.unirse(ref.sala, req.user.id, {
+      name: nombre,
+      avatar,
+      callType: req.body?.callType,
+      roomIdCrudo: req.params.roomId,
+    });
+    if (!r.ok) {
+      return res.status(409).json({ error: r.error, message: 'La llamada ya esta completa' });
+    }
+
+    // Quien ya estaba solo se entera; las offers las envia el recien llegado.
+    avisarSala(ref.sala, req.user.id, {
+      type: 'group_call_participant_joined',
+      chatId: ref.chatId,
+      userId: String(req.user.id),
+      name: nombre,
+      avatar,
+    });
+
+    console.log(`[call/room] ${ref.sala} entra ${req.user.id} (${r.participants.length + 1}/${MAX_LLAMADA_GRUPAL})`);
+    res.json({ roomId: ref.sala, chatId: ref.chatId, participants: r.participants, max: MAX_LLAMADA_GRUPAL });
+  } catch (e) {
+    console.error('[call/room/join]', e.message);
+    res.status(500).json({ error: 'Error al entrar en la llamada' });
+  }
+});
+
+const rutaSenalSala = (tipo) => async (req, res) => {
+  try {
+    const ref = salaDeLlamada(req.params.roomId);
+    if (!ref) return res.status(400).json({ error: 'ROOM_INVALIDO', message: 'Sala de llamada invalida' });
+
+    const destino = String(req.body?.toUserId || '');
+    const dato = tipo === 'ice' ? req.body?.candidate : req.body?.sdp;
+    const ok = salasLlamada.senal(ref.sala, req.user.id, tipo, destino,
+      tipo === 'ice' ? { candidate: dato } : { sdp: dato });
+    if (!ok) return res.status(409).json({ error: 'SIN_DESTINO', message: 'El destinatario ya no esta en la llamada' });
+
+    salasLlamada.tocar(ref.sala, req.user.id);
+    // Adelanto por SSE; el sondeo de 800 ms sigue siendo la red de seguridad.
+    const m = salasLlamada.miembros(ref.sala).find(x => String(x.userId) === destino);
+    if (m) {
+      emitToUser(destino, {
+        type: 'group_call_signal',
+        roomId: m.roomIdCrudo,
+        from: String(req.user.id),
+        signalType: tipo,
+        ...(tipo === 'ice' ? { candidate: dato } : { sdp: dato }),
+      });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(`[call/room/${tipo}]`, e.message);
+    res.status(500).json({ error: 'Error enviando la senal' });
+  }
+};
+
+app.post('/api/call/room/:roomId/offer', auth, rutaSenalSala('offer'));
+app.post('/api/call/room/:roomId/answer', auth, rutaSenalSala('answer'));
+app.post('/api/call/room/:roomId/ice', auth, rutaSenalSala('ice'));
+
+app.get('/api/call/room/:roomId/signals', auth, (req, res) => {
+  const ref = salaDeLlamada(req.params.roomId);
+  if (!ref) return res.status(400).json({ error: 'ROOM_INVALIDO', message: 'Sala de llamada invalida' });
+  // El sondeo cada 800 ms es tambien la senal de vida que renueva el TTL.
+  salasLlamada.tocar(ref.sala, req.user.id);
+  res.json(salasLlamada.pendientes(ref.sala, req.user.id));
+});
+
+app.delete('/api/call/room/:roomId/leave', auth, (req, res) => {
+  const ref = salaDeLlamada(req.params.roomId);
+  if (!ref) return res.status(400).json({ error: 'ROOM_INVALIDO', message: 'Sala de llamada invalida' });
+  const r = salasLlamada.salir(ref.sala, req.user.id);
+  if (r.ok) {
+    avisarSala(ref.sala, req.user.id, {
+      type: 'group_call_participant_left',
+      chatId: ref.chatId,
+      userId: String(req.user.id),
+    });
+  }
+  res.json({ ok: true, left: r.ok, remaining: r.otros.length });
+});
+
+// Aviso al resto del grupo de que hay llamada en curso. La app lo llama al
+// entrar en la sala; sin esto solo se enteraba quien pulsara llamar a la vez.
+app.post('/api/call/room/:roomId/invite', auth, async (req, res) => {
+  try {
+    const ref = salaDeLlamada(req.params.roomId);
+    if (!ref) return res.status(400).json({ error: 'ROOM_INVALIDO', message: 'Sala de llamada invalida' });
+
+    const dentro = salasLlamada.miembros(ref.sala).map(m => String(m.userId));
+    if (!dentro.includes(String(req.user.id))) {
+      return res.status(409).json({ error: 'NO_ESTAS_EN_LA_SALA', message: 'Entra en la llamada antes de invitar' });
+    }
+
+    const { data: partes } = await supabase
+      .from('chat_participants').select('user_id').eq('chat_id', ref.chatId);
+    const destinos = [...new Set((partes || []).map(p => String(p.user_id)))]
+      .filter(id => !dentro.includes(id));
+
+    const callType = req.body?.callType === 'video' ? 'video' : 'audio';
+    const nombre = String(req.body?.name || '').trim() || 'Alguien';
+    for (const id of destinos) {
+      emitToUser(id, {
+        type: 'group_call_invited',
+        roomId: ref.sala,
+        chatId: ref.chatId,
+        fromUserId: String(req.user.id),
+        name: nombre,
+        callType,
+      });
+      // Si tiene la app cerrada, el aviso llega como notificacion normal.
+      sendPushToUser(id, {
+        title: `${nombre} · ${callType === 'video' ? 'videollamada grupal' : 'llamada de grupo'}`,
+        body: 'Toca para unirte',
+        notificationType: 'group_call_invited',
+        roomId: ref.sala,
+        chatId: ref.chatId,
+        callType,
+      }).catch(() => {});
+    }
+    res.json({ ok: true, invited: destinos.length, roomId: ref.sala });
+  } catch (e) {
+    console.error('[call/room/invite]', e.message);
+    res.status(500).json({ error: 'Error invitando al grupo' });
+  }
+});
+
+setInterval(() => salasLlamada.barrer(), 60000).unref?.();
 
 // Limpieza periódica usando RPC expire_stale_calls
 setInterval(async () => {
