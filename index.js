@@ -1687,6 +1687,41 @@ app.get('/api/chats', auth, async (req, res) => {
       return acc;
     }, {});
 
+    // Foto del djangue: si el grupo no tiene foto propia, manda el logo que
+    // se subio al abrir el djangue. Se busca por chat vinculado y, si el
+    // vinculo falta, por el nombre "💰 Nombre" con el que se crea el chat.
+    const logoDjangue = {};
+    const chatsSinFoto = chats.filter(c => (c.type || 'private') === 'group' && !c.avatar_url);
+    if (chatsSinFoto.length) {
+      try {
+        const { data: ligados } = await supabase
+          .from('djangue_groups')
+          .select('chat_group_id, logo_url')
+          .in('chat_group_id', chatsSinFoto.map(c => c.id));
+        (ligados || []).forEach(g => {
+          if (g.chat_group_id && g.logo_url) logoDjangue[String(g.chat_group_id)] = g.logo_url;
+        });
+
+        const sinVinculo = chatsSinFoto.filter(c =>
+          !logoDjangue[String(c.id)] && String(c.name || '').startsWith('💰'));
+        if (sinVinculo.length) {
+          const nombres = [...new Set(sinVinculo.map(c => String(c.name).replace(/^💰\s*/, '')))];
+          const { data: porNombre } = await supabase
+            .from('djangue_groups')
+            .select('name, logo_url')
+            .in('name', nombres);
+          const logoPorNombre = {};
+          (porNombre || []).forEach(g => { if (g.name && g.logo_url) logoPorNombre[g.name] = g.logo_url; });
+          sinVinculo.forEach(c => {
+            const n = String(c.name || '').replace(/^💰\s*/, '');
+            if (logoPorNombre[n]) logoDjangue[String(c.id)] = logoPorNombre[n];
+          });
+        }
+      } catch (e) {
+        console.warn('[CHATS] logo del djangue:', e.message);
+      }
+    }
+
     // No leídos reales por chat: el servidor los acumula al entrar cada mensaje
     const unreadByChat = {};
     (rawParticipants || []).forEach(p => {
@@ -1699,7 +1734,7 @@ app.get('/api/chats', auth, async (req, res) => {
       id: chat.id,
       type: chat.type || 'private',
       name: chat.name,
-      avatar_url: chat.avatar_url || null,
+      avatar_url: chat.avatar_url || logoDjangue[String(chat.id)] || null,
       description: chat.description || null,
       created_by: chat.created_by || null,
       participants: participantsByChat[chat.id] || [],
@@ -9514,12 +9549,20 @@ app.get('/api/chats/:chatId/info', auth, async (req, res) => {
     const { data: chat } = await supabase.from('chats').select('*').eq('id', chatId).maybeSingle();
     if (!chat) return res.status(404).json({ message: 'Chat no encontrado' });
 
-    // Djangue vinculado a este chat (si existe el esquema)
+    // Djangue vinculado a este chat (si existe el esquema). Si el vinculo no
+    // esta escrito, se busca por el nombre "💰 Nombre" del chat del djangue.
     let d = null;
     try {
       const { data: djRow } = await supabase
         .from('djangue_groups').select('id').eq('chat_group_id', chatId).maybeSingle();
-      if (djRow) d = await djCargar(req.user.id, djRow.id);
+      let djId = djRow?.id || null;
+      if (!djId && String(chat.name || '').startsWith('💰')) {
+        const { data: porNombre } = await supabase
+          .from('djangue_groups').select('id')
+          .eq('name', String(chat.name).replace(/^💰\s*/, '')).maybeSingle();
+        djId = porNombre?.id || null;
+      }
+      if (djId) d = await djCargar(req.user.id, djId);
     } catch { d = null; }
     const enDjangue = !!d && ((d.miFila && d.miFila.status !== 'removed') || d.miRol === 'owner' || d.miRol === 'secretary');
 
@@ -9635,7 +9678,7 @@ app.get('/api/chats/:chatId/info', auth, async (req, res) => {
       type: chat.type || 'group',
       name: chat.name,
       description: chat.description || null,
-      avatar_url: chat.avatar_url || null,
+      avatar_url: chat.avatar_url || d?.grupo?.logo_url || null,
       cover_url: chat.cover_url || null,
       created_by: chat.created_by || null,
       created_at: chat.created_at || null,
