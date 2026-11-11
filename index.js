@@ -1834,6 +1834,13 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
       .from('chat_participants').select('chat_id').eq('chat_id', chatId).eq('user_id', req.user.id).single();
     if (!part) return res.status(403).json({ message: 'Sin acceso' });
 
+    // Modo difusion: en un grupo broadcast solo escriben los administradores
+    const { data: chatCfg } = await supabase
+      .from('chats').select('broadcast_mode').eq('id', chatId).maybeSingle();
+    if (chatCfg && chatCfg.broadcast_mode && !(await esAdminDeChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'Solo los administradores pueden escribir en este grupo' });
+    }
+
     const seleccion = 'id, text, type, created_at, sender_id, status, file_url';
     // client_ref es la clave que manda el emisor: el indice unico
     // (chat_id, sender_id, client_ref) corta el reintento que duplicaba el
@@ -2129,14 +2136,10 @@ app.post('/api/chats/:chatId/avatar', auth, async (req, res) => {
 
     if (!base64) return res.status(400).json({ message: 'base64 requerido' });
 
-    // Verificar acceso
-    const { data: part } = await supabase
-      .from('chat_participants')
-      .select('id')
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.id)
-      .single();
-    if (!part) return res.status(403).json({ message: 'Sin acceso' });
+    // Solo quien puede editar la info (admin o permiso edit_info='all') cambia la foto
+    if (!(await puedeEditarInfoChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'No tienes permiso para cambiar la foto del grupo' });
+    }
 
     // Convertir base64 a buffer
     const base64Data = base64.replace(/^data:image\/\w+;base64,/, '');
@@ -2347,14 +2350,19 @@ app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
 
     if (!myPart) return res.status(403).json({ message: 'No tienes acceso a este chat' });
 
-    // Obtener IDs de participantes
+    // Obtener IDs de participantes con su rol real
     const { data: parts, error: partsError } = await supabase
       .from('chat_participants')
-      .select('user_id')
+      .select('user_id, role')
       .eq('chat_id', chatId);
 
     if (partsError) throw partsError;
     if (!parts || parts.length === 0) return res.json([]);
+
+    // El creador del grupo siempre es administrador aunque su fila diga lo contrario
+    const { data: chatRow } = await supabase
+      .from('chats').select('created_by').eq('id', chatId).maybeSingle();
+    const creadorId = chatRow && chatRow.created_by ? String(chatRow.created_by) : null;
 
     // Obtener info completa de usuarios en consulta separada (más robusto que FK join)
     const userIds = parts.map(p => p.user_id);
@@ -2407,7 +2415,8 @@ app.get('/api/chats/:chatId/participants', auth, async (req, res) => {
         avatar_url: u.avatar_url || '',
         online_status: oculta ? false : estaEnLineaAhora(u.last_seen),
         last_seen: oculta ? null : (u.last_seen || null),
-        role: uid === yoId ? 'admin' : 'member',
+        role: p.role === 'admin' || (creadorId && uid === creadorId) ? 'admin' : 'member',
+        is_creator: !!creadorId && uid === creadorId,
       };
     });
 
@@ -9081,6 +9090,15 @@ app.post('/api/lia/attach', auth, liaAttachHandler);
 app.post('/api/chats/:chatId/participants', auth, async (req, res) => {
   try {
     const { user_id } = req.body;
+    // Añadir miembros lo decide el permiso add_members: por defecto cualquiera,
+    // con 'admins' solo administradores o el creador.
+    if (!(await esAdminDeChat(req.params.chatId, req.user.id))) {
+      const { data: c } = await supabase
+        .from('chats').select('settings').eq('id', req.params.chatId).maybeSingle();
+      if (chatPermisos(c).add_members !== 'all') {
+        return res.status(403).json({ message: 'Solo un administrador puede añadir miembros' });
+      }
+    }
     // Reañadir al que ya está no debe duplicar la fila: sin onConflict, PostgREST
     // intenta el alta por clave primaria (id), que aqui no llega.
     const { error } = await supabase
@@ -9175,14 +9193,32 @@ const esAdminDeChat = async (chatId, userId) => {
   return !!chat && String(chat.created_by) === String(userId);
 };
 
+// Permisos granulares del grupo. Viven en chats.settings (JSONB); cuando la
+// columna aun no existe en la base se devuelven los valores por defecto.
+const PERMISOS_GRUPO_DEFECTO = { edit_info: 'admins', add_members: 'all', invite_admins_only: false };
+const chatPermisos = (chat) => {
+  const s = chat && chat.settings && typeof chat.settings === 'object' ? chat.settings : {};
+  return {
+    edit_info: s.edit_info === 'all' ? 'all' : 'admins',
+    add_members: s.add_members === 'admins' ? 'admins' : 'all',
+    invite_admins_only: !!s.invite_admins_only,
+  };
+};
+const puedeEditarInfoChat = async (chatId, userId) => {
+  if (await esAdminDeChat(chatId, userId)) return true;
+  const { data: c } = await supabase.from('chats').select('settings').eq('id', chatId).maybeSingle();
+  return chatPermisos(c).edit_info === 'all';
+};
+
 // El cliente manda PATCH para renombrar; el servidor solo tenia PUT.
+// Ademas del nombre admite descripcion y respeta el permiso edit_info.
 app.patch('/api/chats/:chatId', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
-    const { name, avatar_url } = req.body || {};
+    const { name, avatar_url, description } = req.body || {};
 
-    if (!(await esAdminDeChat(chatId, req.user.id))) {
-      return res.status(403).json({ message: 'Solo un administrador puede editar el grupo' });
+    if (!(await puedeEditarInfoChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'No tienes permiso para editar este grupo' });
     }
 
     const { data: chat } = await supabase
@@ -9196,6 +9232,7 @@ app.patch('/api/chats/:chatId', auth, async (req, res) => {
     const updates = { updated_at: new Date().toISOString() };
     if (typeof name === 'string' && name.trim() !== '') updates.name = name.trim();
     if (typeof avatar_url === 'string' && avatar_url !== '') updates.avatar_url = avatar_url;
+    if (typeof description === 'string') updates.description = description.trim() || null;
     if (Object.keys(updates).length === 1) {
       return res.status(400).json({ message: 'Nada que actualizar' });
     }
@@ -9325,7 +9362,8 @@ app.patch('/api/chats/:chatId/participants/:userId/role', auth, async (req, res)
   }
 });
 
-// Ajustes del grupo. Hoy solo el modo difusion, que es lo que ofrece la app.
+// Ajustes del grupo: modo difusion + permisos granulares (quien edita la
+// info, quien añade miembros y quien puede generar el enlace de invitacion).
 app.patch('/api/chats/:chatId/settings', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
@@ -9334,24 +9372,190 @@ app.patch('/api/chats/:chatId/settings', auth, async (req, res) => {
       return res.status(403).json({ message: 'Solo un administrador puede cambiar los ajustes' });
     }
 
-    const updates = { updated_at: new Date().toISOString() };
-    if (typeof req.body?.broadcast_mode === 'boolean') updates.broadcast_mode = req.body.broadcast_mode;
-    if (Object.keys(updates).length === 1) {
-      return res.status(400).json({ message: 'Nada que actualizar' });
-    }
+    const { data: chatRow } = await supabase
+      .from('chats').select('id, broadcast_mode, settings').eq('id', chatId).maybeSingle();
+    if (!chatRow) return res.status(404).json({ message: 'Chat no encontrado' });
 
-    const { data: actualizado, error } = await supabase
-      .from('chats')
-      .update(updates)
-      .eq('id', chatId)
-      .select('broadcast_mode')
-      .maybeSingle();
+    const prev = chatPermisos(chatRow);
+    const permissions = {
+      edit_info: req.body?.edit_info === 'all' || req.body?.edit_info === 'admins' ? req.body.edit_info : prev.edit_info,
+      add_members: req.body?.add_members === 'all' || req.body?.add_members === 'admins' ? req.body.add_members : prev.add_members,
+      invite_admins_only: typeof req.body?.invite_admins_only === 'boolean' ? req.body.invite_admins_only : prev.invite_admins_only,
+    };
+    const broadcast = typeof req.body?.broadcast_mode === 'boolean' ? req.body.broadcast_mode : !!chatRow.broadcast_mode;
+
+    const updates = {
+      updated_at: new Date().toISOString(),
+      broadcast_mode: broadcast,
+      settings: permissions,
+    };
+    let actualizado = null;
+    let error = null;
+    ({ data: actualizado, error } = await supabase
+      .from('chats').update(updates).eq('id', chatId).select('broadcast_mode, settings').maybeSingle());
+    if (error && /settings/.test(String(error.message || ''))) {
+      // La columna settings todavia no esta en la base: se guarda lo esencial.
+      ({ data: actualizado, error } = await supabase
+        .from('chats')
+        .update({ updated_at: updates.updated_at, broadcast_mode: broadcast })
+        .eq('id', chatId).select('broadcast_mode').maybeSingle());
+    }
     if (error) throw error;
     if (!actualizado) return res.status(404).json({ message: 'Chat no encontrado' });
 
-    res.json({ message: 'Ajustes guardados', broadcast_mode: !!actualizado.broadcast_mode });
+    res.json({
+      message: 'Ajustes guardados',
+      broadcast_mode: !!actualizado.broadcast_mode,
+      permissions: chatPermisos(actualizado),
+    });
   } catch (e) {
     console.error('Chat settings error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Ficha completa del grupo en una sola llamada: datos, permisos reales,
+// participantes con rol verdadero y, si el chat esta ligado a un djangue,
+// sus cuotas del turno. Los miembros del djangue se fusionan con los
+// participantes del chat para que un grupo vinculado nunca abra vacio.
+app.get('/api/chats/:chatId/info', auth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const miId = String(req.user.id);
+
+    const { data: chat } = await supabase.from('chats').select('*').eq('id', chatId).maybeSingle();
+    if (!chat) return res.status(404).json({ message: 'Chat no encontrado' });
+
+    // Djangue vinculado a este chat (si existe el esquema)
+    let d = null;
+    try {
+      const { data: djRow } = await supabase
+        .from('djangue_groups').select('id').eq('chat_group_id', chatId).maybeSingle();
+      if (djRow) d = await djCargar(req.user.id, djRow.id);
+    } catch { d = null; }
+    const enDjangue = !!d && ((d.miFila && d.miFila.status !== 'removed') || d.miRol === 'owner' || d.miRol === 'secretary');
+
+    const mia = await participacionEnChat(chatId, req.user.id);
+    if (!mia && !enDjangue) return res.status(403).json({ message: 'No tienes acceso a este grupo' });
+
+    // Participantes del chat con su rol real
+    const { data: parts } = await supabase
+      .from('chat_participants').select('user_id, role').eq('chat_id', chatId);
+    const roleMap = {};
+    (parts || []).forEach(p => { roleMap[String(p.user_id)] = p.role; });
+    const creador = chat.created_by ? String(chat.created_by) : null;
+
+    // Los miembros activos del djangue entran tambien aunque el chat viejo
+    // no tenga filas en chat_participants
+    const djIds = enDjangue ? (d.activos || []).map(m => String(m.user_id)) : [];
+    const todosIds = [...new Set([...(parts || []).map(p => String(p.user_id)), ...djIds])];
+
+    const { data: usersRows } = todosIds.length
+      ? await supabase.from('users').select('id, full_name, phone, avatar_url, online_status, last_seen').in('id', todosIds)
+      : { data: [] };
+    const uMap = {};
+    (usersRows || []).forEach(u => { uMap[String(u.id)] = u; });
+
+    // Visibilidad de ultima conexion: la decide el dueno del dato
+    const otrosIds = todosIds.filter(uid => uid !== miId);
+    const visMap = {};
+    if (otrosIds.length) {
+      const { data: prefsRows } = await supabase
+        .from('user_preferences').select('user_id, last_seen_visibility').in('user_id', otrosIds);
+      (prefsRows || []).forEach(p => { visMap[String(p.user_id)] = p.last_seen_visibility; });
+    }
+    let misContactos = new Set();
+    if (Object.values(visMap).includes('contactos')) {
+      const { data: agenda } = await supabase
+        .from('contacts').select('contact_user_id').eq('user_id', req.user.id);
+      misContactos = new Set((agenda || []).map(c => String(c.contact_user_id)));
+    }
+
+    // Estado de cuota del turno por miembro del djangue
+    const djByUser = {};
+    if (enDjangue) {
+      (d.activos || []).forEach(m => {
+        const contrib = (d.delTurno || []).find(c => String(c.user_id) === String(m.user_id));
+        djByUser[String(m.user_id)] = {
+          turn_order: Number(m.turn_order) || null,
+          paid_current_turn: !!contrib && contrib.status === 'paid',
+          has_justified: !!contrib && contrib.status === 'justified',
+          is_current_beneficiary: !!d.beneficiario && String(d.beneficiario.user_id) === String(m.user_id),
+        };
+      });
+    }
+
+    const turnoDe = (uid) => djByUser[uid] && djByUser[uid].turn_order != null ? djByUser[uid].turn_order : 9999;
+    const participants = todosIds.map(uid => {
+      const u = uMap[uid] || {};
+      const esAdminGrupo = roleMap[uid] === 'admin' || (!!creador && uid === creador);
+      const vis = visMap[uid] || 'todos';
+      const oculta = uid !== miId && (vis === 'nadie' || (vis === 'contactos' && !misContactos.has(uid)));
+      return {
+        user_id: uid,
+        full_name: u.full_name || '',
+        phone: u.phone || '',
+        avatar_url: u.avatar_url || '',
+        role: esAdminGrupo ? 'admin' : 'member',
+        is_creator: !!creador && uid === creador,
+        online_status: oculta ? false : estaEnLineaAhora(u.last_seen),
+        last_seen: oculta ? null : (u.last_seen || null),
+        djangue: djByUser[uid] || null,
+      };
+    }).sort((a, b) =>
+      (b.role === 'admin' ? 1 : 0) - (a.role === 'admin' ? 1 : 0) ||
+      turnoDe(a.user_id) - turnoDe(b.user_id) ||
+      (a.full_name || '').localeCompare(b.full_name || ''));
+
+    // Resumen financiero del djangue para la ficha del grupo
+    let djangue = null;
+    if (enDjangue) {
+      const g = d.grupo;
+      const activos = d.activos || [];
+      const delTurno = d.delTurno || [];
+      const pagados = activos.filter(m => {
+        const c = delTurno.find(x => String(x.user_id) === String(m.user_id));
+        return c && c.status === 'paid';
+      }).length;
+      const b = d.beneficiario;
+      const usuB = b ? (d.usuarios?.[b.user_id] || {}) : {};
+      djangue = {
+        id: g.id,
+        name: g.name,
+        logo_url: g.logo_url || null,
+        quota_amount: djNum(g.quota_amount),
+        currency: g.currency || 'XAF',
+        frequency: g.frequency || 'monthly',
+        penalty_percent: djNum(g.penalty_percent),
+        current_turn: d.turnoActual || 1,
+        total_turns: Number(g.total_turns) || activos.length,
+        status: g.status || 'active',
+        period_end_date: g.period_end_date || null,
+        beneficiary: b ? { user_id: b.user_id, full_name: usuB.full_name || null, avatar_url: usuB.avatar_url || null } : null,
+        paid_count: pagados,
+        pending_count: Math.max(0, activos.length - pagados - (b ? 1 : 0)),
+        expected_payout: djPozoEsperado(g, activos),
+        my: djByUser[miId] || null,
+      };
+    }
+
+    res.json({
+      id: chat.id,
+      type: chat.type || 'group',
+      name: chat.name,
+      description: chat.description || null,
+      avatar_url: chat.avatar_url || null,
+      created_by: chat.created_by || null,
+      created_at: chat.created_at || null,
+      broadcast_mode: !!chat.broadcast_mode,
+      ephemeral_seconds: Number(chat.ephemeral_seconds || 0),
+      permissions: chatPermisos(chat),
+      my_role: (roleMap[miId] === 'admin' || (!!creador && miId === creador)) ? 'admin' : 'member',
+      participants,
+      djangue,
+    });
+  } catch (e) {
+    console.error('Chat info error:', e);
     res.status(500).json({ message: e.message });
   }
 });
@@ -9364,6 +9568,12 @@ app.post('/api/chats/:chatId/invite-link', auth, async (req, res) => {
 
     if (!(await participacionEnChat(chatId, req.user.id))) {
       return res.status(403).json({ message: 'No participas en este chat' });
+    }
+
+    const { data: chatPerm } = await supabase
+      .from('chats').select('settings').eq('id', chatId).maybeSingle();
+    if (chatPermisos(chatPerm).invite_admins_only && !(await esAdminDeChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'Solo un administrador puede generar el enlace' });
     }
 
     let { data: chat } = await supabase
