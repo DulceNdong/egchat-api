@@ -13919,6 +13919,107 @@ app.get('/api/kyc/pending', requireAdmin, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════════════
+// Centro Legal: versiones vigentes y aceptaciones
+// ══════════════════════════════════════════════════════════════════
+// El texto de los documentos viaja dentro de la app (src/legal/content) y se
+// publica por OTA; aquí solo viven las versiones vigentes y el registro de
+// aceptación. Los identificadores y versiones deben coincidir con
+// egchat-mobile/src/legal/registry.ts.
+const LEGAL_DOCUMENTS = [
+  { id: 'terms', version: '1.0.0', publishedAt: '2026-11-12', effectiveAt: '2026-11-12' },
+  { id: 'privacy', version: '1.0.0', publishedAt: '2026-11-12', effectiveAt: '2026-11-12' },
+];
+const LEGAL_DOCUMENT_VERSIONS = new Map(LEGAL_DOCUMENTS.map((doc) => [doc.id, doc.version]));
+const LEGAL_LANGUAGES = new Set(['es', 'fr', 'en', 'zh']);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const mapLegalAcceptance = (row) => ({
+  documentId: row.document_id,
+  version: row.version,
+  language: row.language,
+  acceptedAt: row.accepted_at,
+});
+
+// GET /api/legal/requirements — versión vigente de cada documento y lo que el
+// usuario ya aceptó (en cualquier dispositivo).
+app.get('/api/legal/requirements', auth, async (req, res) => {
+  try {
+    const userId = String(req.user.id || '');
+    if (!UUID_PATTERN.test(userId)) {
+      return res.json({ documents: LEGAL_DOCUMENTS, accepted: [] });
+    }
+    const { data, error } = await supabase
+      .from('legal_acceptances')
+      .select('document_id, version, language, accepted_at')
+      .eq('user_id', userId)
+      .order('accepted_at', { ascending: false });
+    if (error && !tablaAuxiliarAusente(error)) throw error;
+    res.json({
+      documents: LEGAL_DOCUMENTS,
+      accepted: (data || []).map(mapLegalAcceptance),
+    });
+  } catch (e) {
+    console.error('[LEGAL] requirements:', e.message);
+    res.status(500).json({ message: 'No se pudieron leer las aceptaciones' });
+  }
+});
+
+// POST /api/legal/acceptance — registro idempotente. No guarda IP ni agente de
+// usuario: solo usuario, documento, versión, idioma y fecha de aceptación.
+app.post('/api/legal/acceptance', auth, async (req, res) => {
+  const entries = req.body?.acceptances;
+  if (!Array.isArray(entries) || entries.length === 0 || entries.length > LEGAL_DOCUMENTS.length) {
+    return res.status(400).json({ message: 'Aceptaciones inválidas' });
+  }
+
+  const userId = String(req.user.id || '');
+  if (!UUID_PATTERN.test(userId)) {
+    return res.status(400).json({ message: 'Usuario no válido para registrar aceptaciones' });
+  }
+
+  const now = Date.now();
+  const maxSkew = 5 * 60 * 1000;
+  const rows = [];
+  for (const entry of entries) {
+    const documentId = typeof entry?.documentId === 'string' ? entry.documentId : '';
+    const version = typeof entry?.version === 'string' ? entry.version : '';
+    const language = typeof entry?.language === 'string' ? entry.language.toLowerCase() : '';
+    if (LEGAL_DOCUMENT_VERSIONS.get(documentId) !== version) {
+      return res.status(400).json({ message: `Documento o versión no reconocidos: ${documentId}` });
+    }
+    if (!LEGAL_LANGUAGES.has(language)) {
+      return res.status(400).json({ message: 'Idioma no válido' });
+    }
+    const parsed = typeof entry?.acceptedAt === 'string' ? Date.parse(entry.acceptedAt) : NaN;
+    const acceptedAt = Number.isFinite(parsed) && parsed <= now + maxSkew
+      ? new Date(parsed).toISOString()
+      : new Date(now).toISOString();
+    rows.push({
+      user_id: userId,
+      document_id: documentId,
+      version,
+      language,
+      accepted_at: acceptedAt,
+    });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('legal_acceptances')
+      .upsert(rows, { onConflict: 'user_id,document_id,version', ignoreDuplicates: true })
+      .select('document_id');
+    if (error) throw error;
+    res.json({ success: true, saved: (data || []).length });
+  } catch (e) {
+    if (tablaAuxiliarAusente(e)) {
+      return res.status(503).json({ message: 'El registro de aceptaciones todavía no está disponible' });
+    }
+    console.error('[LEGAL] acceptance:', e.message);
+    res.status(500).json({ message: 'No se pudo guardar la aceptación' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════
 // Canales sin teléfono inteligente (USSD / SMS / IVR)
 // ══════════════════════════════════════════════════════════════════
 // El menú de marcación lee y mueve dinero por la misma primitiva que la app —
