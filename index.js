@@ -13926,8 +13926,8 @@ app.get('/api/kyc/pending', requireAdmin, async (req, res) => {
 // aceptación. Los identificadores y versiones deben coincidir con
 // egchat-mobile/src/legal/registry.ts.
 const LEGAL_DOCUMENTS = [
-  { id: 'terms', version: '1.0.0', publishedAt: '2026-11-12', effectiveAt: '2026-11-12' },
-  { id: 'privacy', version: '1.0.0', publishedAt: '2026-11-12', effectiveAt: '2026-11-12' },
+  { id: 'terms', version: '1.1.0', publishedAt: '2026-11-12', effectiveAt: '2026-11-12' },
+  { id: 'privacy', version: '1.1.0', publishedAt: '2026-11-12', effectiveAt: '2026-11-12' },
 ];
 const LEGAL_DOCUMENT_VERSIONS = new Map(LEGAL_DOCUMENTS.map((doc) => [doc.id, doc.version]));
 const LEGAL_LANGUAGES = new Set(['es', 'fr', 'en', 'zh']);
