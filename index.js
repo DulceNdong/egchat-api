@@ -1306,6 +1306,20 @@ app.delete('/api/auth/delete-account', auth, async (req, res) => {
       return res.json({ ok: true, message: 'Cuenta eliminada' });
     }
 
+    // No se cierra una cuenta con un djangue vivo: hay que liquidar y salir antes
+    // para no dejar cuotas ni pozo pendientes. Se tolera que falte el esquema.
+    const { data: djMembresias, error: djMembErr } = await supabase
+      .from('djangue_members')
+      .select('group_id, djangue_groups(status)')
+      .eq('user_id', req.user.id)
+      .neq('status', 'removed');
+    if (!djMembErr && (djMembresias || []).some(m => m.djangue_groups && m.djangue_groups.status !== 'archived')) {
+      return res.status(409).json({
+        message: 'Tienes un djangue activo. Liquida y sal de él antes de eliminar la cuenta.',
+        code: 'DJANGUE_ACTIVE',
+      });
+    }
+
     // El saldo es la guarda real: una cuenta con dinero no se cierra, porque el
     // asiento que lo respalda se quedaría huérfano. Se lee la fila, no se crea
     // monedero si no existe (getWallet lo alta).
@@ -2130,7 +2144,6 @@ app.post('/api/chats/group', auth, async (req, res) => {
         type: 'group',
         name,
         avatar_url,
-        participants: participants.map(p => ({ user_id: p.id })),
         created_by: req.user.id,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
@@ -2371,83 +2384,37 @@ app.put('/api/chats/:chatId', auth, async (req, res) => {
 app.delete('/api/chats/:chatId', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
-
-    const { data: miParticipacion } = await supabase
-      .from('chat_participants')
-      .select('chat_id')
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.id)
-      .maybeSingle();
-    if (!miParticipacion) return res.status(403).json({ message: 'No tienes acceso a este chat' });
-
     const { data: chat } = await supabase
-      .from('chats')
-      .select('id, type, created_by')
-      .eq('id', chatId)
-      .maybeSingle();
+      .from('chats').select('id, type, created_by').eq('id', chatId).maybeSingle();
     if (!chat) return res.status(404).json({ message: 'Chat no encontrado' });
 
-    if (chat.type === 'group') {
-      const esCreador = String(chat.created_by || '') === String(req.user.id);
-      const { data: restantes } = await supabase
-        .from('chat_participants')
-        .select('user_id')
-        .eq('chat_id', chatId)
-        .neq('user_id', req.user.id);
-      const seguidores = (restantes || []).length;
-
-      if (!esCreador && seguidores > 0) {
-        const { error: errorSalida } = await supabase
-          .from('chat_participants')
-          .delete()
-          .eq('chat_id', chatId)
-          .eq('user_id', req.user.id);
-        if (errorSalida) throw errorSalida;
-        return res.json({ message: 'Has salido del grupo', left: true });
-      }
-    }
+    // Privados: borrado permanente. Grupos: permanente por defecto (el creador
+    // borra; el resto liquida/sale dentro de la funcion). Djangue queda guarded.
+    const esPrivado = chat.type !== 'group';
+    const flag = req.query.permanent ?? req.body?.permanent;
+    const permanente = esPrivado ? true : (flag === undefined ? true : String(flag) === 'true' || flag === true);
 
     let otroUsuario = null;
-    if (chat.type === 'private') {
+    if (esPrivado) {
       const { data: otros } = await supabase
-        .from('chat_participants')
-        .select('user_id')
-        .eq('chat_id', chatId)
-        .neq('user_id', req.user.id);
+        .from('chat_participants').select('user_id').eq('chat_id', chatId).neq('user_id', req.user.id);
       otroUsuario = otros?.[0]?.user_id || null;
     }
 
-    const { data: mensajes } = await supabase
-      .from('messages').select('id').eq('chat_id', chatId);
-    const idsDeMensajes = (mensajes || []).map((m) => m.id);
+    const { data: resultado, error } = await supabase.rpc('chat_safe_delete', {
+      p_chat_id: chatId, p_user_id: req.user.id, p_permanent: permanente,
+    });
+    if (error) return djRpcFail(res, error);
 
-    if (idsDeMensajes.length) {
-      const { error: errorBorrado } = await supabase
-        .from('message_deletions').delete().in('message_id', idsDeMensajes);
-      if (errorBorrado && !tablaAuxiliarAusente(errorBorrado)) throw errorBorrado;
-    }
-
-    const { error: errorMensajes } = await supabase.from('messages').delete().eq('chat_id', chatId);
-    if (errorMensajes) throw errorMensajes;
-    const { error: errorLecturas } = await supabase.from('message_reads').delete().eq('chat_id', chatId);
-    if (errorLecturas && !tablaAuxiliarAusente(errorLecturas)) throw errorLecturas;
-    const { error: errorParticipantes } = await supabase.from('chat_participants').delete().eq('chat_id', chatId);
-    if (errorParticipantes) throw errorParticipantes;
-    const { error: errorChat } = await supabase.from('chats').delete().eq('id', chatId);
-    if (errorChat) throw errorChat;
-
-    if (otroUsuario) {
+    if (esPrivado && resultado?.deleted && otroUsuario) {
       const { error: errorContacto } = await supabase
-        .from('contacts')
-        .delete()
-        .eq('user_id', req.user.id)
-        .eq('contact_user_id', otroUsuario);
-      if (errorContacto) {
-        console.warn('Delete chat: el contacto asociado no se pudo borrar:', errorContacto.message);
-      }
+        .from('contacts').delete().eq('user_id', req.user.id).eq('contact_user_id', otroUsuario);
+      if (errorContacto) console.warn('Delete chat: el contacto asociado no se pudo borrar:', errorContacto.message);
     }
 
-    res.json({ message: 'Chat eliminado', messages_deleted: idsDeMensajes.length });
+    if (resultado?.deleted) return res.json({ message: 'Chat eliminado', deleted: true, permanent: true });
+    if (resultado?.archived) return res.json({ message: 'Djangue archivado', deleted: true, archived: true });
+    return res.json({ message: 'Has salido del grupo', left: true, settlement: resultado?.settlement || null });
   } catch (e) {
     console.error('Delete chat error:', e);
     res.status(500).json({ message: e.message });
@@ -7820,6 +7787,59 @@ const djFalloEsquema = (res, error) => {
   return false;
 };
 
+// Las funciones transaccionales de ciclo lanzan 'CODIGO: mensaje'. Se traduce el
+// codigo a un HTTP estable para que el movil pueda distinguir consentimiento,
+// ciclo activo, roster bloqueado, etc. sin parsear texto libre.
+const DJ_RPC_HTTP = {
+  FORBIDDEN: 403,
+  GROUP_NOT_FOUND: 404, CHAT_NOT_FOUND: 404, USER_NOT_FOUND: 404, INVITATION_NOT_FOUND: 404,
+  CONSENT_REQUIRED: 409, QUOTE_CHANGED: 409, CONSENT_TERMS_LOCKED: 409, CYCLE_ACTIVE: 409, ROSTER_LOCKED: 409, POT_INCOMPLETE: 409,
+  PAYOUT_PENDING: 409, CYCLE_NOT_COMPLETED: 409, DECISIONS_PENDING: 409, NOT_ENOUGH_MEMBERS: 409,
+  GROUP_FULL: 409, ALREADY_MEMBER: 409, INVITATION_CLOSED: 409, DEBTS_PENDING: 409, DJANGUE_EXIT_REQUIRED: 409,
+  BENEFICIARY_DOES_NOT_PAY: 400, GROUP_NOT_ACTIVE: 400, VALIDATION_ERROR: 400,
+  NOTHING_TO_PAY: 400, NO_BENEFICIARY: 400, INSUFFICIENT_BALANCE: 400,
+  CHARGE_FAILED: 502, PAYOUT_FAILED: 502,
+};
+const djRpcFail = (res, error) => {
+  if (djFalloEsquema(res, error)) return;
+  const msg = String((error && error.message) || '');
+  const code = msg.split(':')[0].trim();
+  const sinSaldo = /saldo insuficiente/i.test(msg);
+  const http = sinSaldo ? 400 : (DJ_RPC_HTTP[code] || 500);
+  const finalCode = sinSaldo ? 'INSUFFICIENT_BALANCE' : (DJ_RPC_HTTP[code] ? code : 'DJANGUE_ERROR');
+  res.status(http).json({
+    message: msg.includes(':') ? msg.slice(msg.indexOf(':') + 1).trim() : msg,
+    code: finalCode,
+  });
+};
+
+// Devuelve el djangue activo ligado a un chat, o null. Si el esquema no esta,
+// se trata como chat normal (null) para no romper grupos clasicos.
+const djGrupoPorChat = async (chatId) => {
+  const { data, error } = await supabase
+    .from('djangue_groups').select('id, owner_id, secretary_id, status, chat_group_id')
+    .eq('chat_group_id', chatId).neq('status', 'archived').maybeSingle();
+  if (error) { if (djFaltaEsquema(error)) return null; throw error; }
+  return data || null;
+};
+
+// Aviso de djangue por SSE + push. La fila en djangue_notifications la inserta
+// la funcion transaccional; aqui solo se empuja al dispositivo del usuario.
+const djPush = async (userId, { title, body, groupId, cycleId, subtype, invitationId }) => {
+  const payload = {
+    type: 'djangue_notification',
+    notificationType: 'djangue',
+    subtype: subtype || null,
+    groupId,
+    cycleId: cycleId || null,
+    invitationId: invitationId || null,
+    title,
+    body,
+  };
+  try { emitToUser(userId, payload); } catch { /* SSE best-effort */ }
+  try { await sendPushToUser(userId, payload); } catch { /* push best-effort */ }
+};
+
 const djUsuarios = async (ids) => {
   const limpios = [...new Set((ids || []).filter(Boolean))];
   if (!limpios.length) return {};
@@ -7855,12 +7875,12 @@ const djCargar = async (userId, groupId) => {
   const activos = filas.filter(m => m.status !== 'removed');
   const usuarios = await djUsuarios(filas.map(m => m.user_id));
   const miFila = filas.find(m => m.user_id === userId) || null;
-  const miRol = grupo.owner_id === userId ? 'owner'
-    : grupo.secretary_id === userId ? 'secretary'
-      : miFila && miFila.status !== 'removed' ? 'member' : 'visitante';
+  const miRol = miFila && miFila.status !== 'removed'
+    ? grupo.owner_id === userId ? 'owner' : grupo.secretary_id === userId ? 'secretary' : 'member'
+    : 'visitante';
   const beneficiario = activos.find(m => Number(m.turn_order) === Number(grupo.current_turn)) || null;
   const turnoActual = Number(grupo.current_turn) || 1;
-  const delTurno = (contribuciones || []).filter(c => Number(c.turn_number) === turnoActual);
+  const delTurno = (contribuciones || []).filter(c => Number(c.turn_number) === turnoActual && c.cycle_id === grupo.current_cycle_id);
 
   return {
     grupo,
@@ -7885,46 +7905,6 @@ const djPozoEsperado = (grupo, activos) => {
   return roundAmount(djNum(grupo.quota_amount) * aportantes);
 };
 
-// Un asiento por cuota. La clave de idempotencia lleva grupo, turno y usuario:
-// reintentar el pago no cobra dos veces.
-const djCobrarCuota = async ({ grupo, userId }) => {
-  const quota = roundAmount(djNum(grupo.quota_amount));
-  const key = `DJG-${grupo.id}-T${grupo.current_turn}-${userId}`;
-  const { data, error } = await supabase.rpc('ledger_post', {
-    p_user_id: userId,
-    p_operation: 'pago_servicio',
-    p_idempotency_key: key,
-    p_concept: `Cuota djangue ${grupo.name} turno ${grupo.current_turn}`,
-    p_lines: [
-      { wallet_user_id: userId, entry_type: 'debit', amount: quota },
-      { account: 'SYS-SUSPENSE', entry_type: 'credit', amount: quota },
-    ],
-    p_reference: `${grupo.id}:${key}`,
-  });
-  if (error) {
-    const sinSaldo = /saldo insuficiente/i.test(error.message || '');
-    return { ok: false, http: sinSaldo ? 400 : 500, code: sinSaldo ? 'INSUFFICIENT_BALANCE' : 'CHARGE_FAILED', message: sinSaldo ? 'Saldo insuficiente' : 'No se pudo cobrar la cuota' };
-  }
-  return { ok: true, journal: data || {} };
-};
-
-const djEntregarPozo = async ({ grupo, beneficiario, monto }) => {
-  const key = `DJGP-${grupo.id}-T${grupo.current_turn}`;
-  const { data, error } = await supabase.rpc('ledger_post', {
-    p_user_id: beneficiario.user_id,
-    p_operation: 'reembolso',
-    p_idempotency_key: key,
-    p_concept: `Entrega djangue ${grupo.name} turno ${grupo.current_turn}`,
-    p_lines: [
-      { account: 'SYS-SUSPENSE', entry_type: 'debit', amount: roundAmount(monto) },
-      { wallet_user_id: beneficiario.user_id, entry_type: 'credit', amount: roundAmount(monto) },
-    ],
-    p_reference: `${grupo.id}:${key}`,
-  });
-  if (error) return { ok: false, message: error.message };
-  return { ok: true, journal: data || {} };
-};
-
 // GET /api/djangue/my-list — va antes que /:id para que no lo capture el comodin.
 app.get('/api/djangue/my-list', auth, async (req, res) => {
   try {
@@ -7938,7 +7918,7 @@ app.get('/api/djangue/my-list', auth, async (req, res) => {
       supabase.from('djangue_groups').select('*').in('id', ids),
       supabase.from('djangue_members').select('group_id,user_id,turn_order,status').in('group_id', ids),
       supabase.from('djangue_wallets').select('group_id,balance,currency').in('group_id', ids),
-      supabase.from('djangue_contributions').select('group_id,user_id,turn_number,status').in('group_id', ids),
+      supabase.from('djangue_contributions').select('group_id,user_id,turn_number,status,cycle_id').in('group_id', ids),
     ]);
 
     const admin = [], member = [];
@@ -7948,7 +7928,7 @@ app.get('/api/djangue/my-list', auth, async (req, res) => {
       const turno = Number(g.current_turn) || 1;
       const beneficiario = propios.find(m => Number(m.turn_order) === turno);
       const mio = propios.find(m => m.user_id === uid);
-      const pagada = (contribs || []).some(c => c.group_id === g.id && c.user_id === uid && Number(c.turn_number) === turno && c.status === 'paid');
+      const pagada = (contribs || []).some(c => c.group_id === g.id && c.cycle_id === g.current_cycle_id && c.user_id === uid && Number(c.turn_number) === turno && c.status === 'paid');
       const rol = g.owner_id === uid ? 'owner' : g.secretary_id === uid ? 'secretary' : 'member';
       const fila = {
         id: g.id,
@@ -7995,7 +7975,7 @@ app.get('/api/djangues', auth, async (req, res) => {
     const [{ data: miembros }, { data: wallets }, { data: contribs }] = await Promise.all([
       supabase.from('djangue_members').select('group_id,user_id,turn_order,status').in('group_id', ids),
       supabase.from('djangue_wallets').select('group_id,balance,currency').in('group_id', ids),
-      supabase.from('djangue_contributions').select('group_id,user_id,turn_number,status').in('group_id', ids),
+      supabase.from('djangue_contributions').select('group_id,user_id,turn_number,status,cycle_id').in('group_id', ids),
     ]);
 
     const salida = (grupos || []).map(g => {
@@ -8021,7 +8001,7 @@ app.get('/api/djangues', auth, async (req, res) => {
         member_count: propios.length,
         my_role: rol,
         my_turn_order: mio ? Number(mio.turn_order) : null,
-        my_paid_this_turn: (contribs || []).some(c => c.group_id === g.id && c.user_id === uid && Number(c.turn_number) === turno && c.status === 'paid'),
+        my_paid_this_turn: (contribs || []).some(c => c.group_id === g.id && c.cycle_id === g.current_cycle_id && c.user_id === uid && Number(c.turn_number) === turno && c.status === 'paid'),
         is_my_turn: !!beneficiario && beneficiario.user_id === uid,
       };
     });
@@ -8051,39 +8031,24 @@ app.post('/api/djangue', auth, async (req, res) => {
       if (secretario.id === uid) secretario = null;
     }
 
-    const inicio = new Date();
-    const fin = djFechaFin(freq.dias === 1 ? 'daily' : frequency, inicio);
-    const { data: grupo, error } = await supabase.from('djangue_groups').insert({
-      name: String(name).trim(),
-      description: description ? String(description).trim() : null,
-      logo_url: logo_url ? String(logo_url) : null,
-      frequency: String(frequency).toLowerCase(),
-      quota_amount: quota,
-      currency: 'XAF',
-      max_members: maxMiembros,
-      owner_id: uid,
-      secretary_id: secretario ? secretario.id : null,
-      current_turn: 1,
-      total_turns: secretario ? 2 : 1,
-      period_start_date: inicio.toISOString(),
-      period_end_date: fin.toISOString(),
-      next_payout_at: fin.toISOString(),
-    }).select('*').maybeSingle();
-    if (error) { if (djFalloEsquema(res, error)) return; return res.status(502).json({ message: error.message, code: 'GROUP_CREATE_FAILED' }); }
-
-    await supabase.from('djangue_wallets').insert({ group_id: grupo.id, balance: 0, currency: 'XAF' });
-    const filas = [{ group_id: grupo.id, user_id: uid, turn_order: 1, status: 'active' }];
-    if (secretario) filas.push({ group_id: grupo.id, user_id: secretario.id, turn_order: 2, status: 'active' });
-    const { error: errMiembros } = await supabase.from('djangue_members').insert(filas);
-    if (errMiembros) {
-      await supabase.from('djangue_groups').delete().eq('id', grupo.id);
-      if (djFalloEsquema(res, errMiembros)) return;
-      return res.status(502).json({ message: errMiembros.message, code: 'GROUP_CREATE_FAILED' });
+    if (req.body?.accept_terms !== true) {
+      return res.status(409).json({ code: 'CONSENT_REQUIRED', message: 'Acepta los términos del djangue antes de crearlo' });
     }
-    await supabase.from('djangue_groups').update({ total_turns: filas.length }).eq('id', grupo.id);
-
+    const { data: result, error } = await supabase.rpc('dj_create_group', {
+      p_owner_id: uid, p_name: String(name).trim(), p_frequency: String(frequency).toLowerCase(),
+      p_quota: quota, p_max_members: maxMiembros, p_secretary_id: secretario?.id || null,
+      p_description: description ? String(description).trim() : null, p_logo_url: logo_url ? String(logo_url) : null,
+    });
+    if (error) return djRpcFail(res, error);
+    const grupo = result.group;
+    if (secretario && result.invitation) {
+      await djPush(secretario.id, {
+        title: 'Invitación a Djangue', body: `Te invitaron a ${grupo.name}. Acepta los términos para entrar.`,
+        groupId: grupo.id, cycleId: grupo.current_cycle_id, subtype: 'invitation', invitationId: result.invitation.id,
+      });
+    }
     await logAudit(uid, 'djangue_create', 'djangue', grupo.id, { quota, frequency, max_members: maxMiembros });
-    res.status(201).json({ ...grupo, total_turns: filas.length, group: { ...grupo, total_turns: filas.length }, id: grupo.id });
+    res.status(201).json({ ...grupo, group: grupo, invitation: result.invitation });
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
@@ -8153,10 +8118,17 @@ app.patch('/api/djangue/:id', auth, async (req, res) => {
     if (b.slogan !== undefined) parche.slogan = b.slogan ? String(b.slogan) : null;
     if (b.description !== undefined) parche.description = b.description ? String(b.description) : null;
     if (b.logo_url !== undefined) parche.logo_url = b.logo_url ? String(b.logo_url) : null;
-    if (b.penalty_percent !== undefined) parche.penalty_percent = Math.max(0, Math.min(100, djNum(b.penalty_percent)));
+    if (['quota_amount', 'frequency', 'max_members', 'penalty_percent'].some(key => b[key] !== undefined && String(b[key]) !== String(d.grupo[key]))) {
+      return res.status(409).json({ code: 'CONSENT_TERMS_LOCKED', message: 'Las condiciones aceptadas no se pueden cambiar' });
+    }
     if (b.notification_days_before !== undefined) parche.notification_days_before = Math.max(0, Number(b.notification_days_before) || 0);
     if (b.notification_final_days !== undefined) parche.notification_final_days = Math.max(0, Number(b.notification_final_days) || 0);
     if (b.status === 'active' || b.status === 'paused') parche.status = b.status;
+    // Un ciclo completado o archivado no se reactiva por PATCH: para seguir hay
+    // que iniciar el proximo ciclo con las decisiones de cada integrante.
+    if (b.status === 'active' && (d.grupo.status === 'completed' || d.grupo.status === 'archived')) {
+      return res.status(409).json({ message: 'Usa «iniciar próximo ciclo» para continuar', code: 'CYCLE_COMPLETED' });
+    }
 
     const yaPago = d.contribuciones.some(c => c.status === 'paid');
     if (!yaPago) {
@@ -8178,9 +8150,9 @@ app.patch('/api/djangue/:id', auth, async (req, res) => {
     parche.updated_at = new Date().toISOString();
 
     const { data, error } = await supabase.from('djangue_groups').update(parche).eq('id', d.grupo.id).select('*').maybeSingle();
-    if (error) { if (djFalloEsquema(res, error)) return; return res.status(502).json({ message: error.message, code: 'GROUP_UPDATE_FAILED' }); }
+    if (error) return djRpcFail(res, error);
     await logAudit(req.user.id, 'djangue_update', 'djangue', d.grupo.id, { campos: Object.keys(parche), bloqueado_por_pagos: yaPago });
-    res.json({ ...data, financiero_editable: !yaPago });
+    res.json({ ...data, financiero_editable: false });
   } catch (e) {
     if (e.djSchema) return res.status(502).json({ message: 'El esquema de djangue no esta en la base', code: 'DJANGUE_SCHEMA' });
     res.status(500).json({ message: e.message });
@@ -8188,6 +8160,8 @@ app.patch('/api/djangue/:id', auth, async (req, res) => {
 });
 
 // POST /api/djangue/:id/members y /add-member — la app usa las dos para lo mismo.
+// Ya no se da de alta directa: se crea una invitacion que el usuario debe aceptar
+// con los términos del ciclo. El roster se bloquea en cuanto hay un pago.
 const djAgregarMiembro = async (req, res) => {
   try {
     const d = await djCargar(req.user.id, req.params.id);
@@ -8196,30 +8170,20 @@ const djAgregarMiembro = async (req, res) => {
 
     const persona = await djBuscarUsuarioPorTelefono((req.body || {}).phone);
     if (!persona) return res.status(404).json({ message: 'No hay ningun usuario con ese telefono', code: 'USER_NOT_FOUND' });
-    if (d.grupo.owner_id === persona.id) return res.status(400).json({ message: 'El dueno ya esta en el djangue', code: 'ALREADY_MEMBER' });
 
-    const existente = d.miembros.find(m => m.user_id === persona.id);
-    if (existente && existente.status !== 'removed') return res.status(400).json({ message: 'Ese usuario ya es integrante', code: 'ALREADY_MEMBER' });
-    if (d.activos.length >= Number(d.grupo.max_members || 12)) return res.status(400).json({ message: 'El djangue ya esta lleno', code: 'GROUP_FULL' });
+    const { data: r, error } = await supabase.rpc('dj_invite_member', {
+      p_group_id: d.grupo.id, p_actor_id: req.user.id, p_user_id: persona.id,
+    });
+    if (error) return djRpcFail(res, error);
+    const invitacion = r?.invitation || null;
 
-    const siguiente = d.miembros.reduce((max, m) => Math.max(max, Number(m.turn_order) || 0), 0) + 1;
-    let miembro;
-    if (existente) {
-      const { data, error } = await supabase.from('djangue_members')
-        .update({ status: 'active', turn_order: siguiente, joined_at: new Date().toISOString() })
-        .eq('id', existente.id).select('*').maybeSingle();
-      if (error) { if (djFalloEsquema(res, error)) return; return res.status(502).json({ message: error.message, code: 'MEMBER_ADD_FAILED' }); }
-      miembro = data;
-    } else {
-      const { data, error } = await supabase.from('djangue_members')
-        .insert({ group_id: d.grupo.id, user_id: persona.id, turn_order: siguiente, status: 'active' })
-        .select('*').maybeSingle();
-      if (error) { if (djFalloEsquema(res, error)) return; return res.status(502).json({ message: error.message, code: 'MEMBER_ADD_FAILED' }); }
-      miembro = data;
-    }
-    await supabase.from('djangue_groups').update({ total_turns: d.activos.length + 1, updated_at: new Date().toISOString() }).eq('id', d.grupo.id);
-    await logAudit(req.user.id, 'djangue_add_member', 'djangue', d.grupo.id, { user_id: persona.id, turn_order: siguiente });
-    res.status(201).json({ member: miembro, user: persona, turn_order: siguiente });
+    await logAudit(req.user.id, 'djangue_invite_member', 'djangue', d.grupo.id, { user_id: persona.id, invitation_id: invitacion?.id });
+    await djPush(persona.id, {
+      title: 'Invitación a Djangue',
+      body: `Te invitaron a ${d.grupo.name}. Abre la invitación y acepta los términos para entrar.`,
+      groupId: d.grupo.id, subtype: 'invitation', invitationId: invitacion?.id,
+    });
+    res.status(201).json({ invitation: invitacion, user: persona, pending: true });
   } catch (e) {
     if (e.djSchema) return res.status(502).json({ message: 'El esquema de djangue no esta en la base', code: 'DJANGUE_SCHEMA' });
     res.status(500).json({ message: e.message });
@@ -8241,11 +8205,13 @@ app.delete('/api/djangue/:id/remove-member', auth, async (req, res) => {
     if (fila.user_id === d.grupo.owner_id) return res.status(400).json({ message: 'El dueno no se puede quitar', code: 'OWNER_PROTECTED' });
     if (Number(fila.turn_order) === d.turnoActual) return res.status(400).json({ message: 'No se puede quitar al integrante que recibe este turno', code: 'BENEFICIARY_PROTECTED' });
 
-    const { error } = await supabase.from('djangue_members').update({ status: 'removed' }).eq('id', fila.id);
-    if (error) { if (djFalloEsquema(res, error)) return; return res.status(502).json({ message: error.message, code: 'MEMBER_REMOVE_FAILED' }); }
-    await supabase.from('djangue_groups').update({ total_turns: Math.max(1, d.activos.length - 1), updated_at: new Date().toISOString() }).eq('id', d.grupo.id);
-    await logAudit(req.user.id, 'djangue_remove_member', 'djangue', d.grupo.id, { member_id: fila.id, user_id: fila.user_id });
-    res.json({ ok: true, member_id: fila.id });
+    // Expulsion con liquidacion: se cobra lo que debe antes de quitarlo.
+    const { data: r, error } = await supabase.rpc('dj_settle_and_exit', {
+      p_group_id: d.grupo.id, p_user_id: fila.user_id, p_actor_id: req.user.id, p_remove_chat: true,
+    });
+    if (error) return djRpcFail(res, error);
+    await logAudit(req.user.id, 'djangue_remove_member', 'djangue', d.grupo.id, { member_id: fila.id, user_id: fila.user_id, settlement: r?.settlement_amount });
+    res.json({ ok: true, member_id: fila.id, settlement_amount: r?.settlement_amount ?? 0 });
   } catch (e) {
     if (e.djSchema) return res.status(502).json({ message: 'El esquema de djangue no esta en la base', code: 'DJANGUE_SCHEMA' });
     res.status(500).json({ message: e.message });
@@ -8257,12 +8223,13 @@ app.post('/api/djangue/:id/ensure-chat', auth, async (req, res) => {
   try {
     const d = await djCargar(req.user.id, req.params.id);
     if (!d) return res.status(404).json({ message: 'Djangue no encontrado', code: 'GROUP_NOT_FOUND' });
+    if (d.miRol !== 'owner' && d.miRol !== 'secretary') return res.status(403).json({ message: 'Solo el administrador vincula el chat', code: 'FORBIDDEN' });
     if (d.grupo.chat_group_id) return res.json({ chat_group_id: d.grupo.chat_group_id });
 
     let chatId = (req.body || {}).chat_group_id || null;
     if (chatId) {
-      const { data: chat } = await supabase.from('chats').select('id, created_by').eq('id', chatId).maybeSingle();
-      if (!chat || chat.created_by !== req.user.id) chatId = null;
+      const { data: chat } = await supabase.from('chats').select('id, created_by, type').eq('id', chatId).maybeSingle();
+      if (!chat || chat.created_by !== req.user.id || chat.type !== 'group') chatId = null;
     }
     if (!chatId) {
       const { data: chats } = await supabase.from('chats').select('id, name, created_at')
@@ -8307,6 +8274,24 @@ app.get('/api/djangue/:id/member-view', auth, async (req, res) => {
     const fechaBase = g.next_payout_at ? new Date(g.next_payout_at) : new Date();
     const fechaMia = new Date(fechaBase.getTime() + vueltas * (djFrecuencia(g.frequency) || DJ_FRECUENCIAS.monthly).dias * 86400000);
 
+    // Estado de ciclo, consentimiento y deuda de salida reales (no se perdona
+    // una cuota justificada: solo lo pagado reduce la deuda).
+    let exitQuote = null;
+    let cycleId = g.current_cycle_id || null;
+    let cycleStatus = null;
+    let consentAccepted = false;
+    try {
+      const { data: q } = await supabase.rpc('dj_exit_quote', { p_group_id: g.id, p_user_id: uid });
+      exitQuote = q || null;
+    } catch { /* esquema ausente: se omiten los campos de ciclo */ }
+    if (cycleId) {
+      const { data: cy } = await supabase.from('djangue_cycles').select('status').eq('id', cycleId).maybeSingle();
+      cycleStatus = cy?.status || null;
+      const { data: cs } = await supabase.from('djangue_consents').select('id')
+        .eq('group_id', g.id).eq('cycle_id', cycleId).eq('user_id', uid).maybeSingle();
+      consentAccepted = !!cs;
+    }
+
     res.json({
       group_id: g.id,
       group_name: g.name,
@@ -8316,6 +8301,10 @@ app.get('/api/djangue/:id/member-view', auth, async (req, res) => {
       quota_amount: cuota,
       chat_group_id: g.chat_group_id,
       status: g.status,
+      cycle_id: cycleId,
+      cycle_status: cycleStatus,
+      consent_accepted: consentAccepted,
+      exit_quote: exitQuote,
       current_turn: d.turnoActual,
       total_turns: totalTurnos,
       my_turn_order: miTurno,
@@ -8325,7 +8314,7 @@ app.get('/api/djangue/:id/member-view', auth, async (req, res) => {
       expected_payout: roundAmount(cuota * Math.max(0, activos - 1)),
       paid_current_turn: esBeneficiario ? true : pagada,
       amount_paid_current_turn: pagada ? djNum(miContribucion.amount) : 0,
-      amount_owed: esBeneficiario || pagada || justificada ? 0 : cuota,
+      amount_owed: esBeneficiario || pagada ? 0 : cuota,
       has_justified: justificada,
       total_paid: roundAmount(misContribuciones.reduce((s, c) => s + djNum(c.amount), 0)),
       total_received: roundAmount(misPagos.reduce((s, p) => s + djNum(p.amount), 0)),
@@ -8497,44 +8486,24 @@ app.post('/api/djangue/:id/pay', auth, walletLimiter, async (req, res) => {
     const pinCheck = await checkPinForOperation(uid, req.body?.pin);
     if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
 
-    const cobro = await djCobrarCuota({ grupo: d.grupo, userId: uid });
-    if (!cobro.ok) return res.status(cobro.http).json({ message: cobro.message, code: cobro.code });
+    // Pago atomico: consentimiento + asiento + contribucion + pozo en una sola
+    // transaccion. accept_terms registra el consentimiento si aun no existe.
+    const { data: r, error } = await supabase.rpc('dj_pay_quota', {
+      p_group_id: d.grupo.id, p_user_id: uid, p_accept_terms: req.body?.accept_terms === true,
+    });
+    if (error) return djRpcFail(res, error);
 
-    const journalId = cobro.journal && cobro.journal.journal_id ? cobro.journal.journal_id : null;
-    const importe = roundAmount(djNum(d.grupo.quota_amount));
-    const ahora = new Date().toISOString();
-    if (previa) {
-      await supabase.from('djangue_contributions').update({
-        status: 'paid', amount: importe, paid_at: ahora, transaction_id: journalId,
-      }).eq('id', previa.id);
-    } else {
-      await supabase.from('djangue_contributions').insert({
-        group_id: d.grupo.id,
-        member_id: d.miFila.id,
-        user_id: uid,
-        turn_number: d.turnoActual,
-        amount: importe,
-        status: 'paid',
-        paid_at: ahora,
-        transaction_id: journalId,
-      });
-    }
-    const wallet = await supabase.from('djangue_wallets').select('balance').eq('group_id', d.grupo.id).maybeSingle();
-    await supabase.from('djangue_wallets').update({
-      balance: roundAmount(djNum(wallet.data && wallet.data.balance) + importe), updated_at: ahora,
-    }).eq('group_id', d.grupo.id);
-
-    const esperados = Math.max(0, d.activos.length - 1);
-    const pagadasAhora = d.delTurno.filter(c => c.status === 'paid').length + (previa && previa.status === 'paid' ? 0 : 1);
-    const allPaid = pagadasAhora >= esperados;
-    await logAudit(uid, 'djangue_pay', 'djangue', d.grupo.id, { turn: d.turnoActual, amount: importe, journal_id: journalId });
+    const importe = djNum(r?.amount);
+    const allPaid = !!r?.all_paid;
+    await logAudit(uid, 'djangue_pay', 'djangue', d.grupo.id, { turn: d.turnoActual, amount: importe, journal_id: r?.journal_id });
 
     res.json({
       ok: true,
+      already: !!r?.already,
       amount: importe,
       new_balance: await readWalletBalance(uid),
       all_paid: allPaid,
-      journal_id: journalId,
+      journal_id: r?.journal_id || null,
       message: allPaid
         ? `Todos pagaron el turno ${d.turnoActual}. El secretario ya puede entregar el pozo.`
         : `Cuota del turno ${d.turnoActual} pagada`,
@@ -8620,6 +8589,9 @@ app.post('/api/djangue/:id/send-reminder', auth, async (req, res) => {
     }));
     const { error } = await supabase.from('djangue_notifications').insert(filas);
     if (error) { if (djFalloEsquema(res, error)) return; return res.status(502).json({ message: error.message, code: 'REMINDER_FAILED' }); }
+    for (const f of filas) {
+      await djPush(f.user_id, { title: f.title, body: f.message, groupId: d.grupo.id, subtype: 'reminder' });
+    }
     await logAudit(req.user.id, 'djangue_reminder', 'djangue', d.grupo.id, { enviados: filas.length, turn: d.turnoActual });
     res.json({ ok: true, sent: filas.length });
   } catch (e) {
@@ -8634,36 +8606,25 @@ app.post('/api/djangue/:id/manual-payout', auth, walletLimiter, async (req, res)
     const d = await djCargar(req.user.id, req.params.id);
     if (!d) return res.status(404).json({ message: 'Djangue no encontrado', code: 'GROUP_NOT_FOUND' });
     if (d.miRol !== 'owner' && d.miRol !== 'secretary') return res.status(403).json({ message: 'Solo el administrador entrega el pozo', code: 'FORBIDDEN' });
-    if (!d.beneficiario) return res.status(400).json({ message: 'No hay beneficiario para este turno', code: 'NO_BENEFICIARY' });
-
     const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
     if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
 
-    const previo = d.pagos.find(p => Number(p.turn_number) === d.turnoActual && p.status === 'completed');
-    if (previo) return res.json({ ok: true, already: true, payout: previo, amount: djNum(previo.amount) });
+    // Entrega atomica: exige el pozo base completo y reparte el fondo de
+    // liquidaciones entre los turnos que quedan. No admite pozo parcial.
+    const { data: r, error } = await supabase.rpc('dj_payout_turn', {
+      p_group_id: d.grupo.id, p_actor_id: req.user.id,
+    });
+    if (error) return djRpcFail(res, error);
 
-    const monto = roundAmount(d.delTurno.filter(c => c.status === 'paid').reduce((s, c) => s + djNum(c.amount), 0));
-    if (!(monto > 0)) return res.status(400).json({ message: 'Todavia no hay cuotas cobradas en este turno', code: 'NOTHING_TO_PAY' });
-
-    const entrega = await djEntregarPozo({ grupo: d.grupo, beneficiario: d.beneficiario, monto });
-    if (!entrega.ok) return res.status(502).json({ message: entrega.message, code: 'PAYOUT_FAILED' });
-
-    const ahora = new Date().toISOString();
-    const { data: pago } = await supabase.from('djangue_payouts').insert({
-      group_id: d.grupo.id,
-      beneficiary_id: d.beneficiario.user_id,
-      turn_number: d.turnoActual,
-      amount: monto,
-      expected_amount: djPozoEsperado(d.grupo, d.activos),
-      status: 'completed',
-      paid_at: ahora,
-    }).select('*').maybeSingle();
-
-    await supabase.from('djangue_wallets').update({
-      balance: roundAmount(Math.max(0, djNum(d.wallet && d.wallet.balance) - monto)), updated_at: ahora,
-    }).eq('group_id', d.grupo.id);
-    await logAudit(req.user.id, 'djangue_payout', 'djangue', d.grupo.id, { turn: d.turnoActual, amount: monto, beneficiary: d.beneficiario.user_id, journal_id: entrega.journal.journal_id });
-    res.json({ ok: true, payout: pago, amount: monto, journal_id: entrega.journal.journal_id });
+    await logAudit(req.user.id, 'djangue_payout', 'djangue', d.grupo.id, { turn: d.turnoActual, amount: djNum(r?.amount), beneficiary: r?.payout?.beneficiary_id, journal_id: r?.journal_id });
+    res.json({
+      ok: true,
+      already: !!r?.already,
+      payout: r?.payout || null,
+      amount: djNum(r?.amount),
+      journal_id: r?.journal_id || null,
+      settlement_share: djNum(r?.settlement_share),
+    });
   } catch (e) {
     if (e.djSchema) return res.status(502).json({ message: 'El esquema de djangue no esta en la base', code: 'DJANGUE_SCHEMA' });
     res.status(500).json({ message: e.message });
@@ -8677,35 +8638,205 @@ app.post('/api/djangue/:id/advance-turn', auth, async (req, res) => {
     if (!d) return res.status(404).json({ message: 'Djangue no encontrado', code: 'GROUP_NOT_FOUND' });
     if (d.miRol !== 'owner' && d.miRol !== 'secretary') return res.status(403).json({ message: 'Solo el administrador avanza el turno', code: 'FORBIDDEN' });
 
-    const entregado = d.pagos.some(p => Number(p.turn_number) === d.turnoActual && p.status === 'completed');
-    if (!entregado) return res.status(400).json({ message: 'Primero entrega el pozo de este turno', code: 'PAYOUT_PENDING' });
+    // Avance atomico: exige pozo entregado; al llegar al ultimo turno marca el
+    // ciclo completado y deja una notificacion cycle_completed por integrante.
+    const { data: r, error } = await supabase.rpc('dj_advance_turn', {
+      p_group_id: d.grupo.id, p_actor_id: req.user.id,
+    });
+    if (error) return djRpcFail(res, error);
 
-    const totalTurnos = Number(d.grupo.total_turns) || d.activos.length || 1;
-    const siguiente = d.turnoActual + 1;
-    const fin = siguiente > totalTurnos ? d.grupo.period_end_date : djFechaFin(d.grupo.frequency).toISOString();
-    const parche = siguiente > totalTurnos
-      ? { status: 'completed', updated_at: new Date().toISOString() }
-      : {
-        current_turn: siguiente,
-        period_start_date: new Date().toISOString(),
-        period_end_date: fin,
-        next_payout_at: fin,
-        updated_at: new Date().toISOString(),
-      };
-    const { error } = await supabase.from('djangue_groups').update(parche).eq('id', d.grupo.id);
-    if (error) { if (djFalloEsquema(res, error)) return; return res.status(502).json({ message: error.message, code: 'TURN_ADVANCE_FAILED' }); }
+    await logAudit(req.user.id, 'djangue_advance', 'djangue', d.grupo.id, { desde: d.turnoActual, hacia: r?.new_turn, completado: !!r?.completed });
 
-    await logAudit(req.user.id, 'djangue_advance', 'djangue', d.grupo.id, { desde: d.turnoActual, hacia: siguiente, completado: siguiente > totalTurnos });
+    if (r?.completed && !r?.already) {
+      for (const m of d.activos) {
+        await djPush(m.user_id, {
+          title: 'Ciclo completado',
+          body: `El djangue ${d.grupo.name} completó su ciclo. Elige continuar o salir.`,
+          groupId: d.grupo.id, cycleId: r.cycle_id, subtype: 'cycle_completed',
+        });
+      }
+    }
+
     res.json({
       ok: true,
-      new_turn: siguiente > totalTurnos ? d.turnoActual : siguiente,
-      completed: siguiente > totalTurnos,
-      message: siguiente > totalTurnos ? 'El djangue termino todos sus turnos' : `Ahora turno #${siguiente}`,
+      new_turn: r?.new_turn,
+      completed: !!r?.completed,
+      cycle_id: r?.cycle_id || null,
+      message: r?.completed ? 'El djangue termino todos sus turnos' : `Ahora turno #${r?.new_turn}`,
     });
   } catch (e) {
     if (e.djSchema) return res.status(502).json({ message: 'El esquema de djangue no esta en la base', code: 'DJANGUE_SCHEMA' });
     res.status(500).json({ message: e.message });
   }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// DJANGUE: ciclo, consentimiento, salida liquidada e invitaciones
+// ════════════════════════════════════════════════════════════════════
+
+// GET /api/djangue/:id/exit-quote — deuda real de salida (cuotas + futuro + moras).
+app.get('/api/djangue/:id/exit-quote', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.rpc('dj_exit_quote', { p_group_id: req.params.id, p_user_id: req.user.id });
+    if (error) return djRpcFail(res, error);
+    res.json(data);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/djangue/:id/accept-terms — consentimiento explicito del ciclo actual.
+app.post('/api/djangue/:id/accept-terms', auth, async (req, res) => {
+  try {
+    if (req.body?.accept_terms !== true) return res.status(409).json({ code: 'CONSENT_REQUIRED', message: 'Confirma que aceptas los términos' });
+    const { data, error } = await supabase.rpc('dj_consent_accept', {
+      p_group_id: req.params.id, p_user_id: req.user.id, p_cycle_id: req.body?.cycle_id || null,
+    });
+    if (error) return djRpcFail(res, error);
+    await logAudit(req.user.id, 'djangue_accept_terms', 'djangue', req.params.id, { cycle_id: data?.cycle_id });
+    res.json({ ok: true, consent: data });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/djangue/:id/exit — salir liquidando lo que se debe antes de irse.
+app.post('/api/djangue/:id/exit', auth, walletLimiter, async (req, res) => {
+  try {
+    const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+    if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
+    if (!pinCheck.configured) return res.status(403).json({ code: 'PIN_SETUP_REQUIRED', message: 'Configura tu PIN antes de confirmar la salida' });
+    const { data, error } = await supabase.rpc('dj_confirm_exit', {
+      p_group_id: req.params.id, p_user_id: req.user.id, p_quote: req.body?.quote || null, p_completed: false,
+    });
+    if (error) return djRpcFail(res, error);
+    await logAudit(req.user.id, 'djangue_exit', 'djangue', req.params.id, { settlement: data?.settlement_amount, journal_id: data?.journal_id });
+    res.json({ ok: true, settlement_amount: data?.settlement_amount ?? 0, journal_id: data?.journal_id || null, breakdown: data?.breakdown || null });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/djangue/:id/delete — borrado definitivo del creador (archiva, conserva el libro).
+app.post('/api/djangue/:id/delete', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.rpc('dj_delete_group', { p_group_id: req.params.id, p_user_id: req.user.id });
+    if (error) return djRpcFail(res, error);
+    await logAudit(req.user.id, 'djangue_delete', 'djangue', req.params.id, { archived: data?.archived });
+    res.json({ ok: true, archived: !!data?.archived, chat_deleted: !!data?.chat_deleted });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/djangue/:id/cycle-decision — al completar el ciclo: continuar o salir.
+app.post('/api/djangue/:id/cycle-decision', auth, walletLimiter, async (req, res) => {
+  try {
+    const decision = String(req.body?.decision || '').trim();
+    if (decision !== 'continue' && decision !== 'leave') {
+      return res.status(400).json({ message: 'Decisión no válida', code: 'VALIDATION_ERROR' });
+    }
+    if (decision === 'leave') {
+      const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
+      if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
+      if (!pinCheck.configured) return res.status(403).json({ code: 'PIN_SETUP_REQUIRED', message: 'Configura tu PIN antes de confirmar la salida' });
+    }
+    const { data, error } = decision === 'leave'
+      ? await supabase.rpc('dj_confirm_exit', {
+        p_group_id: req.params.id, p_user_id: req.user.id, p_quote: req.body?.quote || null, p_completed: true,
+      })
+      : await supabase.rpc('dj_cycle_decision', {
+        p_group_id: req.params.id, p_user_id: req.user.id, p_decision: decision, p_accept_terms: req.body?.accept_terms === true,
+      });
+    if (error) return djRpcFail(res, error);
+    await logAudit(req.user.id, 'djangue_cycle_decision', 'djangue', req.params.id, { decision });
+    res.json({ ok: true, decision: data?.decision });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/djangue/:id/start-next-cycle — el creador reabre con todos de acuerdo.
+app.post('/api/djangue/:id/start-next-cycle', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.rpc('dj_start_next_cycle', { p_group_id: req.params.id, p_actor_id: req.user.id });
+    if (error) return djRpcFail(res, error);
+    await logAudit(req.user.id, 'djangue_start_next_cycle', 'djangue', req.params.id, { cycle_id: data?.cycle_id });
+    const d = await djCargar(req.user.id, req.params.id);
+    if (d) {
+      for (const m of d.activos) {
+        await djPush(m.user_id, {
+          title: 'Nuevo ciclo',
+          body: `El djangue ${d.grupo.name} inició un nuevo ciclo.`,
+          groupId: req.params.id, cycleId: data?.cycle_id, subtype: 'cycle_started',
+        });
+      }
+    }
+    res.json({ ok: true, cycle_id: data?.cycle_id, cycle_number: data?.cycle_number, total_turns: data?.total_turns });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// GET /api/djangue/:id/cycle-status — estado del ciclo y decisiones de cada integrante.
+app.get('/api/djangue/:id/cycle-status', auth, async (req, res) => {
+  try {
+    const d = await djCargar(req.user.id, req.params.id);
+    if (!d) return res.status(404).json({ message: 'Djangue no encontrado', code: 'GROUP_NOT_FOUND' });
+    if (d.miRol === 'visitante') return res.status(403).json({ message: 'No participas en este djangue', code: 'FORBIDDEN' });
+
+    const cycleId = d.grupo.current_cycle_id || null;
+    let cycle = null, decisions = [], consent = null;
+    if (cycleId) {
+      const { data: cy } = await supabase.from('djangue_cycles').select('*').eq('id', cycleId).maybeSingle();
+      cycle = cy || null;
+      const { data: dec } = await supabase.from('djangue_cycle_decisions').select('user_id, decision, decided_at').eq('cycle_id', cycleId);
+      decisions = dec || [];
+      const { data: cs } = await supabase.from('djangue_consents').select('id, accepted_at, terms_hash')
+        .eq('group_id', req.params.id).eq('cycle_id', cycleId).eq('user_id', req.user.id).maybeSingle();
+      consent = cs || null;
+    }
+    const activos = d.activos.length;
+    const myDecision = decisions.find(x => x.user_id === req.user.id) || null;
+    const pendientes = d.activos.filter(m => !decisions.some(x => x.user_id === m.user_id && x.decision === 'continue')).length;
+    res.json({
+      group_id: req.params.id,
+      group_status: d.grupo.status,
+      cycle,
+      my_decision: myDecision,
+      consent_accepted: !!consent,
+      decisions,
+      active_members: activos,
+      pending_decisions: pendientes,
+      can_start_next: (d.miRol === 'owner' || (d.miRol === 'secretary' && !d.activos.some(m => m.user_id === d.grupo.owner_id)))
+        && d.grupo.status === 'completed' && cycle?.status === 'completed' && activos >= 2 && pendientes === 0,
+    });
+  } catch (e) {
+    if (e.djSchema) return res.status(502).json({ message: 'El esquema de djangue no esta en la base', code: 'DJANGUE_SCHEMA' });
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// GET /api/djangue/invitations/:id — la invitacion con los términos del djangue.
+app.get('/api/djangue/invitations/:id', auth, async (req, res) => {
+  try {
+    const { data: inv, error } = await supabase.from('djangue_invitations').select('*').eq('id', req.params.id).maybeSingle();
+    if (error) { if (djFalloEsquema(res, error)) return; return res.status(502).json({ message: error.message, code: 'DJANGUE_UNAVAILABLE' }); }
+    if (!inv) return res.status(404).json({ message: 'Invitación no encontrada', code: 'INVITATION_NOT_FOUND' });
+    if (inv.user_id !== req.user.id) return res.status(403).json({ message: 'La invitación no es para ti', code: 'FORBIDDEN' });
+    const { data: g } = await supabase.from('djangue_groups')
+      .select('id, name, quota_amount, currency, total_turns, max_members, penalty_percent, frequency, owner_id, logo_url, status')
+      .eq('id', inv.group_id).maybeSingle();
+    res.json({ invitation: inv, group: g || null });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/djangue/invitations/:id/accept — entrar aceptando los términos.
+app.post('/api/djangue/invitations/:id/accept', auth, async (req, res) => {
+  try {
+    if (req.body?.accept_terms !== true) return res.status(409).json({ code: 'CONSENT_REQUIRED', message: 'Acepta los términos antes de entrar' });
+    const { data, error } = await supabase.rpc('dj_accept_invitation', { p_invitation_id: req.params.id, p_user_id: req.user.id });
+    if (error) return djRpcFail(res, error);
+    await logAudit(req.user.id, 'djangue_accept_invitation', 'djangue', data?.group_id, { invitation_id: req.params.id });
+    res.json({ ok: true, group_id: data?.group_id, member: data?.member });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/djangue/invitations/:id/decline — rechazar la invitacion.
+app.post('/api/djangue/invitations/:id/decline', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.rpc('dj_decline_invitation', { p_invitation_id: req.params.id, p_user_id: req.user.id });
+    if (error) return djRpcFail(res, error);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 // POST /api/upload/djangue-logo — multipart con campo `file`, devuelve `{ url }`.
@@ -9210,12 +9341,20 @@ app.post('/api/lia/attach', auth, liaAttachHandler);
 // Añadir participante a grupo
 app.post('/api/chats/:chatId/participants', auth, async (req, res) => {
   try {
+    const { chatId } = req.params;
     const { user_id } = req.body;
+    if (!(await participacionEnChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'No participas en este chat' });
+    }
+    // En un djangue nadie entra por alta directa: hace falta invitacion aceptada.
+    if (await djGrupoPorChat(chatId)) {
+      return res.status(409).json({ message: 'En un djangue los integrantes entran por invitación', code: 'DJANGUE_INVITE_REQUIRED' });
+    }
     // Añadir miembros lo decide el permiso add_members: por defecto cualquiera,
     // con 'admins' solo administradores o el creador.
-    if (!(await esAdminDeChat(req.params.chatId, req.user.id))) {
+    if (!(await esAdminDeChat(chatId, req.user.id))) {
       const { data: c } = await supabase
-        .from('chats').select('settings').eq('id', req.params.chatId).maybeSingle();
+        .from('chats').select('settings').eq('id', chatId).maybeSingle();
       if (chatPermisos(c).add_members !== 'all') {
         return res.status(403).json({ message: 'Solo un administrador puede añadir miembros' });
       }
@@ -9224,7 +9363,7 @@ app.post('/api/chats/:chatId/participants', auth, async (req, res) => {
     // intenta el alta por clave primaria (id), que aqui no llega.
     const { error } = await supabase
       .from('chat_participants')
-      .upsert({ chat_id: req.params.chatId, user_id }, { onConflict: 'chat_id,user_id' });
+      .upsert({ chat_id: chatId, user_id }, { onConflict: 'chat_id,user_id' });
     if (error) throw error;
     res.json({ message: 'Participante añadido' });
   } catch (e) { res.status(500).json({ message: e.message }); }
@@ -9236,6 +9375,10 @@ app.post('/api/chats/:chatId/wallpaper', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
     const { wallpaper_type, wallpaper_value, wallpaper_settings } = req.body;
+
+    if (!(await participacionEnChat(chatId, req.user.id))) {
+      return res.status(403).json({ message: 'No participas en este chat' });
+    }
 
     const { data, error } = await supabase
       .from('chat_participants')
@@ -9384,30 +9527,18 @@ app.post('/api/chats/:chatId/leave', auth, async (req, res) => {
     const mia = await participacionEnChat(chatId, req.user.id);
     if (!mia) return res.status(404).json({ message: 'No participas en este chat' });
 
-    const { error } = await supabase
-      .from('chat_participants')
-      .delete()
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.id);
-    if (error) throw error;
+    // Salida guarded: en djangue liquida la deuda antes de quitar la participacion.
+    const { data: resultado, error } = await supabase.rpc('chat_safe_delete', {
+      p_chat_id: chatId, p_user_id: req.user.id, p_permanent: false,
+    });
+    if (error) return djRpcFail(res, error);
 
-    await supabase.from('message_reads').delete().eq('chat_id', chatId).eq('user_id', req.user.id);
-
-    const { data: quedan } = await supabase
-      .from('chat_participants')
-      .select('id')
-      .eq('chat_id', chatId);
-
-    let chatBorrado = false;
-    if (!quedan || quedan.length === 0) {
-      // La tabla messages no declara FK a chats: si se borra el chat a secas,
-      // los mensajes quedan huerfanos y nadie puede leerlos. Se limpian antes.
-      await supabase.from('messages').delete().eq('chat_id', chatId);
-      const { error: delErr } = await supabase.from('chats').delete().eq('id', chatId);
-      chatBorrado = !delErr;
-    }
-
-    res.json({ message: 'Has salido del grupo', left: true, chat_deleted: chatBorrado });
+    res.json({
+      message: 'Has salido del grupo',
+      left: true,
+      chat_deleted: !!resultado?.chat_deleted,
+      settlement: resultado?.settlement || null,
+    });
   } catch (e) {
     console.error('Leave chat error:', e);
     res.status(500).json({ message: e.message });
@@ -9429,6 +9560,15 @@ app.delete('/api/chats/:chatId/participants/:userId', auth, async (req, res) => 
     const { data: chat } = await supabase.from('chats').select('created_by').eq('id', chatId).maybeSingle();
     if (chat && String(chat.created_by) === String(userId)) {
       return res.status(400).json({ message: 'No se puede expulsar al creador del grupo' });
+    }
+
+    // En djangue la expulsion liquida la deuda del expulsado (solo owner/secretary).
+    if (await djGrupoPorChat(chatId)) {
+      const { data: r, error: djErr } = await supabase.rpc('dj_guard_chat_action', {
+        p_chat_id: chatId, p_user_id: req.user.id, p_target_id: userId, p_action: 'expel',
+      });
+      if (djErr) return djRpcFail(res, djErr);
+      return res.json({ message: 'Participante eliminado', removed: true, settlement: r?.settlement_amount ?? null });
     }
 
     const { data: borrado, error } = await supabase
@@ -9653,8 +9793,10 @@ app.get('/api/chats/:chatId/info', auth, async (req, res) => {
       }).length;
       const b = d.beneficiario;
       const usuB = b ? (d.usuarios?.[b.user_id] || {}) : {};
+      const { data: cycle } = await supabase.from('djangue_cycles').select('status').eq('id', g.current_cycle_id).maybeSingle();
       djangue = {
         id: g.id,
+        owner_id: g.owner_id,
         name: g.name,
         logo_url: g.logo_url || null,
         quota_amount: djNum(g.quota_amount),
@@ -9664,6 +9806,7 @@ app.get('/api/chats/:chatId/info', auth, async (req, res) => {
         current_turn: d.turnoActual || 1,
         total_turns: Number(g.total_turns) || activos.length,
         status: g.status || 'active',
+        cycle_status: cycle?.status || null,
         period_end_date: g.period_end_date || null,
         beneficiary: b ? { user_id: b.user_id, full_name: usuB.full_name || null, avatar_url: usuB.avatar_url || null } : null,
         paid_count: pagados,
@@ -9703,6 +9846,11 @@ app.post('/api/chats/:chatId/invite-link', auth, async (req, res) => {
 
     if (!(await participacionEnChat(chatId, req.user.id))) {
       return res.status(403).json({ message: 'No participas en este chat' });
+    }
+
+    // Un djangue no se comparte por enlace libre: la entrada es por invitacion.
+    if (await djGrupoPorChat(chatId)) {
+      return res.status(409).json({ message: 'En un djangue se entra por invitación', code: 'DJANGUE_INVITE_REQUIRED' });
     }
 
     const { data: chatPerm } = await supabase
@@ -9750,6 +9898,11 @@ app.post('/api/chats/join', auth, async (req, res) => {
       .eq('invite_token', token)
       .maybeSingle();
     if (!chat) return res.status(404).json({ message: 'Enlace no valido' });
+
+    // No se entra a un djangue por token de chat: requiere invitacion aceptada.
+    if (await djGrupoPorChat(chat.id)) {
+      return res.status(409).json({ message: 'En un djangue se entra por invitación', code: 'DJANGUE_INVITE_REQUIRED' });
+    }
 
     const yaDentro = await participacionEnChat(chat.id, req.user.id);
     if (!yaDentro) {
