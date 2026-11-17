@@ -1957,6 +1957,7 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
       const msgType = message.type || 'text';
       const bodyText = msgType === 'text'
         ? (message.text || 'Nuevo mensaje')
+        : msgType === 'call' ? (message.text || 'Llamada')
         : msgType === 'image' ? '📷 Foto'
         : msgType === 'audio' ? '🎵 Mensaje de voz'
         : msgType === 'video' ? '🎥 Video'
@@ -11505,10 +11506,15 @@ const getApnsVoipJwt = () => {
   }
 };
 
-/** Un POST a APNs para un token device. Nunca rechaza: devuelve {ok, reason}. */
-const sendApnsVoip = (deviceToken, apnsJwt, payload) => new Promise((resolve) => {
+/**
+ * Un POST a APNs para un token device. Nunca rechaza: devuelve {ok, reason}.
+ * Por defecto habla VoIP (lo que usaba solo este módulo); con `opts` sirve
+ * también para avisos normales en la app (alert + topic del bundle principal).
+ */
+const sendApnsVoip = (deviceToken, apnsJwt, payload, opts = {}) => new Promise((resolve) => {
   const host   = APNS_VOIP_HOSTS[process.env.APNS_ENV] || APNS_VOIP_HOSTS.production;
   const bundle = process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat';
+  const pushType = opts.pushType || 'voip';
   const client = http2.connect(`https://${host}`);
 
   let settled = false;
@@ -11528,10 +11534,13 @@ const sendApnsVoip = (deviceToken, apnsJwt, payload) => new Promise((resolve) =>
     ':path':            `/3/device/${deviceToken}`,
     ':authority':       host,
     'authorization':    `bearer ${apnsJwt}`,
-    'apns-push-type':   'voip',
-    'apns-topic':       `${bundle}.voip`,
-    'apns-priority':    '10',
-    'apns-expiration':  String(Math.floor(Date.now() / 1000) + 90),
+    'apns-push-type':   pushType,
+    'apns-topic':       opts.topic || (pushType === 'voip' ? `${bundle}.voip` : bundle),
+    'apns-priority':    opts.priority || '10',
+    'apns-expiration':  String(Math.floor(Date.now() / 1000) + (opts.ttlSeconds ?? 90)),
+    ...(opts.collapseId
+      ? { 'apns-collapse-id': String(opts.collapseId).slice(0, 64) }
+      : {}),
     'content-type':     'application/json',
   });
 
@@ -11701,6 +11710,67 @@ const deliverIncomingCall = async (targetUserId, call) => {
 };
 
 // Iniciar llamada — caller envía offer + push al destinatario
+// ─────────────────────────────────────────────────────────────────────────────
+// AVISO DE LLAMADA PERDIDA
+//
+// Con la app cerrada el callee no veía absolutamente nada cuando no atendía:
+// el push VoIP solo mantiene la ventana de CallKit mientras el teléfono está
+// despierto con el timbre, y el SSE muere con la app. Este aviso es el que
+// pinta «Llamada perdida» en la pantalla bloqueada, con la foto y el nombre
+// de quien llamó. Se emite una sola vez por llamada y nunca si llegó a
+// conectarse (esa ya deja su rastro en el chat).
+// ─────────────────────────────────────────────────────────────────────────────
+const CALL_OUTCOME_NOTIFIED = new Map();
+const isFirstCallOutcomeNotice = (callId) => {
+  const now = Date.now();
+  for (const [key, ts] of CALL_OUTCOME_NOTIFIED) {
+    if (now - ts > 6 * 3600 * 1000) CALL_OUTCOME_NOTIFIED.delete(key);
+  }
+  if (CALL_OUTCOME_NOTIFIED.has(callId)) return false;
+  CALL_OUTCOME_NOTIFIED.set(callId, now);
+  return true;
+};
+
+const sendCallOutcomePush = async (callId, reason) => {
+  try {
+    if (!callId || !isFirstCallOutcomeNotice(String(callId))) return;
+    const { data: cs } = await supabase
+      .from('call_sessions')
+      .select('call_id, caller_id, target_user_id, type, status, connected_at')
+      .eq('call_id', String(callId))
+      .maybeSingle();
+    if (!cs) return;
+
+    const answered = !!cs.connected_at
+      || ['accepted', 'connecting', 'connected', 'reconnecting'].includes(String(cs.status || ''));
+    if (answered) return;
+
+    // Si quien colgó fue el propio destinatario (rechazo explícito), ya lo
+    // sabe y no se le vuelve a avisar.
+    if (String(reason || '') === 'rejected') return;
+    if (!cs.target_user_id) return;
+
+    const { data: caller } = await supabase
+      .from('users').select('id, full_name, avatar_url').eq('id', cs.caller_id).maybeSingle();
+    const isVideo = cs.type === 'video';
+
+    await sendPushToUser(String(cs.target_user_id), {
+      title:        caller?.full_name || 'EGChat',
+      body:         isVideo ? 'Videollamada perdida' : 'Llamada perdida',
+      notificationType: 'call_summary',
+      messageType:  'call',
+      senderName:   caller?.full_name || 'EGChat',
+      senderId:     String(caller?.id || cs.caller_id || ''),
+      senderAvatar: caller?.avatar_url || '',
+      callId:       String(callId),
+      callType:     isVideo ? 'video' : 'audio',
+    });
+    console.log(`[call/summary] ${callId} (${reason || 'sin motivo'}) avisada como perdida`);
+  } catch (e) {
+    console.warn('[call/summary]', e.message);
+  }
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LLAMADAS WebRTC — Señalización y gestión de estado
 //
@@ -11924,6 +11994,7 @@ app.delete('/api/call/:callId', auth, async (req, res) => {
     }
 
     await notifyCallPeer(req.params.callId, req.user.id, { type: 'call_ended', callId: req.params.callId, reason, ts: Date.now() });
+    await sendCallOutcomePush(req.params.callId, reason);
 
     res.json({ ok: true, idempotent: data && data.idempotent ? true : false, duration_seconds: data && data.duration_seconds ? data.duration_seconds : 0 });
   } catch (e) {
@@ -11990,9 +12061,11 @@ app.post('/api/call/cancel', auth, async (req, res) => {
       }).eq('call_id', callId).eq('caller_id', String(req.user.id));
       if (fallbackUpdate.error) throw fallbackUpdate.error;
       await notifyCallPeer(callId, req.user.id, { type: 'call_ended', callId, reason: 'cancelled', ts: Date.now() });
+      await sendCallOutcomePush(callId, 'cancelled');
       return res.json({ ok: true, idempotent: false });
     }
     await notifyCallPeer(callId, req.user.id, { type: 'call_ended', callId, reason: 'cancelled', ts: Date.now() });
+    await sendCallOutcomePush(callId, 'cancelled');
     res.json({ ok: true, idempotent: data && data.idempotent ? true : false });
   } catch (e) {
     console.error('[call/cancel]', e.message);
@@ -12247,16 +12320,27 @@ app.post('/api/call/room/:roomId/invite', auth, async (req, res) => {
 
 setInterval(() => salasLlamada.barrer(), 60000).unref?.();
 
-// Limpieza periódica usando RPC expire_stale_calls
+// Limpieza periódica usando RPC expire_stale_calls.
+// Cada 60 s (antes 300) para que «Llamada perdida» salga poco después del
+// timbre y no cinco minutos tarde: la RPC es un UPDATE barato.
 setInterval(async () => {
   try {
+    const { data: expiring } = await supabase.from('call_sessions')
+      .select('call_id')
+      .in('status', ['ringing', 'connecting'])
+      .eq('ended', false)
+      .lt('expires_at', new Date().toISOString())
+      .limit(50);
     await supabase.rpc('expire_stale_calls');
+    for (const s of (expiring || [])) {
+      await sendCallOutcomePush(s.call_id, 'missed');
+    }
     const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
     await supabase.from('call_sessions').delete()
       .in('status', ['ended','rejected','missed','failed'])
       .lt('ended_at', cutoff);
   } catch (e) { console.warn('[cleanup]', e.message); }
-}, 300000);
+}, 60000);
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -12594,6 +12678,9 @@ app.get('/api/push/vapid-public-key', (req, res) => {
 const sendPushToUser = async (userId, payload) => {
   try {
     const isCall = payload.notificationType === 'incoming_call';
+    // Resultado de llamada (perdida/saliente): no lleva badge ni el tono de
+    // mensaje, pero sí extensión para que salga con avatar y foto.
+    const isCallSummary = payload.notificationType === 'call_summary';
 
     // ── Web Push (navegador/PWA) ──────────────────────────────────────────
     const { data: subs } = await supabase
@@ -12625,6 +12712,7 @@ const sendPushToUser = async (userId, payload) => {
     }
 
     // ── Expo Push (app movil nativa — funciona con telefono hibernado) ────
+    // ── Tokens nativos registrados por la app ─────────────────────────────
     const { data: expoSubs } = await supabase
       .from('expo_push_tokens')
       .select('token, token_type')
@@ -12632,11 +12720,21 @@ const sendPushToUser = async (userId, payload) => {
       .in('token_type', ['expo', 'fcm', 'apns'])
       .neq('is_active', false);
 
-    // Se envían TODOS los tokens guardados, incluidos los APNs crudos (64 hex):
-    // exp.host los entrega con la clave APNs del proyecto, y muchos iPhone están
-    // registrados así. Filtrar solo por forma Expo dejó esos dispositivos sin
-    // ninguna notificación (2026-11-02).
-    const expoTokens = [...new Set((expoSubs || []).map(s => s.token).filter(Boolean))];
+    const isExpoFormat = (t) => t.startsWith('ExponentPushToken') || t.startsWith('ExpoPushToken');
+    const isHexToken    = (t) => /^[0-9a-f]{64}$/i.test(t);
+
+    // exp.host solo conoce sus propios tokens. Los APNs crudos que la app
+    // registra en iOS se le mandaban también a exp.host y el rechazo del lote
+    // dejaba al iPhone sin ningún aviso. Ahora van directos a APNs.
+    const expoTokens = [...new Set((expoSubs || [])
+      .map(s => String(s.token || ''))
+      .filter(t => isExpoFormat(t)))];
+    const apnsTokens = [...new Set((expoSubs || [])
+      .map(s => ({ token: String(s.token || ''), type: String(s.token_type || '') }))
+      .filter(s => s.type === 'apns' || (!isExpoFormat(s.token) && isHexToken(s.token)))
+      .map(s => s.token))];
+
+    const delivered = { expo: 0, apns: 0 };
 
     if (expoTokens.length > 0) {
       const expoMessages = expoTokens.map(token => ({
@@ -12645,8 +12743,8 @@ const sendPushToUser = async (userId, payload) => {
         body: payload.body || (isCall ? 'Llamada entrante' : 'Nuevo mensaje'),
         // El nombre debe coincidir con el archivo que la app instala en
         // Library/Sounds del contenedor (useSounds.installIosPushSound).
-        sound: isCall ? 'default' : 'egchat-message.wav',
-        badge: isCall ? 0 : Number(payload.badge ?? 1),
+        sound: isCall ? 'default' : (isCallSummary ? 'default' : 'egchat-message.wav'),
+        badge: (isCall || isCallSummary) ? 0 : Number(payload.badge ?? 1),
         channelId: isCall ? 'egchat-calls-v2' : 'egchat-messages',
         // En iOS el channelId no existe: la categoría con acciones (Aceptar /
         // Rechazar) se registra desde la app con setNotificationCategoryAsync.
@@ -12713,6 +12811,7 @@ const sendPushToUser = async (userId, payload) => {
           if (result.data) {
             const tickets = result.data
               .map((r, idx) => ({ r, token: batch[idx].to }));
+            delivered.expo += tickets.filter(({ r }) => r.status === 'ok').length;
             const invalid = tickets
               .filter(({ r }) => r.status === 'error' && r.details?.error === 'DeviceNotRegistered');
             if (invalid.length > 0) {
@@ -12733,8 +12832,64 @@ const sendPushToUser = async (userId, payload) => {
         }
       }
     }
+
+    // ── APNs directo (tokens de dispositivo 64 hex de iOS) ────────────────
+    // `apns-push-type: alert` + prioridad 10 es lo que hace que el aviso salga
+    // con la pantalla bloqueada sin esperar a que iOS agrupe pushes diferibles.
+    if (apnsTokens.length > 0) {
+      const apnsJwt = getApnsVoipJwt();
+      if (!apnsJwt) {
+        console.warn(`[Push APNs] user=${userId}: ${apnsTokens.length} token(s) iOS pero faltan APNS_KEY_P8/APNS_KEY_ID/APNS_TEAM_ID`);
+      } else {
+        const alertPayload = {
+          aps: {
+            alert: {
+              title: payload.title || 'EGChat',
+              body:  payload.body  || (isCall ? 'Llamada entrante' : 'Nuevo mensaje'),
+            },
+            sound: (isCall || isCallSummary) ? 'default' : 'egchat-message.wav',
+            ...((isCall || isCallSummary) ? { badge: 0 } : { badge: Number(payload.badge ?? 1) }),
+            ...(isCall ? { 'interruption-level': 'time-sensitive' } : { 'mutable-content': 1 }),
+            category: isCall ? 'EGCHAT_CALL' : 'EGCHAT_MESSAGE',
+          },
+          notificationType: payload.notificationType || (isCall ? 'incoming_call' : 'message'),
+          title:        payload.title || '',
+          body:         payload.body || '',
+          senderName:   payload.senderName || payload.callerName || '',
+          senderId:     String(payload.senderId || payload.callerId || ''),
+          senderAvatar: payload.senderAvatar || payload.callerAvatar || '',
+          messageType:  payload.messageType || 'text',
+          chatId:       payload.chatId || '',
+          callId:       payload.callId || '',
+          callType:     payload.callType || '',
+          imageUrl:     payload.imageUrl || '',
+        };
+        const results = await Promise.all(apnsTokens.map(token => sendApnsVoip(token, apnsJwt, alertPayload, {
+          pushType:  'alert',
+          priority:  '10',
+          ttlSeconds: isCall ? 120 : 86400,
+        })));
+        delivered.apns += results.filter(r => r.ok).length;
+        const dead = results
+          .map((r, i) => ({ r, token: apnsTokens[i] }))
+          .filter(({ r }) => ['BadDeviceToken', 'Unregistered', 'DeviceTokenNotForTopic'].includes(String(r.reason)));
+        if (dead.length > 0) {
+          await Promise.allSettled(
+            dead.map(({ token }) => supabase.from('expo_push_tokens').delete().eq('token', token))
+          );
+        }
+        const failed = results.filter(r => !r.ok)
+          .map(r => r.reason).filter(r => !['BadDeviceToken', 'Unregistered', 'DeviceTokenNotForTopic'].includes(String(r)));
+        if (failed.length > 0) {
+          console.warn(`[Push APNs] user=${userId}: ${failed.length}/${apnsTokens.length} fallaron: ${[...new Set(failed)].join(' | ')}`);
+        }
+      }
+    }
+
+    return { ...delivered, expoTokens: expoTokens.length, apnsTokens: apnsTokens.length };
   } catch (e) {
     console.error('sendPushToUser error:', e.message);
+    return { error: e.message };
   }
 };
 
