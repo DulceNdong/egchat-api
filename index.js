@@ -6976,13 +6976,17 @@ app.post('/api/taxi/request', auth, walletLimiter, async (req, res) => {
     if (!origin || !dest) return res.status(400).json({ message: 'origin y dest requeridos', code: 'VALIDATION_ERROR' });
     const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
     if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
-    const variant = ['moto', 'basic', 'premium'].includes(type) ? type : 'basic';
+    // Un tipo desconocido no puede caer a 'basic': cobraría la tarifa de taxi
+    // por un servicio que el usuario no pidió.
+    const variant = ['moto', 'basic', 'premium', 'tow', 'moving', 'package'].includes(type) ? type : null;
+    if (!variant) return res.status(400).json({ message: 'Tipo de servicio no válido', code: 'VALIDATION_ERROR' });
 
     const tarifa = await readTariff('taxi', variant);
     if (!tarifa) return res.status(502).json({ message: 'Tarifa de taxi no disponible', code: 'TARIFF_UNAVAILABLE' });
 
+    const VEHICLE_NAME = { moto: 'Moto Honda', basic: 'Toyota Corolla', premium: 'SUV Toyota', tow: 'Camión grúa', moving: 'Camión de mudanza', package: 'Moto de reparto' };
     const rideId = safeRef('RIDE');
-    const driver = { name: 'Carlos Mba', phone: '+240 222 555', rating: 4.8, plate: 'GE-1234', vehicle: variant === 'moto' ? 'Moto Honda' : 'Toyota Corolla' };
+    const driver = { name: 'Carlos Mba', phone: '+240 222 555', rating: 4.8, plate: 'GE-1234', vehicle: VEHICLE_NAME[variant] || 'Toyota Corolla' };
 
     // El viaje se escribe antes de cobrar: si no queda fila, no hay cargo.
     const { data: ride, error: rideError } = await supabase.from('taxi_rides').insert({
