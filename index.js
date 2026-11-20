@@ -7170,6 +7170,11 @@ app.post('/api/taxi/request', auth, walletLimiter, async (req, res) => {
       .eq('id', ride.id);
     await supabase.from('taxi_rides').update({ eta_minutes: eta }).eq('id', ride.id);
     await logAudit(req.user.id, 'taxi_request', 'taxi', ride.id, { fare: Number(cargo.amount), variant, live_driver: !!live });
+    // Aviso al conductor en el acto para que el viaje aparezca sin esperar al
+    // próximo sondeo; la app sigue sondeando como respaldo.
+    if (live?.driver?.user_id) {
+      emitToUser(live.driver.user_id, { type: 'taxi_ride', role: 'new_ride', rideId, ts: Date.now() });
+    }
 
     res.json({
       rideId,
@@ -7275,6 +7280,9 @@ app.post('/api/taxi/:rideId/cancel', auth, async (req, res) => {
     // Cancelar libera al conductor real en el acto: no debe quedarse 'busy'
     // por un viaje que ya no existe.
     await freeTaxiDriver(ride.driver?.user_id);
+    if (ride.driver?.user_id) {
+      emitToUser(ride.driver.user_id, { type: 'taxi_ride', role: 'cancelled', rideId: ride.ride_ref, ts: Date.now() });
+    }
     await logAudit(req.user.id, 'taxi_cancel', 'taxi', ride.id, { ride_ref: ride.ride_ref, reembolsado });
 
     res.json({ message: 'Viaje cancelado', rideId: req.params.rideId, reembolsado, balance: await readWalletBalance(req.user.id) });
@@ -7367,6 +7375,22 @@ app.post('/api/taxi/driver/heartbeat', auth, async (req, res) => {
       console.error('taxi driver heartbeat:', error.message);
       return res.status(502).json({ message: 'No se pudo guardar la posición', code: 'POSITION_NOT_SAVED' });
     }
+    // Con un viaje en curso, el latido llega al pasajero por el stream SSE:
+    // posición y ETA al instante, sin esperar su sondeo.
+    if (hasRide && prev?.current_ride_ref) {
+      try {
+        const { data: ride } = await supabase.from('taxi_rides')
+          .select('user_id, origin_lat, origin_lng').eq('ride_ref', prev.current_ride_ref).maybeSingle();
+        if (ride?.user_id) {
+          let eta = null;
+          if (ride.origin_lat != null && ride.origin_lng != null) {
+            const km = taxiDistanceKm({ lat: Number(ride.origin_lat), lng: Number(ride.origin_lng) }, { lat, lng });
+            eta = km < 0.12 ? 0 : taxiEtaMin(km);
+          }
+          emitToUser(ride.user_id, { type: 'taxi_ride', role: 'driver_position', rideId: prev.current_ride_ref, lat, lng, eta, ts: Date.now() });
+        }
+      } catch { /* el stream es un extra: el sondeo sigue funcionando */ }
+    }
     res.json({ ok: true, status, current_ride: hasRide ? prev.current_ride_ref : null });
   } catch (error) {
     console.error('Taxi heartbeat error:', error);
@@ -7447,6 +7471,7 @@ app.post('/api/taxi/:rideId/driver-status', auth, async (req, res) => {
         .update({ status: 'busy', last_seen: new Date().toISOString() }).eq('user_id', req.user.id);
     }
     await logAudit(req.user.id, 'taxi_driver_status', 'taxi', ride.id, { ride_ref: ride.ride_ref, status: next });
+    emitToUser(ride.user_id, { type: 'taxi_ride', role: 'status', rideId: ride.ride_ref, status: NEXT_RIDE_STATUS[next], ts: Date.now() });
     res.json({ ok: true, status: NEXT_RIDE_STATUS[next] });
   } catch (error) {
     console.error('Taxi driver status error:', error);
