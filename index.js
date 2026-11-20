@@ -6970,10 +6970,79 @@ app.post('/api/salud/medicamentos/pedido', auth, walletLimiter, async (req, res)
 // ════════════════════════════════════════════════════════════════════
 // TAXI
 // ════════════════════════════════════════════════════════════════════
+
+// Posición real de los conductores. Cada app en Modo Conductor manda su GPS;
+// sin latido reciente el conductor no cuenta como disponible. Grúa y mudanza
+// son servicios programados: no se despachan por cercanía.
+const TAXI_ON_DEMAND = ['moto', 'basic', 'premium', 'package'];
+const TAXI_DRIVER_TTL_SEC = 45;
+const TAXI_MAX_PICKUP_KM = 8;
+const TAXI_CITY_KMH = 22;
+
+const taxiDistanceKm = (a, b) => {
+  const rad = x => (x * Math.PI) / 180;
+  const dLat = rad(b.lat - a.lat), dLng = rad(b.lng - a.lng);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.min(1, Math.sqrt(h)));
+};
+const taxiEtaMin = km => Math.max(1, Math.round((km / TAXI_CITY_KMH) * 60));
+
+// Acepta { address, lat, lng } o la cadena antigua: un cliente viejo que aún
+// manda solo la dirección no rompe el viaje, solo pierde el ETA por GPS.
+const taxiPlace = value => {
+  if (typeof value === 'string') return { address: value, lat: null, lng: null };
+  const lat = Number(value?.lat), lng = Number(value?.lng);
+  return {
+    address: typeof value?.address === 'string' ? value.address : '',
+    lat: Number.isFinite(lat) && Math.abs(lat) <= 90 ? lat : null,
+    lng: Number.isFinite(lng) && Math.abs(lng) <= 180 ? lng : null,
+  };
+};
+
+const taxiVehicleName = { moto: 'Moto Honda', basic: 'Toyota Corolla', premium: 'SUV Toyota', tow: 'Camión grúa', moving: 'Camión de mudanza', package: 'Moto de reparto' };
+
+const findNearestDriver = async (variant, coords) => {
+  if (!TAXI_ON_DEMAND.includes(variant) || !coords) return null;
+  const since = new Date(Date.now() - TAXI_DRIVER_TTL_SEC * 1000).toISOString();
+  const { data, error } = await supabase.from('taxi_driver_positions')
+    .select('user_id, vehicle_type, plate, vehicle_model, driver_name, driver_phone, driver_rating, lat, lng')
+    .eq('status', 'available').eq('vehicle_type', variant)
+    .gte('last_seen', since).limit(25);
+  if (error || !data?.length) return null;
+  let best = null;
+  for (const d of data) {
+    const km = taxiDistanceKm(coords, { lat: Number(d.lat), lng: Number(d.lng) });
+    if (km > TAXI_MAX_PICKUP_KM) continue;
+    if (!best || km < best.km) best = { d, km };
+  }
+  if (!best) return null;
+  return {
+    km: best.km,
+    etaMin: taxiEtaMin(best.km),
+    driver: {
+      user_id: best.d.user_id,
+      name: best.d.driver_name || 'Conductor MiTaxi',
+      phone: best.d.driver_phone || null,
+      rating: Number(best.d.driver_rating) || 4.9,
+      plate: best.d.plate || '—',
+      vehicle: best.d.vehicle_model || taxiVehicleName[variant],
+      live: true,
+    },
+  };
+};
+
+const freeTaxiDriver = async (userId) => {
+  if (!userId) return;
+  await supabase.from('taxi_driver_positions')
+    .update({ status: 'available', current_ride_ref: null, last_seen: new Date().toISOString() })
+    .eq('user_id', userId);
+};
+
 app.post('/api/taxi/request', auth, walletLimiter, async (req, res) => {
   try {
     const { origin, dest, type } = req.body;
-    if (!origin || !dest) return res.status(400).json({ message: 'origin y dest requeridos', code: 'VALIDATION_ERROR' });
+    const place = taxiPlace(origin), drop = taxiPlace(dest);
+    if (!place.address || !drop.address) return res.status(400).json({ message: 'origin y dest requeridos', code: 'VALIDATION_ERROR' });
     const pinCheck = await checkPinForOperation(req.user.id, req.body?.pin);
     if (!pinCheck.ok) return pinErrorResponse(res, pinCheck.code);
     // Un tipo desconocido no puede caer a 'basic': cobraría la tarifa de taxi
@@ -6984,16 +7053,38 @@ app.post('/api/taxi/request', auth, walletLimiter, async (req, res) => {
     const tarifa = await readTariff('taxi', variant);
     if (!tarifa) return res.status(502).json({ message: 'Tarifa de taxi no disponible', code: 'TARIFF_UNAVAILABLE' });
 
-    const VEHICLE_NAME = { moto: 'Moto Honda', basic: 'Toyota Corolla', premium: 'SUV Toyota', tow: 'Camión grúa', moving: 'Camión de mudanza', package: 'Moto de reparto' };
     const rideId = safeRef('RIDE');
-    const driver = { name: 'Carlos Mba', phone: '+240 222 555', rating: 4.8, plate: 'GE-1234', vehicle: VEHICLE_NAME[variant] || 'Toyota Corolla' };
+
+    // Despacho real: se reserva el conductor disponible más cercano antes de
+    // escribir el viaje. La reserva es condicional a que siga 'available', así
+    // que dos pasajeros no pueden llevarse al mismo conductor.
+    let live = null;
+    if (place.lat != null && place.lng != null) {
+      const cand = await findNearestDriver(variant, { lat: place.lat, lng: place.lng });
+      if (cand) {
+        const { data: claimed } = await supabase.from('taxi_driver_positions')
+          .update({ status: 'busy', current_ride_ref: rideId, last_seen: new Date().toISOString() })
+          .eq('user_id', cand.driver.user_id).eq('status', 'available')
+          .select('user_id');
+        if (claimed?.length) live = cand;
+      }
+    }
+
+    // Sin flota real en línea se mantiene el conductor simulado: el viaje
+    // funciona igual y la app puede probarse antes de que haya conductores.
+    const driver = live ? live.driver : { name: 'Carlos Mba', phone: '+240 222 555', rating: 4.8, plate: 'GE-1234', vehicle: taxiVehicleName[variant] || 'Toyota Corolla' };
+    const eta = live ? live.etaMin : Math.floor(Math.random() * 8) + 3;
 
     // El viaje se escribe antes de cobrar: si no queda fila, no hay cargo.
     const { data: ride, error: rideError } = await supabase.from('taxi_rides').insert({
       ride_ref: rideId,
       user_id: req.user.id,
-      origin,
-      destination: dest,
+      origin: place.address,
+      destination: drop.address,
+      origin_lat: place.lat,
+      origin_lng: place.lng,
+      dest_lat: drop.lat,
+      dest_lng: drop.lng,
       ride_type: variant,
       fare: Number(tarifa.amount),
       status: 'searching',
@@ -7001,6 +7092,7 @@ app.post('/api/taxi/request', auth, walletLimiter, async (req, res) => {
     }).select().maybeSingle();
     if (rideError || !ride) {
       console.error('taxi_rides insert:', rideError?.message || 'sin fila insertada');
+      await freeTaxiDriver(live?.driver?.user_id);
       return res.status(502).json({ message: 'No se pudo registrar el viaje', code: 'RIDE_NOT_SAVED' });
     }
 
@@ -7008,23 +7100,29 @@ app.post('/api/taxi/request', auth, walletLimiter, async (req, res) => {
     if (!cargo.ok) {
       await supabase.from('taxi_rides').update({ status: 'cancelled', updated_at: new Date().toISOString() })
         .eq('id', ride.id).eq('charged_at', null);
+      await freeTaxiDriver(live?.driver?.user_id);
       return res.status(cargo.http || 400).json(cargo.code === 'INSUFFICIENT_BALANCE'
         ? { message: 'Saldo insuficiente', code: 'INSUFFICIENT_BALANCE' }
         : { message: 'No se pudo cobrar el viaje', code: cargo.code || 'CHARGE_FAILED' });
     }
 
+    // El rastro del cobro va en su propia escritura: si un día falta una
+    // columna accesoria (eta), el viaje no queda sin charged_at y cancelar
+    // sigue devolviendo el dinero.
     await supabase.from('taxi_rides')
       .update({ status: 'assigned', charged_at: new Date().toISOString(), journal_id: cargo.journal_id })
       .eq('id', ride.id);
-    await logAudit(req.user.id, 'taxi_request', 'taxi', ride.id, { fare: Number(cargo.amount), variant });
+    await supabase.from('taxi_rides').update({ eta_minutes: eta }).eq('id', ride.id);
+    await logAudit(req.user.id, 'taxi_request', 'taxi', ride.id, { fare: Number(cargo.amount), variant, live_driver: !!live });
 
     res.json({
       rideId,
       driver,
-      eta: Math.floor(Math.random() * 8) + 3,
+      eta,
       tarifa: Number(cargo.amount),
       type: variant,
       status: 'assigned',
+      live: !!live,
       balance: await readWalletBalance(req.user.id),
       journal_id: cargo.journal_id,
     });
@@ -7042,14 +7140,40 @@ app.get('/api/taxi/:rideId/status', auth, async (req, res) => {
       return res.status(404).json({ message: 'Viaje no encontrado', code: 'RIDE_NOT_FOUND' });
     }
 
-    const status = sandboxStatus.includes(ride.status) ? ride.status : 'processing';
-    res.json({ 
-      rideId: ride.ride_ref, 
-      status, 
-      eta: status === 'completed' ? 0 : 2, 
-      driver_location: { lat: 3.75, lng: 8.78 }, 
-      fare: ride.fare, 
-      driver: ride.driver 
+    // Estados del viaje en el vocabulario de la app; cualquier otro valor se
+    // conserva tal cual para no disfrazar un estado nuevo de 'processing'.
+    const RIDE_STATUS = {
+      searching: 'searching', assigned: 'matched', accepted: 'matched',
+      riding: 'riding', in_progress: 'riding', completed: 'completed', cancelled: 'cancelled',
+    };
+    const status = RIDE_STATUS[ride.status] || ride.status;
+
+    // Con conductor real la posición y el ETA salen de su último latido; el
+    // punto fijo queda solo para viajes simulados.
+    let eta = status === 'completed' || status === 'riding' ? 0 : 2;
+    let driverLocation = { lat: 3.75, lng: 8.78 };
+    let live = false;
+    if (ride.driver?.user_id) {
+      const { data: pos } = await supabase.from('taxi_driver_positions')
+        .select('lat, lng, last_seen').eq('user_id', ride.driver.user_id).maybeSingle();
+      if (pos) {
+        driverLocation = { lat: Number(pos.lat), lng: Number(pos.lng) };
+        live = true;
+        if (status === 'matched' && ride.origin_lat != null && ride.origin_lng != null) {
+          const km = taxiDistanceKm({ lat: Number(ride.origin_lat), lng: Number(ride.origin_lng) }, driverLocation);
+          eta = km < 0.12 ? 0 : taxiEtaMin(km);
+        }
+      }
+    }
+
+    res.json({
+      rideId: ride.ride_ref,
+      status,
+      eta,
+      driver_location: driverLocation,
+      live,
+      fare: ride.fare,
+      driver: ride.driver,
     });
   } catch (error) {
     console.error('Taxi status error:', error);
@@ -7080,6 +7204,9 @@ app.post('/api/taxi/:rideId/cancel', auth, async (req, res) => {
         ? { status: 'cancelled', refunded_at: new Date().toISOString(), updated_at: new Date().toISOString() }
         : { status: 'cancelled', updated_at: new Date().toISOString() })
       .eq('id', ride.id);
+    // Cancelar libera al conductor real en el acto: no debe quedarse 'busy'
+    // por un viaje que ya no existe.
+    await freeTaxiDriver(ride.driver?.user_id);
     await logAudit(req.user.id, 'taxi_cancel', 'taxi', ride.id, { ride_ref: ride.ride_ref, reembolsado });
 
     res.json({ message: 'Viaje cancelado', rideId: req.params.rideId, reembolsado, balance: await readWalletBalance(req.user.id) });
@@ -7137,8 +7264,152 @@ app.get('/api/taxi/rides', auth, async (req, res) => {
   }
 });
 
-// Alta de conductor. No existe flota que asignar todavía, así que la solicitud
-// se registra como orden de servicio (importe 0: no mueve dinero) y el operador
+// ── Modo Conductor: posición real ──────────────────────────────────
+// El conductor comparte su GPS mientras está en línea. Solo él puede fijar
+// 'available'/'offline'; 'busy' lo pone el despacho al asignarle un viaje.
+app.post('/api/taxi/driver/heartbeat', auth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const lat = Number(body.lat), lng = Number(body.lng);
+    if (!Number.isFinite(lat) || Math.abs(lat) > 90 || !Number.isFinite(lng) || Math.abs(lng) > 180) {
+      return res.status(400).json({ message: 'Ubicación no válida', code: 'VALIDATION_ERROR' });
+    }
+    const vehicleType = TAXI_ON_DEMAND.includes(body.vehicle_type) ? body.vehicle_type : 'basic';
+    // Un conductor con viaje en curso sigue 'busy' aunque la app pida otra cosa.
+    const { data: prev } = await supabase.from('taxi_driver_positions')
+      .select('status, current_ride_ref').eq('user_id', req.user.id).maybeSingle();
+    const hasRide = !!(prev?.current_ride_ref && prev.status === 'busy');
+    const status = hasRide ? 'busy' : (body.status === 'offline' ? 'offline' : 'available');
+    const heading = Number(body.heading);
+
+    const { error } = await supabase.from('taxi_driver_positions').upsert({
+      user_id: req.user.id,
+      vehicle_type: vehicleType,
+      plate: typeof body.plate === 'string' ? body.plate.slice(0, 20) : null,
+      vehicle_model: typeof body.vehicle_model === 'string' ? body.vehicle_model.slice(0, 80) : null,
+      driver_name: typeof body.name === 'string' ? body.name.slice(0, 100) : null,
+      driver_phone: typeof body.phone === 'string' ? body.phone.slice(0, 30) : null,
+      driver_rating: Number.isFinite(Number(body.rating)) ? Math.min(5, Math.max(1, Number(body.rating))) : 4.9,
+      lat, lng,
+      heading: Number.isFinite(heading) ? heading : null,
+      status,
+      last_seen: new Date().toISOString(),
+    }, { onConflict: 'user_id' });
+    if (error) {
+      console.error('taxi driver heartbeat:', error.message);
+      return res.status(502).json({ message: 'No se pudo guardar la posición', code: 'POSITION_NOT_SAVED' });
+    }
+    res.json({ ok: true, status, current_ride: hasRide ? prev.current_ride_ref : null });
+  } catch (error) {
+    console.error('Taxi heartbeat error:', error);
+    res.status(500).json({ message: 'Error al enviar posición', code: 'INTERNAL_ERROR' });
+  }
+});
+
+app.post('/api/taxi/driver/offline', auth, async (req, res) => {
+  try {
+    await supabase.from('taxi_driver_positions')
+      .update({ status: 'offline', last_seen: new Date().toISOString() })
+      .eq('user_id', req.user.id).is('current_ride_ref', null);
+    res.json({ ok: true, status: 'offline' });
+  } catch (error) {
+    console.error('Taxi offline error:', error);
+    res.status(500).json({ message: 'Error al desconectarse', code: 'INTERNAL_ERROR' });
+  }
+});
+
+app.get('/api/taxi/driver/current', auth, async (req, res) => {
+  try {
+    const { data: pos } = await supabase.from('taxi_driver_positions')
+      .select('status, current_ride_ref').eq('user_id', req.user.id).maybeSingle();
+    if (!pos?.current_ride_ref) return res.json({ ride: null, status: pos?.status || 'offline' });
+    const { data: ride } = await supabase.from('taxi_rides')
+      .select('*').eq('ride_ref', pos.current_ride_ref).maybeSingle();
+    if (!ride || ['completed', 'cancelled'].includes(ride.status)) {
+      await freeTaxiDriver(req.user.id);
+      return res.json({ ride: null, status: 'available' });
+    }
+    res.json({
+      status: pos.status,
+      ride: {
+        rideId: ride.ride_ref,
+        status: ride.status,
+        origin: { address: ride.origin, lat: ride.origin_lat, lng: ride.origin_lng },
+        destination: { address: ride.destination, lat: ride.dest_lat, lng: ride.dest_lng },
+        ride_type: ride.ride_type,
+        fare: ride.fare,
+      },
+    });
+  } catch (error) {
+    console.error('Taxi driver current error:', error);
+    res.status(500).json({ message: 'Error al consultar el viaje', code: 'INTERNAL_ERROR' });
+  }
+});
+
+// El conductor marca llegada, inicio y fin. Solo el conductor asignado puede.
+app.post('/api/taxi/:rideId/driver-status', auth, async (req, res) => {
+  try {
+    const next = String(req.body?.status || '');
+    const NEXT_RIDE_STATUS = { arrived: 'assigned', riding: 'riding', completed: 'completed' };
+    if (!NEXT_RIDE_STATUS[next]) {
+      return res.status(400).json({ message: 'Estado no válido', code: 'VALIDATION_ERROR' });
+    }
+    const { data: ride } = await supabase.from('taxi_rides')
+      .select('*').eq('ride_ref', req.params.rideId).maybeSingle();
+    if (!ride) return res.status(404).json({ message: 'Viaje no encontrado', code: 'RIDE_NOT_FOUND' });
+    if (ride.driver?.user_id !== req.user.id) {
+      return res.status(403).json({ message: 'Este viaje no es tuyo', code: 'FORBIDDEN' });
+    }
+    await supabase.from('taxi_rides')
+      .update({ status: NEXT_RIDE_STATUS[next], updated_at: new Date().toISOString() })
+      .eq('id', ride.id);
+    if (next === 'completed') {
+      await freeTaxiDriver(req.user.id);
+    } else {
+      await supabase.from('taxi_driver_positions')
+        .update({ status: 'busy', last_seen: new Date().toISOString() }).eq('user_id', req.user.id);
+    }
+    await logAudit(req.user.id, 'taxi_driver_status', 'taxi', ride.id, { ride_ref: ride.ride_ref, status: next });
+    res.json({ ok: true, status: NEXT_RIDE_STATUS[next] });
+  } catch (error) {
+    console.error('Taxi driver status error:', error);
+    res.status(500).json({ message: 'Error al actualizar el viaje', code: 'INTERNAL_ERROR' });
+  }
+});
+
+// Conductores en línea cerca del pasajero, con distancia y ETA. No se expone
+// nombre ni teléfono: eso solo llega al asignarse el viaje.
+app.get('/api/taxi/nearby', auth, async (req, res) => {
+  try {
+    const lat = Number(req.query.lat), lng = Number(req.query.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ message: 'lat y lng requeridos', code: 'VALIDATION_ERROR' });
+    }
+    const type = TAXI_ON_DEMAND.includes(req.query.type) ? req.query.type : null;
+    const since = new Date(Date.now() - TAXI_DRIVER_TTL_SEC * 1000).toISOString();
+    let query = supabase.from('taxi_driver_positions')
+      .select('vehicle_type, lat, lng, heading')
+      .eq('status', 'available').gte('last_seen', since).limit(50);
+    if (type) query = query.eq('vehicle_type', type);
+    const { data, error } = await query;
+    if (error) return res.status(502).json({ message: 'Flota no disponible', code: 'DRIVERS_UNAVAILABLE' });
+    const center = { lat, lng };
+    const drivers = (data || [])
+      .map(d => ({ type: d.vehicle_type, lat: Number(d.lat), lng: Number(d.lng), heading: d.heading == null ? null : Number(d.heading) }))
+      .map(d => ({ ...d, km: taxiDistanceKm(center, d) }))
+      .filter(d => d.km <= TAXI_MAX_PICKUP_KM)
+      .sort((a, b) => a.km - b.km)
+      .slice(0, 10)
+      .map(d => ({ type: d.type, lat: d.lat, lng: d.lng, heading: d.heading, distance_km: Number(d.km.toFixed(2)), eta_min: taxiEtaMin(d.km) }));
+    res.json({ drivers, ttl_sec: TAXI_DRIVER_TTL_SEC });
+  } catch (error) {
+    console.error('Taxi nearby error:', error);
+    res.status(500).json({ message: 'Error al buscar conductores', code: 'INTERNAL_ERROR' });
+  }
+});
+
+// Alta de conductor: la solicitud se registra como orden de servicio (importe 0:
+// no mueve dinero) y el operador
 // la revisa desde service_orders. Sin fila no hay solicitud: antes la app
 // confirmaba el alta con solo haber llamado a la ruta.
 app.post('/api/taxi/drivers/register', auth, async (req, res) => {
