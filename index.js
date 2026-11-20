@@ -7038,6 +7038,53 @@ const freeTaxiDriver = async (userId) => {
     .eq('user_id', userId);
 };
 
+// Chat pasajero ↔ conductor: el mismo chat privado que usa la mensajería, así
+// el historial no se duplica si vuelven a coincidir en otro viaje.
+const ensureRideChat = async (passengerId, driverId) => {
+  if (!passengerId || !driverId || passengerId === driverId) return null;
+  try {
+    const { data: mine } = await supabase.from('chat_participants').select('chat_id').eq('user_id', passengerId);
+    const { data: theirs } = await supabase.from('chat_participants').select('chat_id').eq('user_id', driverId);
+    const mineIds = (mine || []).map(x => x.chat_id);
+    const common = mineIds.filter(id => (theirs || []).some(x => x.chat_id === id));
+    if (common.length) {
+      const { data: existing } = await supabase.from('chats')
+        .select('id').in('id', common).eq('type', 'private').limit(1).maybeSingle();
+      if (existing) return existing.id;
+    }
+    const { data: chat, error } = await supabase.from('chats')
+      .insert({ type: 'private', created_by: passengerId, created_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .select('id').single();
+    if (error || !chat) return null;
+    await supabase.from('chat_participants').insert([
+      { chat_id: chat.id, user_id: passengerId },
+      { chat_id: chat.id, user_id: driverId },
+    ]);
+    return chat.id;
+  } catch (e) {
+    console.error('taxi ride chat:', e.message);
+    return null;
+  }
+};
+
+const taxiMediaOf = pos => ({
+  exterior: Array.isArray(pos?.photos_exterior) ? pos.photos_exterior : [],
+  interior: Array.isArray(pos?.photos_interior) ? pos.photos_interior : [],
+  video: pos?.video_url || null,
+});
+
+// Lee la ficha del conductor aunque la migración de fotos aún no esté pegada:
+// sin las columnas viejas el viaje en vivo debe seguir funcionando igual.
+const taxiPosRow = async (userId, columns, fallback) => {
+  let { data, error } = await supabase.from('taxi_driver_positions')
+    .select(columns).eq('user_id', userId).maybeSingle();
+  if (error && /column .* does not exist|Could not find the .* column/i.test(error.message || '')) {
+    ({ data } = await supabase.from('taxi_driver_positions')
+      .select(fallback).eq('user_id', userId).maybeSingle());
+  }
+  return data || null;
+};
+
 app.post('/api/taxi/request', auth, walletLimiter, async (req, res) => {
   try {
     const { origin, dest, type } = req.body;
@@ -7070,10 +7117,19 @@ app.post('/api/taxi/request', auth, walletLimiter, async (req, res) => {
       }
     }
 
-    // Sin flota real en línea se mantiene el conductor simulado: el viaje
-    // funciona igual y la app puede probarse antes de que haya conductores.
-    const driver = live ? live.driver : { name: 'Carlos Mba', phone: '+240 222 555', rating: 4.8, plate: 'GE-1234', vehicle: taxiVehicleName[variant] || 'Toyota Corolla' };
+    // Los servicios al instante ya no inventan conductor: si nadie está en
+    // línea cerca, se dice con claridad y no se cobra nada. Grúa y mudanza
+    // siguen siendo programados, sin despacho por cercanía.
+    if (TAXI_ON_DEMAND.includes(variant) && !live) {
+      const sinGps = place.lat == null || place.lng == null;
+      return res.status(409).json(sinGps
+        ? { message: 'Activa la ubicación para buscar conductores cerca', code: 'NO_LOCATION' }
+        : { message: 'No hay conductores cerca ahora mismo. Inténtalo en unos minutos.', code: 'NO_DRIVERS_NEARBY' });
+    }
+
+    const driver = live ? live.driver : { name: 'Proveedor MiTaxi', phone: null, rating: 4.8, plate: '—', vehicle: taxiVehicleName[variant] || 'Toyota Corolla' };
     const eta = live ? live.etaMin : Math.floor(Math.random() * 8) + 3;
+    if (live) driver.chat_id = await ensureRideChat(req.user.id, live.driver.user_id);
 
     // El viaje se escribe antes de cobrar: si no queda fila, no hay cargo.
     const { data: ride, error: rideError } = await supabase.from('taxi_rides').insert({
@@ -7153,15 +7209,26 @@ app.get('/api/taxi/:rideId/status', auth, async (req, res) => {
     let eta = status === 'completed' || status === 'riding' ? 0 : 2;
     let driverLocation = { lat: 3.75, lng: 8.78 };
     let live = false;
+    let media = null;
+    let chatId = ride.driver?.chat_id || null;
     if (ride.driver?.user_id) {
-      const { data: pos } = await supabase.from('taxi_driver_positions')
-        .select('lat, lng, last_seen').eq('user_id', ride.driver.user_id).maybeSingle();
+      const pos = await taxiPosRow(ride.driver.user_id,
+        'lat, lng, last_seen, photos_exterior, photos_interior, video_url',
+        'lat, lng, last_seen');
       if (pos) {
         driverLocation = { lat: Number(pos.lat), lng: Number(pos.lng) };
         live = true;
+        media = taxiMediaOf(pos);
         if (status === 'matched' && ride.origin_lat != null && ride.origin_lng != null) {
           const km = taxiDistanceKm({ lat: Number(ride.origin_lat), lng: Number(ride.origin_lng) }, driverLocation);
           eta = km < 0.12 ? 0 : taxiEtaMin(km);
+        }
+      }
+      if (live && !chatId) {
+        chatId = await ensureRideChat(ride.user_id, ride.driver.user_id);
+        if (chatId) {
+          await supabase.from('taxi_rides')
+            .update({ driver: { ...ride.driver, chat_id: chatId } }).eq('id', ride.id);
         }
       }
     }
@@ -7173,7 +7240,8 @@ app.get('/api/taxi/:rideId/status', auth, async (req, res) => {
       driver_location: driverLocation,
       live,
       fare: ride.fare,
-      driver: ride.driver,
+      driver: ride.driver ? { ...ride.driver, chat_id: chatId } : ride.driver,
+      vehicle_media: media,
     });
   } catch (error) {
     console.error('Taxi status error:', error);
@@ -7320,17 +7388,24 @@ app.post('/api/taxi/driver/offline', auth, async (req, res) => {
 
 app.get('/api/taxi/driver/current', auth, async (req, res) => {
   try {
-    const { data: pos } = await supabase.from('taxi_driver_positions')
-      .select('status, current_ride_ref').eq('user_id', req.user.id).maybeSingle();
-    if (!pos?.current_ride_ref) return res.json({ ride: null, status: pos?.status || 'offline' });
+    const pos = await taxiPosRow(req.user.id,
+      'status, current_ride_ref, photos_exterior, photos_interior, video_url',
+      'status, current_ride_ref');
+    const media = taxiMediaOf(pos);
+    if (!pos?.current_ride_ref) return res.json({ ride: null, status: pos?.status || 'offline', media });
     const { data: ride } = await supabase.from('taxi_rides')
       .select('*').eq('ride_ref', pos.current_ride_ref).maybeSingle();
     if (!ride || ['completed', 'cancelled'].includes(ride.status)) {
       await freeTaxiDriver(req.user.id);
-      return res.json({ ride: null, status: 'available' });
+      return res.json({ ride: null, status: 'available', media });
     }
+    const chatId = ride.driver?.chat_id || await ensureRideChat(ride.user_id, req.user.id);
+    let passengerName = null;
+    const { data: passenger } = await supabase.from('users').select('full_name').eq('id', ride.user_id).maybeSingle();
+    if (passenger?.full_name) passengerName = passenger.full_name;
     res.json({
       status: pos.status,
+      media,
       ride: {
         rideId: ride.ride_ref,
         status: ride.status,
@@ -7338,6 +7413,8 @@ app.get('/api/taxi/driver/current', auth, async (req, res) => {
         destination: { address: ride.destination, lat: ride.dest_lat, lng: ride.dest_lng },
         ride_type: ride.ride_type,
         fare: ride.fare,
+        passenger_name: passengerName,
+        chat_id: chatId,
       },
     });
   } catch (error) {
@@ -7405,6 +7482,113 @@ app.get('/api/taxi/nearby', auth, async (req, res) => {
   } catch (error) {
     console.error('Taxi nearby error:', error);
     res.status(500).json({ message: 'Error al buscar conductores', code: 'INTERNAL_ERROR' });
+  }
+});
+
+// Fotos del coche (hasta 3 exteriores y 3 interiores) y un vídeo corto. Van en
+// la ficha del conductor y el pasajero las ve al asignarse el viaje.
+const TAXI_MEDIA_LIMITS = { exterior: 12 * 1024 * 1024, interior: 12 * 1024 * 1024, video: 40 * 1024 * 1024 };
+
+const taxiStoragePath = url => {
+  const marker = '/chat-files/';
+  const i = typeof url === 'string' ? url.indexOf(marker) : -1;
+  return i >= 0 ? decodeURIComponent(url.slice(i + marker.length)) : null;
+};
+
+app.post('/api/taxi/driver/media', auth, async (req, res) => {
+  try {
+    const { fields, file } = await new Promise((resolve, reject) => {
+      const busboy = require('busboy');
+      const bb = busboy({ headers: req.headers, limits: { files: 1, fileSize: 45 * 1024 * 1024 } });
+      const fields = {};
+      let file = null;
+      bb.on('field', (k, v) => { fields[k] = v; });
+      bb.on('file', (name, stream, info) => {
+        const chunks = [];
+        stream.on('data', c => chunks.push(c));
+        stream.on('limit', () => reject(new Error('FILE_TOO_LARGE')));
+        stream.on('end', () => {
+          file = { buffer: Buffer.concat(chunks), mime: info.mimeType || 'application/octet-stream', name: info.filename || `${name}_${Date.now()}` };
+        });
+      });
+      bb.on('close', () => resolve({ fields, file }));
+      bb.on('error', reject);
+      req.pipe(bb);
+    });
+
+    const slot = String(fields.slot || '');
+    if (!TAXI_MEDIA_LIMITS[slot]) return res.status(400).json({ message: 'slot no válido', code: 'VALIDATION_ERROR' });
+    if (!file?.buffer?.length) return res.status(400).json({ message: 'Archivo vacío o no recibido', code: 'VALIDATION_ERROR' });
+    if (file.buffer.length > TAXI_MEDIA_LIMITS[slot]) return res.status(413).json({ message: 'Archivo demasiado grande', code: 'FILE_TOO_LARGE' });
+    const isVideo = file.mime.startsWith('video/');
+    if (slot === 'video' ? !isVideo : !file.mime.startsWith('image/')) {
+      return res.status(400).json({ message: slot === 'video' ? 'El vídeo debe ser un archivo de vídeo' : 'La foto debe ser una imagen', code: 'VALIDATION_ERROR' });
+    }
+
+    const ext = (file.name.split('.').pop() || (isVideo ? 'mp4' : 'jpg'))
+      .toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 5) || (isVideo ? 'mp4' : 'jpg');
+    const path = `taxi-vehicles/${req.user.id}/${slot}_${Date.now()}.${ext}`;
+    const { error: upErr } = await supabase.storage.from('chat-files')
+      .upload(path, file.buffer, { contentType: file.mime, upsert: false });
+    if (upErr) {
+      console.error('taxi media upload:', upErr.message);
+      return res.status(502).json({ message: 'No se pudo subir el archivo', code: 'UPLOAD_FAILED' });
+    }
+    const { data: urlData } = supabase.storage.from('chat-files').getPublicUrl(path);
+    const url = urlData?.publicUrl || '';
+
+    const { data: pos } = await supabase.from('taxi_driver_positions')
+      .select('photos_exterior, photos_interior, video_url').eq('user_id', req.user.id).maybeSingle();
+    const media = taxiMediaOf(pos);
+    if (slot === 'video') media.video = url;
+    else media[slot] = [...media[slot].filter(u => u !== url), url].slice(-3);
+
+    const patch = { photos_exterior: media.exterior, photos_interior: media.interior, video_url: media.video };
+    let error = null;
+    if (pos) {
+      ({ error } = await supabase.from('taxi_driver_positions').update(patch).eq('user_id', req.user.id));
+    } else {
+      // lat/lng son obligatorios en la tabla: la ficha nace desconectada y sin
+      // posición; el primer latido la coloca de verdad.
+      ({ error } = await supabase.from('taxi_driver_positions')
+        .insert({ user_id: req.user.id, status: 'offline', lat: 0, lng: 0, last_seen: new Date().toISOString(), ...patch }));
+    }
+    if (error) throw error;
+    res.json({ url, slot, vehicle_media: media });
+  } catch (e) {
+    if (e.message === 'FILE_TOO_LARGE') return res.status(413).json({ message: 'Archivo demasiado grande', code: 'FILE_TOO_LARGE' });
+    console.error('Taxi media upload:', e.message);
+    res.status(500).json({ message: 'Error al subir el archivo', code: 'INTERNAL_ERROR' });
+  }
+});
+
+app.delete('/api/taxi/driver/media', auth, async (req, res) => {
+  try {
+    const slot = String(req.body?.slot || req.query.slot || '');
+    const url = typeof req.body?.url === 'string' ? req.body.url : (typeof req.query.url === 'string' ? req.query.url : null);
+    if (!TAXI_MEDIA_LIMITS[slot]) return res.status(400).json({ message: 'slot no válido', code: 'VALIDATION_ERROR' });
+    const { data: pos } = await supabase.from('taxi_driver_positions')
+      .select('photos_exterior, photos_interior, video_url').eq('user_id', req.user.id).maybeSingle();
+    if (!pos) return res.json({ ok: true, slot, vehicle_media: taxiMediaOf(null) });
+    const media = taxiMediaOf(pos);
+    if (slot === 'video') media.video = null;
+    else media[slot] = url ? media[slot].filter(u => u !== url) : [];
+    const { error } = await supabase.from('taxi_driver_positions')
+      .update({ photos_exterior: media.exterior, photos_interior: media.interior, video_url: media.video })
+      .eq('user_id', req.user.id);
+    if (error) throw error;
+    let removed = [];
+    if (slot === 'video') removed = [pos.video_url];
+    else if (url) removed = [url];
+    else removed = (slot === 'exterior' ? pos.photos_exterior : pos.photos_interior) || [];
+    const paths = (removed || []).map(taxiStoragePath).filter(Boolean);
+    if (paths.length) {
+      try { await supabase.storage.from('chat-files').remove(paths); } catch { /* el archivo huérfano no bloquea */ }
+    }
+    res.json({ ok: true, slot, vehicle_media: media });
+  } catch (e) {
+    console.error('Taxi media delete:', e.message);
+    res.status(500).json({ message: 'Error al quitar el archivo', code: 'INTERNAL_ERROR' });
   }
 });
 
