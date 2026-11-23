@@ -11666,10 +11666,16 @@ app.get('/api/stories', auth, async (req, res) => {
 
 app.post('/api/stories', auth, async (req, res) => {
   try {
-    const { media, type = 'text' } = req.body;
+    const { media, type = 'text', music } = req.body;
     if (!media) return res.status(400).json({ message: 'media requerido' });
     const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
-    const newSlides = Array.isArray(media) ? media : [media];
+    // La música va dentro de cada slide. El campo media ya es JSON y se
+    // conserva al añadir estados posteriores, sin necesitar una migración de
+    // base de datos ni perder la canción para los demás dispositivos.
+    const newSlides = (Array.isArray(media) ? media : [media]).map((slide) => {
+      if (!music || !slide || typeof slide !== 'object' || Array.isArray(slide)) return slide;
+      return { ...slide, music: slide.music || music };
+    });
 
     // Upsert: añadir a story activa existente o crear nueva
     const { data: existing } = await supabase
