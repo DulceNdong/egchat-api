@@ -12243,9 +12243,17 @@ const sendCallOutcomePush = async (callId, reason) => {
       .from('users').select('id, full_name, avatar_url').eq('id', cs.caller_id).maybeSingle();
     const isVideo = cs.type === 'video';
 
+    // Si la sesión no llegó a establecerse pero el usuario que llamaba colgó
+    // (o la otra parte cerró la UI), no es una llamada perdida: fue cancelada.
+    // "Llamada perdida" queda reservada para expiraciones reales (`missed`).
+    const wasMissed = String(reason || '') === 'missed';
+    const summary = wasMissed
+      ? (isVideo ? 'Videollamada perdida' : 'Llamada perdida')
+      : (isVideo ? 'Videollamada cancelada' : 'Llamada cancelada');
+
     await sendPushToUser(String(cs.target_user_id), {
       title:        caller?.full_name || 'EGChat',
-      body:         isVideo ? 'Videollamada perdida' : 'Llamada perdida',
+      body:         summary,
       notificationType: 'call_summary',
       messageType:  'call',
       senderName:   caller?.full_name || 'EGChat',
