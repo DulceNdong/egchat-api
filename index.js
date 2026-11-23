@@ -13204,10 +13204,14 @@ const sendPushToUser = async (userId, payload) => {
     // ── Tokens nativos registrados por la app ─────────────────────────────
     const { data: expoSubs } = await supabase
       .from('expo_push_tokens')
-      .select('token, token_type')
-      .eq('user_id', userId)
-      .in('token_type', ['expo', 'fcm', 'apns'])
-      .neq('is_active', false);
+      // Las instalaciones antiguas no tienen token_type/is_active. Filtrar
+      // por esas columnas en SQL las excluía y nunca recibían notificaciones.
+      .select('token, token_type, is_active, platform')
+      .eq('user_id', userId);
+
+    const activeTokens = (expoSubs || []).filter(sub =>
+      sub?.token && sub.is_active !== false
+    );
 
     const isExpoFormat = (t) => t.startsWith('ExponentPushToken') || t.startsWith('ExpoPushToken');
     const isHexToken    = (t) => /^[0-9a-f]{64}$/i.test(t);
@@ -13215,10 +13219,10 @@ const sendPushToUser = async (userId, payload) => {
     // exp.host solo conoce sus propios tokens. Los APNs crudos que la app
     // registra en iOS se le mandaban también a exp.host y el rechazo del lote
     // dejaba al iPhone sin ningún aviso. Ahora van directos a APNs.
-    const expoTokens = [...new Set((expoSubs || [])
+    const expoTokens = [...new Set(activeTokens
       .map(s => String(s.token || ''))
       .filter(t => isExpoFormat(t)))];
-    const apnsTokens = [...new Set((expoSubs || [])
+    const apnsTokens = [...new Set(activeTokens
       .map(s => ({ token: String(s.token || ''), type: String(s.token_type || '') }))
       .filter(s => s.type === 'apns' || (!isExpoFormat(s.token) && isHexToken(s.token)))
       .map(s => s.token))];
@@ -13590,12 +13594,25 @@ app.post('/api/push/send-test/:phone', async (req, res) => {
 // Ver cuántas suscripciones tiene el usuario actual
 app.get('/api/push/my-subscriptions', auth, async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('push_subscriptions')
-      .select('id, endpoint, created_at, updated_at')
-      .eq('user_id', req.user.id);
-    if (error) return res.status(500).json({ message: error.message });
-    res.json({ count: (data || []).length, subscriptions: (data || []).map(s => ({ id: s.id, endpoint: s.endpoint.slice(0, 60) + '...', updated_at: s.updated_at })) });
+    const [{ data: webData, error: webError }, { data: nativeData, error: nativeError }] = await Promise.all([
+      supabase.from('push_subscriptions')
+        .select('id, endpoint, created_at, updated_at')
+        .eq('user_id', req.user.id),
+      supabase.from('expo_push_tokens')
+        .select('token, token_type, platform, is_active, updated_at')
+        .eq('user_id', req.user.id),
+    ]);
+    if (webError || nativeError) return res.status(500).json({ message: webError?.message || nativeError?.message });
+    const native = (nativeData || []).filter(token => token.is_active !== false);
+    res.json({
+      web: (webData || []).length,
+      native: native.length,
+      total: (webData || []).length + native.length,
+      nativeTokens: native.map(token => ({
+        type: token.token_type || 'legacy', platform: token.platform || 'unknown',
+        token: `${String(token.token).slice(0, 18)}…`, updated_at: token.updated_at,
+      })),
+    });
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
