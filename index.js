@@ -1968,8 +1968,13 @@ app.post('/api/chats/:chatId/messages', auth, async (req, res) => {
         body: bodyText,
         icon: senderData?.avatar_url || '/favicon.svg',
         tag: `chat-${chatId}`,
-        url: '/',
+        // El cliente abre la conversación y el mensaje exacto del aviso.
+        url: `/?chatId=${encodeURIComponent(chatId)}&messageId=${encodeURIComponent(message.id)}`,
         chatId,
+        messageId: message.id,
+        // Compatibilidad con consumidores que esperan snake_case.
+        chat_id: chatId,
+        message_id: message.id,
         notificationType: 'message',
         // Datos para notificaciones ricas nativas
         senderName,
