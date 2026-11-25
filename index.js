@@ -13294,9 +13294,10 @@ const sendPushToUser = async (userId, payload) => {
         // Llamadas: TTL de 120s
         ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
       }));
-
-      for (let i = 0; i < expoMessages.length; i += 100) {
-        const batch = expoMessages.slice(i, i + 100);
+      // Expo rechaza lotes que mezclan tokens de distintos experience IDs.
+      // Se manda un mensaje por petición para evitar PUSH_TOO_MANY_EXPERIENCE_IDS.
+      for (const message of expoMessages) {
+        const batch = [message];
         try {
           const expoRes = await fetch('https://exp.host/--/api/v2/push/send', {
             method: 'POST',
@@ -13442,13 +13443,36 @@ app.post('/api/push/register-expo-token', auth, async (req, res) => {
           }),
         });
         if (edgeRes.ok) {
+          // Limpiar tokens Expo viejos del mismo usuario (proyectos anteriores).
+          // Expo rechaza lotes con tokens de distintos experience IDs
+          // (PUSH_TOO_MANY_EXPERIENCE_IDS); un usuario solo debe tener un
+          // token Expo activo a la vez.
+          if (type === 'expo') {
+            await supabase
+              .from('expo_push_tokens')
+              .delete()
+              .eq('user_id', req.user.id)
+              .eq('token_type', 'expo')
+              .neq('token', token);
+          }
           return res.json({ message: 'Token registrado', tokenType: type });
         }
       } catch (edgeErr) {
         console.warn('[push/register] Edge Function falló, usando fallback:', edgeErr.message);
       }
     }
-
+    // Si el token es Expo, borrar todos los tokens Expo anteriores del mismo
+    // usuario antes de guardar el nuevo. Al migrar de proyecto quedaron tokens
+    // de @reddington120/egchat-frontend junto a los nuevos de la organización,
+    // y el lote mixto se rechazaba entero con PUSH_TOO_MANY_EXPERIENCE_IDS.
+    if (type === 'expo') {
+      await supabase
+        .from('expo_push_tokens')
+        .delete()
+        .eq('user_id', req.user.id)
+        .eq('token_type', 'expo')
+        .neq('token', token);
+    }
     // Fallback: upsert directo en Supabase (compatibilidad hacia atrás)
     await supabase.from('expo_push_tokens').upsert({
       user_id:    req.user.id,
