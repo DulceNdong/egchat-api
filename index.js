@@ -12404,7 +12404,13 @@ app.post('/api/call/answer', auth, async (req, res) => {
       });
       console.log(`[call/answer] Broadcast sent: accepted with answer for ${callId}`);
       // Limpiar el canal después de enviar
-      setTimeout(() => supabase.removeChannel(channel), 1000);
+      setTimeout(() => {
+        void Promise.resolve()
+          .then(() => supabase.removeChannel(channel))
+          .catch((cleanupErr) => {
+            console.warn('[call/answer] Channel cleanup failed:', cleanupErr?.message || cleanupErr);
+          });
+      }, 1000);
     } catch (broadcastErr) {
       console.warn('[call/answer] Broadcast failed:', broadcastErr.message);
     }
