@@ -119,10 +119,9 @@ const formatLocalChat = (chat) => {
 };
 
 // --- Supabase ---------------------------------------------------------
-const supabase = createClient(
-  process.env.SUPABASE_URL || 'https://fqfxtjnfhvpggssbymdn.supabase.co',
-  process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || ''
-);
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fqfxtjnfhvpggssbymdn.supabase.co';
+const SUPABASE_API_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || '';
+const supabase = createClient(SUPABASE_URL, SUPABASE_API_KEY);
 
 const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'https://egchat-app.vercel.app,https://egchat-v2.vercel.app,http://localhost:5173,http://localhost:3001,http://localhost:3000,http://127.0.0.1:3001')
   .split(',')
@@ -12386,31 +12385,33 @@ app.post('/api/call/answer', auth, async (req, res) => {
       }).eq('call_id', callId);
     }
 
-    // FIX: Enviar broadcast instantáneo CON EL ANSWER para parar el tono y conectar inmediatamente
-    // Esto es mucho más rápido (< 50ms) que postgres_changes (200-500ms) + elimina el fetch extra
+    // Enviar el mismo broadcast por REST evita el teardown defectuoso de Phoenix.
     try {
-      const channel = supabase.channel(`call-state:${callId}`, {
-        config: { broadcast: { self: false } }
+      const broadcastRes = await fetch(new URL('realtime/v1/api/broadcast', SUPABASE_URL), {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_API_KEY,
+          Authorization: `Bearer ${SUPABASE_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messages: [{
+            topic: `call-state:${callId}`,
+            event: 'call_status',
+            payload: {
+              status: 'accepted',
+              callId,
+              answer: answer ? JSON.parse(JSON.stringify(answer)) : null,
+            },
+            private: false,
+          }],
+        }),
+        signal: AbortSignal.timeout(10000),
       });
-      await channel.subscribe();
-      await channel.send({
-        type: 'broadcast',
-        event: 'call_status',
-        payload: { 
-          status: 'accepted', 
-          callId,
-          answer: answer ? JSON.parse(JSON.stringify(answer)) : null  // Incluir el answer en el broadcast
-        }
-      });
+      if (broadcastRes.status !== 202) {
+        throw new Error(`Supabase respondió ${broadcastRes.status} ${broadcastRes.statusText}`);
+      }
       console.log(`[call/answer] Broadcast sent: accepted with answer for ${callId}`);
-      // Limpiar el canal después de enviar
-      setTimeout(() => {
-        void Promise.resolve()
-          .then(() => supabase.removeChannel(channel))
-          .catch((cleanupErr) => {
-            console.warn('[call/answer] Channel cleanup failed:', cleanupErr?.message || cleanupErr);
-          });
-      }, 1000);
     } catch (broadcastErr) {
       console.warn('[call/answer] Broadcast failed:', broadcastErr.message);
     }
