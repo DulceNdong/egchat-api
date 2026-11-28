@@ -2198,21 +2198,21 @@ app.post('/api/chats/:chatId/avatar', auth, async (req, res) => {
     const { chatId } = req.params;
     const { base64, mimeType = 'image/jpeg' } = req.body;
 
-    if (!base64) return res.status(400).json({ message: 'base64 requerido' });
+    if (typeof base64 !== 'string' || !base64) return res.status(400).json({ message: 'base64 requerido' });
 
     // Solo quien puede editar la info (admin o permiso edit_info='all') cambia la foto
     if (!(await puedeEditarInfoChat(chatId, req.user.id))) {
       return res.status(403).json({ message: 'No tienes permiso para cambiar la foto del grupo' });
     }
 
-    // Convertir base64 a buffer
     const base64Data = base64.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
-    const ext = mimeType.split('/')[1] || 'jpg';
+    if (!buffer.length) return res.status(400).json({ message: 'Imagen inválida' });
+    if (buffer.length > 8 * 1024 * 1024) return res.status(413).json({ message: 'Imagen demasiado grande' });
+    const ext = (String(mimeType).split('/')[1] || 'jpg').replace(/[^a-z0-9]/gi, '').slice(0, 5) || 'jpg';
     const fileName = `group-avatars/${chatId}-${Date.now()}.${ext}`;
 
-    // Subir a Supabase Storage (bucket: avatars)
-    const { data: uploadData, error: uploadError } = await supabase.storage
+    const { error: uploadError } = await supabase.storage
       .from('avatars')
       .upload(fileName, buffer, {
         contentType: mimeType,
@@ -2220,28 +2220,23 @@ app.post('/api/chats/:chatId/avatar', auth, async (req, res) => {
       });
 
     if (uploadError) {
-      // Si falla Storage, guardar el base64 directamente en la BD como fallback
-      const { data: updated } = await supabase
-        .from('chats')
-        .update({ avatar_url: base64, updated_at: new Date().toISOString() })
-        .eq('id', chatId)
-        .select('avatar_url')
-        .single();
-      return res.json({ avatar_url: updated?.avatar_url || base64 });
+      return res.status(502).json({ message: 'No se pudo subir la foto. Inténtalo de nuevo.' });
     }
 
-    // Obtener URL pública
     const { data: publicData } = supabase.storage
       .from('avatars')
       .getPublicUrl(fileName);
 
-    const publicUrl = publicData?.publicUrl || '';
+    const publicUrl = publicData?.publicUrl;
+    if (!publicUrl) {
+      return res.status(502).json({ message: 'No se pudo obtener la URL pública de la foto.' });
+    }
 
-    // Actualizar en la BD
-    await supabase
+    const { error } = await supabase
       .from('chats')
       .update({ avatar_url: publicUrl, updated_at: new Date().toISOString() })
       .eq('id', chatId);
+    if (error) throw error;
 
     res.json({ avatar_url: publicUrl });
   } catch (e) {
@@ -2269,14 +2264,16 @@ app.post('/api/chats/:chatId/cover', auth, async (req, res) => {
     const ext = (String(mimeType).split('/')[1] || 'jpg').replace(/[^a-z0-9]/gi, '').slice(0, 5) || 'jpg';
     const fileName = `group-covers/${chatId}-${Date.now()}.${ext}`;
 
-    let publicUrl = base64;
     const { error: uploadError } = await supabase.storage
       .from('avatars')
       .upload(fileName, buffer, { contentType: mimeType, upsert: true });
-
-    if (!uploadError) {
-      const { data: publicData } = supabase.storage.from('avatars').getPublicUrl(fileName);
-      publicUrl = publicData?.publicUrl || base64;
+    if (uploadError) {
+      return res.status(502).json({ message: 'No se pudo subir la portada. Inténtalo de nuevo.' });
+    }
+    const { data: publicData } = supabase.storage.from('avatars').getPublicUrl(fileName);
+    const publicUrl = publicData?.publicUrl;
+    if (!publicUrl) {
+      return res.status(502).json({ message: 'No se pudo obtener la URL pública de la portada.' });
     }
 
     const { error } = await supabase
@@ -2352,6 +2349,9 @@ app.put('/api/chats/:chatId', auth, async (req, res) => {
 
     if (!chat) return res.status(404).json({ message: 'Chat no encontrado' });
     if (chat.type !== 'group') return res.status(400).json({ message: 'Solo se pueden editar grupos' });
+    if (avatar_url !== undefined && avatar_url !== null && avatar_url !== '' && !isPublicGroupImageUrl(avatar_url)) {
+      return res.status(400).json({ message: 'La imagen del grupo debe ser una URL pública' });
+    }
 
     // Construir objeto de actualización
     const updates = { updated_at: new Date().toISOString() };
@@ -9959,9 +9959,14 @@ const chatPermisos = (chat) => {
     invite_admins_only: !!s.invite_admins_only,
   };
 };
+const isPublicGroupImageUrl = value => typeof value === 'string' && /^https?:\/\/\S+$/i.test(value);
+
 const puedeEditarInfoChat = async (chatId, userId) => {
-  if (await esAdminDeChat(chatId, userId)) return true;
-  const { data: c } = await supabase.from('chats').select('settings').eq('id', chatId).maybeSingle();
+  const part = await participacionEnChat(chatId, userId);
+  if (!part) return false;
+  if (part.role === 'admin') return true;
+  const { data: c } = await supabase.from('chats').select('created_by, settings').eq('id', chatId).maybeSingle();
+  if (c && String(c.created_by) === String(userId)) return true;
   return chatPermisos(c).edit_info === 'all';
 };
 
@@ -9974,6 +9979,9 @@ app.patch('/api/chats/:chatId', auth, async (req, res) => {
 
     if (!(await puedeEditarInfoChat(chatId, req.user.id))) {
       return res.status(403).json({ message: 'No tienes permiso para editar este grupo' });
+    }
+    if (typeof avatar_url === 'string' && avatar_url !== '' && !isPublicGroupImageUrl(avatar_url)) {
+      return res.status(400).json({ message: 'La imagen del grupo debe ser una URL pública' });
     }
 
     const { data: chat } = await supabase
@@ -13184,6 +13192,24 @@ app.get('/api/push/vapid-public-key', (req, res) => {
   res.json({ publicKey: VAPID_PUBLIC_KEY });
 });
 
+const isExpoPushToken = token => typeof token === 'string' && /^(ExponentPushToken|ExpoPushToken)\[[^\]]+\]$/.test(token);
+
+let firebaseMessaging = null;
+const getFirebaseMessaging = () => {
+  if (firebaseMessaging) return firebaseMessaging;
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!raw) return null;
+  try {
+    const admin = require('firebase-admin');
+    if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(JSON.parse(raw)) });
+    firebaseMessaging = admin.messaging();
+    return firebaseMessaging;
+  } catch (e) {
+    console.warn('[Push FCM] No se pudo inicializar Firebase:', e.message);
+    return null;
+  }
+};
+
 // Función interna para enviar push a un usuario
 const sendPushToUser = async (userId, payload) => {
   try {
@@ -13221,90 +13247,93 @@ const sendPushToUser = async (userId, payload) => {
       );
     }
 
-    // ── Expo Push (app movil nativa — funciona con telefono hibernado) ────
     // ── Tokens nativos registrados por la app ─────────────────────────────
-    const { data: expoSubs } = await supabase
+    const { data: expoSubs, error: tokenError } = await supabase
       .from('expo_push_tokens')
-      // Las instalaciones antiguas no tienen token_type/is_active. Filtrar
-      // por esas columnas en SQL las excluía y nunca recibían notificaciones.
-      .select('token, token_type, is_active, platform')
+      // Las instalaciones antiguas no tienen token_type/is_active/device_id.
+      // Filtrar por esas columnas en SQL las excluía de toda entrega.
+      .select('token, token_type, device_id, is_active, platform')
       .eq('user_id', userId);
+    if (tokenError) throw tokenError;
 
-    const activeTokens = (expoSubs || []).filter(sub =>
-      sub?.token && sub.is_active !== false
-    );
+    const subscriptions = [...new Map((expoSubs || [])
+      .filter(sub => sub?.token && sub.is_active !== false)
+      .map(sub => [String(sub.token), sub])).values()];
+    const isHexToken = token => /^[0-9a-f]{64}$/i.test(String(token || ''));
+    const isFcmSubscription = sub => {
+      const token = String(sub.token);
+      return !isExpoPushToken(token) && !isHexToken(token) && String(sub.token_type || '').toLowerCase() !== 'voip';
+    };
+    // Sin device_id no se puede distinguir una instalación antigua de otra.
+    // Se agrupan conservadoramente para no duplicar timbres durante la migración.
+    const deviceKey = sub => sub.device_id ? String(sub.device_id) : 'legacy';
+    const fcmSubscriptions = subscriptions.filter(isFcmSubscription);
+    const androidFcmDevices = new Set(fcmSubscriptions.map(deviceKey));
+    const expoTokens = subscriptions
+      .filter(sub => isExpoPushToken(String(sub.token)) && !((isCall || isCallSummary) && androidFcmDevices.has(deviceKey(sub))))
+      .map(sub => String(sub.token));
+    const attemptedExpoTokens = new Set();
+    const deliveredDevices = new Set();
+    const delivered = { expo: 0, apns: 0, fcm: 0 };
 
-    const isExpoFormat = (t) => t.startsWith('ExponentPushToken') || t.startsWith('ExpoPushToken');
-    const isHexToken    = (t) => /^[0-9a-f]{64}$/i.test(t);
-
-    // exp.host solo conoce sus propios tokens. Los APNs crudos que la app
-    // registra en iOS se le mandaban también a exp.host y el rechazo del lote
-    // dejaba al iPhone sin ningún aviso. Ahora van directos a APNs.
-    const expoTokens = [...new Set(activeTokens
-      .map(s => String(s.token || ''))
-      .filter(t => isExpoFormat(t)))];
-    const apnsTokens = [...new Set(activeTokens
-      .map(s => ({ token: String(s.token || ''), type: String(s.token_type || '') }))
-      .filter(s => s.type === 'apns' || (!isExpoFormat(s.token) && isHexToken(s.token)))
-      .map(s => s.token))];
-
-    const delivered = { expo: 0, apns: 0 };
-
-    if (expoTokens.length > 0) {
-      const expoMessages = expoTokens.map(token => ({
-        to: token,
+    const buildExpoMessage = token => ({
+      to: token,
+      ...(!isCallSummary ? {
         title: payload.title || 'EGChat',
         body: payload.body || (isCall ? 'Llamada entrante' : 'Nuevo mensaje'),
         // El nombre debe coincidir con el archivo que la app instala en
         // Library/Sounds del contenedor (useSounds.installIosPushSound).
-        sound: isCall ? 'default' : (isCallSummary ? 'default' : 'egchat-message.wav'),
-        badge: (isCall || isCallSummary) ? 0 : Number(payload.badge ?? 1),
+        sound: isCall ? 'default' : 'egchat-message.wav',
+        badge: isCall ? 0 : Number(payload.badge ?? 1),
         channelId: isCall ? 'egchat-calls-v2' : 'egchat-messages',
-        // En iOS el channelId no existe: la categoría con acciones (Aceptar /
-        // Rechazar) se registra desde la app con setNotificationCategoryAsync.
-        ...(isCall ? { categoryIdentifier: 'EGCHAT_CALL' } : {}),
-        priority: isCall ? 'high' : 'normal',
-        // Campo EXACTO que acepta la API REST de Expo (no "_mutableContent"):
-        // exp.host lo traduce a aps["mutable-content"]=1 y hace que iOS lance
-        // la Notification Service Extension, donde se descarga y pega la foto.
-        // El "mutable-content" de dentro de `data` NO sirve: cae en el diccionario
-        // data, no en aps, y la extensión nunca corre. En llamadas no se activa
-        // para no interferir con CallKit.
-        ...(!isCall ? { mutableContent: true } : {}),
-        data: {
-          ...payload,
-          'mutable-content': 1,
-          // Asegurar que notificationType siempre está presente para que el cliente
-          // pueda distinguir mensajes de llamadas
-          notificationType: payload.notificationType || 'message',
-          imageUrl: payload.imageUrl || payload.callerAvatar || payload.icon || '',
-          senderName: payload.senderName || payload.callerName || '',
-          senderAvatar: payload.senderAvatar || payload.callerAvatar || payload.icon || '',
-          messageType: payload.messageType || 'text',
-          chatId: payload.chatId || '',
-          // Llamadas: incluir el offer en el push para que el callee
-          // no tenga que esperar a Render al despertar
-          ...(isCall && payload.offer ? { offer: payload.offer } : {}),
-          ...(isCall ? {
-            callId: payload.callId || '',
-            callerId: payload.callerId || '',
-            callerName: payload.callerName || '',
-            callType: payload.callType || 'audio',
-          } : {}),
-        },
-        // richContent es un campo de web-push (PWA), Expo lo ignora en nativo;
-        // la foto nativa la pone la extensión gracias a mutableContent arriba.
-        // Se mantiene solo para la PWA.
-        ...(!isCall && (payload.callerAvatar || payload.senderAvatar || payload.imageUrl || (typeof payload.icon === 'string' && /^https?:\/\//.test(payload.icon)))
-          ? { richContent: { image: payload.callerAvatar || payload.senderAvatar || payload.imageUrl || payload.icon } }
-          : {}),
-        // Llamadas: TTL de 120s
-        ...(isCall ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
-      }));
-      // Expo rechaza lotes que mezclan tokens de distintos experience IDs.
-      // Se manda un mensaje por petición para evitar PUSH_TOO_MANY_EXPERIENCE_IDS.
-      for (const message of expoMessages) {
-        const batch = [message];
+      } : {}),
+      // En iOS el channelId no existe: la categoría con acciones (Aceptar /
+      // Rechazar) se registra desde la app con setNotificationCategoryAsync.
+      ...(isCall ? { categoryIdentifier: 'EGCHAT_CALL' } : {}),
+      priority: isCall || isCallSummary ? 'high' : 'normal',
+      // Campo EXACTO que acepta la API REST de Expo (no "_mutableContent"):
+      // exp.host lo traduce a aps["mutable-content"]=1 y hace que iOS lance
+      // la Notification Service Extension, donde se descarga y pega la foto.
+      // El "mutable-content" de dentro de `data` NO sirve: cae en el diccionario
+      // data, no en aps, y la extensión nunca corre. En llamadas no se activa
+      // para no interferir con CallKit.
+      ...(!isCall && !isCallSummary ? { mutableContent: true } : {}),
+      data: {
+        ...payload,
+        'mutable-content': 1,
+        // Asegurar que notificationType siempre está presente para que el cliente
+        // pueda distinguir mensajes de llamadas
+        notificationType: payload.notificationType || 'message',
+        imageUrl: payload.imageUrl || payload.callerAvatar || payload.icon || '',
+        senderName: payload.senderName || payload.callerName || '',
+        senderAvatar: payload.senderAvatar || payload.callerAvatar || payload.icon || '',
+        messageType: payload.messageType || 'text',
+        chatId: payload.chatId || '',
+        // Llamadas: incluir el offer en el push para que el callee
+        // no tenga que esperar a Render al despertar
+        ...(isCall && payload.offer ? { offer: payload.offer } : {}),
+        ...(isCall ? {
+          callId: payload.callId || '',
+          callerId: payload.callerId || '',
+          callerName: payload.callerName || '',
+          callType: payload.callType || 'audio',
+        } : {}),
+      },
+      // richContent es un campo de web-push (PWA), Expo lo ignora en nativo;
+      // la foto nativa la pone la extensión gracias a mutableContent arriba.
+      // Se mantiene solo para la PWA.
+      ...(!isCall && !isCallSummary && (payload.callerAvatar || payload.senderAvatar || payload.imageUrl || (typeof payload.icon === 'string' && /^https?:\/\//.test(payload.icon)))
+        ? { richContent: { image: payload.callerAvatar || payload.senderAvatar || payload.imageUrl || payload.icon } }
+        : {}),
+      // Llamadas: TTL de 120s
+      ...(isCall || isCallSummary ? { ttl: 120, expiration: Math.floor(Date.now() / 1000) + 120 } : {}),
+    });
+
+    const sendExpoTokens = async tokens => {
+      const pendingTokens = [...new Set(tokens)].filter(token => !attemptedExpoTokens.has(token));
+      for (const token of pendingTokens) {
+        attemptedExpoTokens.add(token);
+        const batch = [buildExpoMessage(token)];
         try {
           const expoRes = await fetch('https://exp.host/--/api/v2/push/send', {
             method: 'POST',
@@ -13324,8 +13353,11 @@ const sendPushToUser = async (userId, payload) => {
             console.warn(`[Push Expo] user=${userId} exp.host rechazó el lote:`, JSON.stringify(result.errors).slice(0, 400));
           }
           if (result.data) {
-            const tickets = result.data
-              .map((r, idx) => ({ r, token: batch[idx].to }));
+            const tickets = result.data.map((r, idx) => ({ r, token: batch[idx].to }));
+            for (const { r, token } of tickets) {
+              const subscription = subscriptions.find(sub => String(sub.token) === token);
+              if (r.status === 'ok' && subscription) deliveredDevices.add(deviceKey(subscription));
+            }
             delivered.expo += tickets.filter(({ r }) => r.status === 'ok').length;
             const invalid = tickets
               .filter(({ r }) => r.status === 'error' && r.details?.error === 'DeviceNotRegistered');
@@ -13346,7 +13378,34 @@ const sendPushToUser = async (userId, payload) => {
           console.warn('Expo push error:', expoErr.message);
         }
       }
-    }
+    };
+
+    await sendExpoTokens(expoTokens);
+
+    const nativeSubs = subscriptions.filter(sub => {
+      const token = String(sub.token);
+      return !isExpoPushToken(token) && !deliveredDevices.has(deviceKey(sub));
+    });
+    const apnsTokens = [...new Set(nativeSubs
+      .filter(sub => isHexToken(sub.token) && String(sub.token_type || '').toLowerCase() !== 'voip')
+      .map(sub => String(sub.token)))];
+    const fcmSubs = nativeSubs.filter(isFcmSubscription);
+    const sendExpoFallback = async failedSubscriptions => {
+      if ((!isCall && !isCallSummary) || failedSubscriptions.length === 0) return;
+      const failedDevices = new Set(failedSubscriptions.map(deviceKey));
+      const fallbackTokens = subscriptions
+        .filter(sub => isExpoPushToken(String(sub.token)) && failedDevices.has(deviceKey(sub)))
+        .map(sub => String(sub.token));
+      await sendExpoTokens(fallbackTokens);
+    };
+    const data = {
+      ...payload,
+      notificationType: payload.notificationType || 'message',
+      senderName: payload.senderName || payload.callerName || '',
+      senderAvatar: payload.senderAvatar || payload.callerAvatar || payload.icon || '',
+      messageType: payload.messageType || 'text',
+      chatId: payload.chatId || '',
+    };
 
     // ── APNs directo (tokens de dispositivo 64 hex de iOS) ────────────────
     // `apns-push-type: alert` + prioridad 10 es lo que hace que el aviso salga
@@ -13401,7 +13460,50 @@ const sendPushToUser = async (userId, payload) => {
       }
     }
 
-    return { ...delivered, expoTokens: expoTokens.length, apnsTokens: apnsTokens.length };
+    // ── FCM directo (Android) ─────────────────────────────────────────────
+    // El token FCM directo no pasa por exp.host. Sin este transporte quedaba
+    // registrado en la base, pero el servidor nunca lo utilizaba.
+    if (fcmSubs.length > 0) {
+      const messaging = getFirebaseMessaging();
+      if (!messaging) {
+        console.warn(`[Push FCM] user=${userId}: ${fcmSubs.length} token(s) sin credenciales Firebase`);
+        await sendExpoFallback(fcmSubs);
+      } else {
+        const fcmData = Object.fromEntries(Object.entries(data)
+          .filter(([, value]) => value !== undefined && value !== null)
+          .map(([key, value]) => [key, typeof value === 'string' ? value : JSON.stringify(value)]));
+        const results = await Promise.all(fcmSubs.map(async sub => {
+          try {
+            const messageId = await messaging.send({
+              token: String(sub.token),
+              data: fcmData,
+              // Las llamadas y su resumen son data-only: el servicio nativo
+              // abre la pantalla completa o cancela el aviso ongoing.
+              ...(!isCall && !isCallSummary ? { notification: { title: payload.title || 'EGChat', body: payload.body || 'Nuevo mensaje' } } : {}),
+              android: {
+                priority: 'high',
+                ttl: isCall || isCallSummary ? 120000 : 86400000,
+                ...(!isCall && !isCallSummary ? { notification: { channelId: 'egchat-messages', sound: 'notification', icon: 'notification_icon' } } : {}),
+              },
+            });
+            return { ok: true, sub, token: String(sub.token), messageId };
+          } catch (error) {
+            return { ok: false, sub, token: String(sub.token), code: error.code || error.message || 'send_failed' };
+          }
+        }));
+        delivered.fcm += results.filter(result => result.ok).length;
+        await sendExpoFallback(results.filter(result => !result.ok).map(result => result.sub));
+        const dead = results.filter(result => ['messaging/registration-token-not-registered', 'messaging/invalid-registration-token'].includes(result.code));
+        if (dead.length) {
+          await Promise.allSettled(dead.map(result => supabase.from('expo_push_tokens').delete().eq('token', result.token)));
+        }
+        results.filter(result => !result.ok && !dead.includes(result)).forEach(result => {
+          console.warn(`[Push FCM] user=${userId} error=${result.code}`);
+        });
+      }
+    }
+
+    return { ...delivered, expoTokens: attemptedExpoTokens.size, apnsTokens: apnsTokens.length, fcmTokens: fcmSubs.length };
   } catch (e) {
     console.error('sendPushToUser error:', e.message);
     return { error: e.message };
@@ -13417,14 +13519,25 @@ app.post('/api/push/register-expo-token', auth, async (req, res) => {
     const { expoPushToken, platform, tokenType } = req.body;
     const token = expoPushToken || req.body.token;
 
-    if (!token || token.length < 10) {
+    if (typeof token !== 'string' || token.length < 10 || token.length > 500) {
       return res.status(400).json({ message: 'Token inválido' });
     }
 
     // Determinar tipo de token automáticamente si no se especifica
-    const isExpoToken = token.startsWith('ExponentPushToken');
+    const isExpoToken = isExpoPushToken(token);
     const isHexAPNs = token.length === 64 && /^[0-9a-f]+$/i.test(token);
     const type = tokenType || (isExpoToken ? 'expo' : isHexAPNs ? 'apns' : 'fcm');
+    const removeSupersededDeviceToken = async () => {
+      if (!req.body.deviceId) return;
+      const { error } = await supabase
+        .from('expo_push_tokens')
+        .delete()
+        .eq('user_id', req.user.id)
+        .eq('device_id', req.body.deviceId)
+        .eq('token_type', type)
+        .neq('token', token);
+      if (error) throw error;
+    };
     // Tokens APNs nativos: guardar en DB pero no enviar directo a APNs.
     // El ExponentPushToken iOS usa APNs via Expo internamente (correcto).
     console.log(`[Push] Registrando token tipo=${type} platform=${platform||'unknown'} user=${req.user.id}`);
@@ -13450,45 +13563,25 @@ app.post('/api/push/register-expo-token', auth, async (req, res) => {
           }),
         });
         if (edgeRes.ok) {
-          // Limpiar tokens Expo viejos del mismo usuario (proyectos anteriores).
-          // Expo rechaza lotes con tokens de distintos experience IDs
-          // (PUSH_TOO_MANY_EXPERIENCE_IDS); un usuario solo debe tener un
-          // token Expo activo a la vez.
-          if (type === 'expo') {
-            await supabase
-              .from('expo_push_tokens')
-              .delete()
-              .eq('user_id', req.user.id)
-              .eq('token_type', 'expo')
-              .neq('token', token);
-          }
+          await removeSupersededDeviceToken();
           return res.json({ message: 'Token registrado', tokenType: type });
         }
       } catch (edgeErr) {
         console.warn('[push/register] Edge Function falló, usando fallback:', edgeErr.message);
       }
     }
-    // Si el token es Expo, borrar todos los tokens Expo anteriores del mismo
-    // usuario antes de guardar el nuevo. Al migrar de proyecto quedaron tokens
-    // de @reddington120/egchat-frontend junto a los nuevos de la organización,
-    // y el lote mixto se rechazaba entero con PUSH_TOO_MANY_EXPERIENCE_IDS.
-    if (type === 'expo') {
-      await supabase
-        .from('expo_push_tokens')
-        .delete()
-        .eq('user_id', req.user.id)
-        .eq('token_type', 'expo')
-        .neq('token', token);
-    }
     // Fallback: upsert directo en Supabase (compatibilidad hacia atrás)
-    await supabase.from('expo_push_tokens').upsert({
+    const { error: saveError } = await supabase.from('expo_push_tokens').upsert({
       user_id:    req.user.id,
       token,
       token_type: type,
       platform:   platform || 'android',
+      device_id:  req.body.deviceId || null,
       is_active:  true,
       updated_at: new Date().toISOString(),
     }, { onConflict: 'token' });
+    if (saveError) throw saveError;
+    await removeSupersededDeviceToken();
 
     res.json({ message: 'Token registrado', tokenType: type });
   } catch (e) {
@@ -13537,6 +13630,7 @@ app.get('/api/push/voip-status', auth, async (req, res) => {
 
     res.json({
       apnsConfigured:   !!(process.env.APNS_KEY_P8 && process.env.APNS_KEY_ID && process.env.APNS_TEAM_ID),
+      fcmConfigured:    !!(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.FIREBASE_SERVICE_ACCOUNT),
       signalEnabled:    process.env.VOIP_SIGNAL_ENABLED === '1',
       apnsEnv:          process.env.APNS_ENV || 'production',
       apnsBundle:       process.env.APNS_BUNDLE_ID || 'com.jallzstores.egchat',
